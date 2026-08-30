@@ -12,10 +12,13 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use peios::file::{File, SecInfo};
 use peios::msgpack::{Reader, Type, Writer};
+
+use crate::commit_signal::CommitSignal;
+use crate::query_language::{RecordAggregate, Source};
 
 pub use executor::{Limits, Stores};
 
@@ -73,6 +76,8 @@ impl QueryServer {
         stores: &Arc<Stores>,
         config: &Arc<ServerConfig>,
         stopping: &Arc<AtomicBool>,
+        event_commits: &Arc<CommitSignal>,
+        log_commits: &Arc<CommitSignal>,
     ) -> Result<(), QuerySocketError> {
         let active = Arc::new(AtomicUsize::new(0));
         let streaming = Arc::new(AtomicUsize::new(0));
@@ -88,13 +93,21 @@ impl QueryServer {
                     let stores = Arc::clone(stores);
                     let config = Arc::clone(config);
                     let stopping = Arc::clone(stopping);
+                    let event_commits = Arc::clone(event_commits);
+                    let log_commits = Arc::clone(log_commits);
                     let spawned = std::thread::Builder::new()
                         .name("eventd-query".to_owned())
                         .spawn(move || {
                             let _guard = CounterGuard(worker_active);
-                            if let Err(error) =
-                                handle(stream, &stores, &config, &streaming, &stopping)
-                            {
+                            if let Err(error) = handle(
+                                stream,
+                                &stores,
+                                &config,
+                                &streaming,
+                                &stopping,
+                                &event_commits,
+                                &log_commits,
+                            ) {
                                 eprintln!("eventd: query failed: {error}");
                             }
                         });
@@ -124,12 +137,18 @@ impl Drop for QueryServer {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "connection ownership and its protocol state remain linear and auditable"
+)]
 fn handle(
     mut stream: UnixStream,
     stores: &Stores,
     config: &ServerConfig,
     streaming_count: &Arc<AtomicUsize>,
     stopping: &AtomicBool,
+    event_commits: &CommitSignal,
+    log_commits: &CommitSignal,
 ) -> Result<(), QuerySocketError> {
     stream
         .set_read_timeout(Some(config.timeout))
@@ -146,6 +165,7 @@ fn handle(
             return Ok(());
         }
     };
+    let deadline = Instant::now() + config.timeout;
     let query = match crate::query_language::parse(&query_text) {
         Ok(query) => query,
         Err(error) => {
@@ -153,6 +173,10 @@ fn handle(
             return Ok(());
         }
     };
+    if Instant::now() >= deadline {
+        send_error(&mut stream, "query timed out")?;
+        return Ok(());
+    }
     let stream_guard = if query.stream {
         if !try_acquire(streaming_count, config.max_streaming) {
             send_error(&mut stream, "too many concurrent streaming queries")?;
@@ -162,15 +186,19 @@ fn handle(
     } else {
         None
     };
-    let records = match executor::execute(
-        &query,
-        stores,
-        &authorizer,
-        &Limits {
-            timeout: config.timeout,
-        },
-    ) {
-        Ok(records) => records,
+    let signal = match query.source {
+        Source::Logs { .. } => log_commits,
+        Source::Events { .. } | Source::Metric { .. } => event_commits,
+    };
+    let mut observed_generation = signal.generation();
+    let (records, mut stream_state) = match if query.stream {
+        executor::start_stream(&query, stores, &authorizer, &Limits { deadline })
+            .map(|(records, state)| (records, Some(state)))
+    } else {
+        executor::execute(&query, stores, &authorizer, &Limits { deadline })
+            .map(|records| (records, None))
+    } {
+        Ok(result) => result,
         Err(error) => {
             send_error(&mut stream, &error.to_string())?;
             return Ok(());
@@ -186,12 +214,16 @@ fn handle(
         send_error(&mut stream, "DISTINCT stream exceeds its seen-value limit")?;
         return Ok(());
     }
-    send_records(&mut stream, &records, config.response_target_bytes)?;
+    send_records(
+        &mut stream,
+        &records,
+        config.response_target_bytes,
+        Some(deadline),
+    )?;
     if query.stream {
-        send_status(&mut stream, "watch")?;
-        stream
-            .set_write_timeout(Some(Duration::ZERO))
-            .map_err(QuerySocketError::Io)?;
+        let mut seen = distinct_values(&query, &records);
+        send_status(&mut stream, "watch", Some(deadline))?;
+        stream.set_nonblocking(true).map_err(QuerySocketError::Io)?;
         while !stopping.load(Ordering::Acquire) {
             match peer_state(&stream) {
                 Ok(PeerState::Closed) => break,
@@ -199,16 +231,74 @@ fn handle(
                     return Err(QuerySocketError::Protocol("unexpected client data".into()));
                 }
                 Ok(PeerState::Idle) => {
-                    std::thread::sleep(Duration::from_millis(100));
+                    let generation =
+                        signal.wait_for_change(observed_generation, Duration::from_millis(100));
+                    if generation == observed_generation {
+                        continue;
+                    }
+                    observed_generation = generation;
+                    let Some(state) = stream_state.as_mut() else {
+                        unreachable!("stream query has stream state")
+                    };
+                    let mut records =
+                        match executor::stream_next(state, &query, stores, &authorizer) {
+                            Ok(records) => records,
+                            Err(error) => {
+                                let _ = send_error(&mut stream, &error.to_string());
+                                return Ok(());
+                            }
+                        };
+                    if let (Some(values), Some(field)) = (seen.as_mut(), distinct_field(&query)) {
+                        records.retain(|record| {
+                            let value = record.get(field).cloned().unwrap_or(value::Value::Null);
+                            if values.iter().any(|seen| seen.language_equal(&value)) {
+                                false
+                            } else {
+                                values.push(value);
+                                true
+                            }
+                        });
+                        if values.len() > config.max_distinct_stream_values {
+                            let _ = send_error(
+                                &mut stream,
+                                "DISTINCT stream exceeds its seen-value limit",
+                            );
+                            return Ok(());
+                        }
+                    }
+                    if !records.is_empty() {
+                        send_records(&mut stream, &records, config.response_target_bytes, None)?;
+                    }
                 }
                 Err(error) => return Err(QuerySocketError::Io(error)),
             }
         }
+        let _ = send_error(&mut stream, "eventd is shutting down");
     } else {
-        send_status(&mut stream, "end")?;
+        send_status(&mut stream, "end", Some(deadline))?;
     }
     drop(stream_guard);
     Ok(())
+}
+
+fn distinct_field(query: &crate::query_language::Query) -> Option<&str> {
+    match &query.aggregate {
+        Some(RecordAggregate::Distinct(field)) => Some(field),
+        _ => None,
+    }
+}
+
+fn distinct_values(
+    query: &crate::query_language::Query,
+    records: &[value::Record],
+) -> Option<Vec<value::Value>> {
+    let field = distinct_field(query)?;
+    Some(
+        records
+            .iter()
+            .map(|record| record.get(field).cloned().unwrap_or(value::Value::Null))
+            .collect(),
+    )
 }
 
 enum PeerState {
@@ -303,9 +393,10 @@ fn send_records(
     stream: &mut UnixStream,
     records: &[value::Record],
     target: usize,
+    deadline: Option<Instant>,
 ) -> Result<(), QuerySocketError> {
     if records.is_empty() {
-        return send_ok(stream, &[]);
+        return send_ok(stream, &[], deadline);
     }
     let encoded: Vec<Vec<u8>> = records
         .iter()
@@ -321,7 +412,7 @@ fn send_records(
             size = size.saturating_add(encoded[end].len());
             end += 1;
         }
-        send_ok(stream, &encoded[start..end])?;
+        send_ok(stream, &encoded[start..end], deadline)?;
         start = end;
     }
     Ok(())
@@ -337,7 +428,11 @@ fn encode_record(record: &value::Record) -> Result<Vec<u8>, QuerySocketError> {
     writer.to_bytes().map_err(QuerySocketError::Peios)
 }
 
-fn send_ok(stream: &mut UnixStream, records: &[Vec<u8>]) -> Result<(), QuerySocketError> {
+fn send_ok(
+    stream: &mut UnixStream,
+    records: &[Vec<u8>],
+    deadline: Option<Instant>,
+) -> Result<(), QuerySocketError> {
     let mut writer = Writer::new();
     writer
         .write_map(2)
@@ -348,13 +443,25 @@ fn send_ok(stream: &mut UnixStream, records: &[Vec<u8>]) -> Result<(), QuerySock
     for record in records {
         writer.write_raw(record);
     }
-    send_frame(stream, &writer.to_bytes().map_err(QuerySocketError::Peios)?)
+    send_frame(
+        stream,
+        &writer.to_bytes().map_err(QuerySocketError::Peios)?,
+        deadline,
+    )
 }
 
-fn send_status(stream: &mut UnixStream, status: &str) -> Result<(), QuerySocketError> {
+fn send_status(
+    stream: &mut UnixStream,
+    status: &str,
+    deadline: Option<Instant>,
+) -> Result<(), QuerySocketError> {
     let mut writer = Writer::new();
     writer.write_map(1).write_str("status").write_str(status);
-    send_frame(stream, &writer.to_bytes().map_err(QuerySocketError::Peios)?)
+    send_frame(
+        stream,
+        &writer.to_bytes().map_err(QuerySocketError::Peios)?,
+        deadline,
+    )
 }
 
 fn send_error(mut stream: impl Write, error: &str) -> Result<(), QuerySocketError> {
@@ -373,7 +480,19 @@ fn send_error(mut stream: impl Write, error: &str) -> Result<(), QuerySocketErro
     stream.write_all(&payload).map_err(QuerySocketError::Io)
 }
 
-fn send_frame(stream: &mut UnixStream, payload: &[u8]) -> Result<(), QuerySocketError> {
+fn send_frame(
+    stream: &mut UnixStream,
+    payload: &[u8],
+    deadline: Option<Instant>,
+) -> Result<(), QuerySocketError> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(QuerySocketError::Timeout)?;
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(QuerySocketError::Io)?;
+    }
     let length = u32::try_from(payload.len()).map_err(|_| QuerySocketError::FrameTooLarge)?;
     stream
         .write_all(&length.to_le_bytes())
@@ -405,6 +524,7 @@ pub enum QuerySocketError {
     Protocol(String),
     Occupied(PathBuf),
     FrameTooLarge,
+    Timeout,
 }
 
 impl fmt::Display for QuerySocketError {
@@ -422,6 +542,7 @@ impl fmt::Display for QuerySocketError {
             Self::FrameTooLarge => {
                 formatter.write_str("query response exceeds the u32 framing bound")
             }
+            Self::Timeout => formatter.write_str("query timed out"),
         }
     }
 }
@@ -432,7 +553,7 @@ impl std::error::Error for QuerySocketError {
             Self::Io(error) => Some(error),
             Self::Peios(error) => Some(error),
             Self::Security(error) => Some(error),
-            Self::Protocol(_) | Self::Occupied(_) | Self::FrameTooLarge => None,
+            Self::Protocol(_) | Self::Occupied(_) | Self::FrameTooLarge | Self::Timeout => None,
         }
     }
 }

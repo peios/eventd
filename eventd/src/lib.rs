@@ -2,6 +2,7 @@
 
 use std::error::Error;
 
+mod commit_signal;
 mod config;
 mod datagram;
 mod directory;

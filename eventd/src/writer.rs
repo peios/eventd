@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use eventd_core::{BoundedQueue, IngestItem, Pop, Shard, ShardError, SyntheticEvent};
 
+use crate::commit_signal::CommitSignal;
+
 /// Ordered data and control messages consumed by a shard's sole owner.
 pub enum WriterMessage {
     /// One KMES handoff from a drain thread.
@@ -23,6 +25,7 @@ pub fn run(
     max_batch_size: usize,
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
+    commits: &Arc<CommitSignal>,
 ) -> Result<(), ShardError> {
     let mut batch = Vec::with_capacity(max_batch_size);
     loop {
@@ -30,7 +33,7 @@ pub fn run(
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
-                if let Err(error) = handle_control(&mut shard, control) {
+                if let Err(error) = handle_control(&mut shard, control, commits) {
                     stopping.store(true, Ordering::Release);
                     queue.close();
                     return Err(error);
@@ -52,8 +55,11 @@ pub fn run(
                         queue.close();
                         return Err(error);
                     }
+                    if !batch.is_empty() {
+                        commits.committed();
+                    }
                     batch.clear();
-                    if let Err(error) = handle_control(&mut shard, control) {
+                    if let Err(error) = handle_control(&mut shard, control, commits) {
                         stopping.store(true, Ordering::Release);
                         queue.close();
                         return Err(error);
@@ -72,6 +78,9 @@ pub fn run(
             queue.close();
             return Err(error);
         }
+        if !batch.is_empty() {
+            commits.committed();
+        }
         batch.clear();
         if closed {
             return Ok(());
@@ -79,7 +88,11 @@ pub fn run(
     }
 }
 
-fn handle_control(shard: &mut Shard, message: WriterMessage) -> Result<(), ShardError> {
+fn handle_control(
+    shard: &mut Shard,
+    message: WriterMessage,
+    commits: &CommitSignal,
+) -> Result<(), ShardError> {
     match message {
         WriterMessage::Event(_) => unreachable!("events are handled by the batch loop"),
         WriterMessage::Barrier(sender) => {
@@ -88,6 +101,7 @@ fn handle_control(shard: &mut Shard, message: WriterMessage) -> Result<(), Shard
         }
         WriterMessage::Synthetic(event, sender) => match shard.commit_synthetic(&event) {
             Ok(()) => {
+                commits.committed();
                 let _ = sender.send(Ok(()));
                 Ok(())
             }

@@ -12,6 +12,7 @@ use eventd_core::{
     BoundedQueue, Coverage, LogStore, MetricStore, Shard, StripeRouter, assigned_shards,
 };
 
+use crate::commit_signal::CommitSignal;
 use crate::config::{Config, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
@@ -98,6 +99,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?
         .into();
     let stopping = Arc::new(AtomicBool::new(false));
+    let event_commits = Arc::new(CommitSignal::new());
+    let log_commits = Arc::new(CommitSignal::new());
     install_signal_handlers()?;
 
     let mut writers = Vec::with_capacity(shard_count);
@@ -106,6 +109,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let writer_stopping = Arc::clone(&stopping);
         let max_batch_size = config.max_batch_size;
         let max_batch_latency = config.max_batch_latency;
+        let writer_commits = Arc::clone(&event_commits);
         writers.push(
             std::thread::Builder::new()
                 .name(format!("eventd-writer-{index:04}"))
@@ -116,6 +120,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         max_batch_size,
                         max_batch_latency,
                         &writer_stopping,
+                        &writer_commits,
                     )
                     .map_err(|error| error.to_string())
                 })?,
@@ -125,6 +130,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_batch_size = config.log_max_batch_size;
     let log_batch_latency = config.log_max_batch_latency;
     let log_datagram_ceiling = config.max_log_datagram_bytes;
+    let log_writer_commits = Arc::clone(&log_commits);
     writers.push(
         std::thread::Builder::new()
             .name("eventd-log".to_owned())
@@ -137,6 +143,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     log_batch_size,
                     log_batch_latency,
                     &log_stopping,
+                    &log_writer_commits,
                 )
                 .map_err(|error| error.to_string())
             })?,
@@ -239,7 +246,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .name("eventd-query-listener".to_owned())
             .spawn(move || {
                 query_server
-                    .run(&query_stores, &query_config, &query_stopping)
+                    .run(
+                        &query_stores,
+                        &query_config,
+                        &query_stopping,
+                        &event_commits,
+                        &log_commits,
+                    )
                     .map_err(|error| error.to_string())
             })?,
     );

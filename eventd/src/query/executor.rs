@@ -4,7 +4,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, params};
 
@@ -22,7 +22,18 @@ pub struct Stores {
 }
 
 pub struct Limits {
-    pub timeout: Duration,
+    pub deadline: Instant,
+}
+
+pub struct StreamState {
+    evaluation_time: i64,
+    cursor: StoreCursor,
+}
+
+#[derive(Clone)]
+struct StoreCursor {
+    event_ids: Vec<i64>,
+    log_id: i64,
 }
 
 pub fn execute(
@@ -32,8 +43,101 @@ pub fn execute(
     limits: &Limits,
 ) -> Result<Vec<Record>, QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
-    let deadline = Instant::now() + limits.timeout;
-    let (since, until) = time_range(query, evaluation_time)?;
+    execute_at(
+        query,
+        stores,
+        authorizer,
+        evaluation_time,
+        Some(limits.deadline),
+        &StoreCursor {
+            event_ids: vec![i64::MAX; stores.event_paths.len()],
+            log_id: i64::MAX,
+        },
+        &StoreCursor {
+            event_ids: vec![0; stores.event_paths.len()],
+            log_id: 0,
+        },
+        false,
+    )
+}
+
+pub fn start_stream(
+    query: &Query,
+    stores: &Stores,
+    authorizer: &Authorizer,
+    limits: &Limits,
+) -> Result<(Vec<Record>, StreamState), QueryError> {
+    let evaluation_time = realtime_nanoseconds()?;
+    let cursor = capture_cursor(stores, &query.source)?;
+    let lower = StoreCursor {
+        event_ids: vec![0; stores.event_paths.len()],
+        log_id: 0,
+    };
+    let records = execute_at(
+        query,
+        stores,
+        authorizer,
+        evaluation_time,
+        Some(limits.deadline),
+        &cursor,
+        &lower,
+        false,
+    )?;
+    Ok((
+        records,
+        StreamState {
+            evaluation_time,
+            cursor,
+        },
+    ))
+}
+
+pub fn stream_next(
+    state: &mut StreamState,
+    query: &Query,
+    stores: &Stores,
+    authorizer: &Authorizer,
+) -> Result<Vec<Record>, QueryError> {
+    let upper = capture_cursor(stores, &query.source)?;
+    if upper.event_ids == state.cursor.event_ids && upper.log_id == state.cursor.log_id {
+        return Ok(Vec::new());
+    }
+    let mut watch_query = query.clone();
+    watch_query.sort.clear();
+    watch_query.take = None;
+    watch_query.skip = 0;
+    let records = execute_at(
+        &watch_query,
+        stores,
+        authorizer,
+        state.evaluation_time,
+        None,
+        &upper,
+        &state.cursor,
+        true,
+    )?;
+    state.cursor = upper;
+    Ok(records)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream snapshots require explicit lower and upper commit cursors"
+)]
+fn execute_at(
+    query: &Query,
+    stores: &Stores,
+    authorizer: &Authorizer,
+    evaluation_time: i64,
+    deadline: Option<Instant>,
+    upper: &StoreCursor,
+    lower: &StoreCursor,
+    watch: bool,
+) -> Result<Vec<Record>, QueryError> {
+    let (since, mut until) = time_range(query, evaluation_time)?;
+    if watch {
+        until = i64::MAX;
+    }
     if since >= until {
         return Ok(Vec::new());
     }
@@ -44,6 +148,8 @@ pub fn execute(
             since,
             until,
             deadline,
+            &lower.event_ids,
+            &upper.event_ids,
         )?,
         Source::Logs {
             origins,
@@ -57,6 +163,8 @@ pub fn execute(
             since,
             until,
             deadline,
+            lower.log_id,
+            upper.log_id,
         )?,
         Source::Metric { name, labels } => {
             return execute_metric(
@@ -110,6 +218,33 @@ pub fn execute(
     Ok(records)
 }
 
+fn capture_cursor(stores: &Stores, source: &Source) -> Result<StoreCursor, QueryError> {
+    let mut cursor = StoreCursor {
+        event_ids: vec![0; stores.event_paths.len()],
+        log_id: 0,
+    };
+    match source {
+        Source::Events { .. } => {
+            for (index, path) in stores.event_paths.iter().enumerate() {
+                cursor.event_ids[index] = open_read_only(path)?.query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM events",
+                    [],
+                    |row| row.get(0),
+                )?;
+            }
+        }
+        Source::Logs { .. } => {
+            cursor.log_id = open_read_only(&stores.log_path)?.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM logs",
+                [],
+                |row| row.get(0),
+            )?;
+        }
+        Source::Metric { .. } => unreachable!("metric streams are rejected by the parser"),
+    }
+    Ok(cursor)
+}
+
 #[derive(Debug, Clone)]
 struct Row {
     record: Record,
@@ -128,7 +263,9 @@ fn read_events(
     pattern: Option<&str>,
     since: i64,
     until: i64,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    lower_ids: &[i64],
+    upper_ids: &[i64],
 ) -> Result<Vec<Row>, QueryError> {
     let mut output = Vec::new();
     for (shard, path) in paths.iter().enumerate() {
@@ -137,9 +274,10 @@ fn read_events(
         let mut statement = connection.prepare(
             "SELECT id, boot_id, timestamp, cpu_id, sequence, origin_class, event_type, \
              effective_token_guid, true_token_guid, process_guid, payload \
-             FROM events WHERE timestamp >= ?1 AND timestamp < ?2",
+             FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4",
         )?;
-        let mut rows = statement.query(params![since, until])?;
+        let mut rows =
+            statement.query(params![since, until, lower_ids[shard], upper_ids[shard]])?;
         while let Some(row) = rows.next()? {
             if output.len().is_multiple_of(1_024) {
                 check_deadline(deadline)?;
@@ -195,14 +333,16 @@ fn read_logs(
     containing: Option<&str>,
     since: i64,
     until: i64,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    lower_id: i64,
+    upper_id: i64,
 ) -> Result<Vec<Row>, QueryError> {
     let connection = open_read_only(path)?;
     let mut statement = connection.prepare(
         "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
-         FROM logs WHERE timestamp >= ?1 AND timestamp < ?2",
+         FROM logs WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4",
     )?;
-    let mut rows = statement.query(params![since, until])?;
+    let mut rows = statement.query(params![since, until, lower_id, upper_id])?;
     let mut output = Vec::new();
     while let Some(row) = rows.next()? {
         if output.len().is_multiple_of(1_024) {
@@ -727,7 +867,7 @@ fn execute_metric(
     since: i64,
     until: i64,
     authorizer: &Authorizer,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Record>, QueryError> {
     let connection = open_read_only(path)?;
     let mut series_statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
@@ -1477,8 +1617,8 @@ fn realtime_nanoseconds() -> Result<i64, QueryError> {
     i64::try_from(elapsed.as_nanos()).map_err(|_| QueryError::InvalidTime)
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), QueryError> {
-    if Instant::now() >= deadline {
+fn check_deadline(deadline: Option<Instant>) -> Result<(), QueryError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         Err(QueryError::Timeout)
     } else {
         Ok(())

@@ -9,8 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eventd_core::{LogRecord, LogStore, LogStoreError};
 use peios::msgpack::{Reader, Type};
 
+use crate::commit_signal::CommitSignal;
 use crate::datagram::{IngestionSocket, Receive, SocketError};
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sole log owner receives its fixed batching and wake dependencies explicitly"
+)]
 pub fn run(
     socket: &IngestionSocket,
     mut store: LogStore,
@@ -19,6 +24,7 @@ pub fn run(
     max_batch_size: usize,
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
+    commits: &Arc<CommitSignal>,
 ) -> Result<(), LogIngestError> {
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
@@ -38,6 +44,7 @@ pub fn run(
                         || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
                     {
                         store.commit(&batch)?;
+                        commits.committed();
                         batch.clear();
                         started = None;
                     }
@@ -47,12 +54,16 @@ pub fn run(
             Receive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
             Receive::Empty => {
                 store.commit(&batch)?;
+                commits.committed();
                 batch.clear();
                 started = None;
             }
         }
     }
-    store.commit(&batch)?;
+    if !batch.is_empty() {
+        store.commit(&batch)?;
+        commits.committed();
+    }
     Ok(())
 }
 
