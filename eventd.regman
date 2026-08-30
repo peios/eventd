@@ -284,11 +284,13 @@ Maximum metric sample age in days.
 --- machine\system\eventd metricretentionmaxbytes
 canonical: Machine\System\eventd MetricRetentionMaxBytes
 type: REG_QWORD
-default: 0
+default: 1073741824
 valid: 0 or more
 applies: live
 
-Maximum logical live bytes in the metric store. Zero disables the size limit.
+Maximum logical live bytes in the metric store. The 1 GiB default bounds a
+misconfigured or compromised publisher's label-cardinality growth. Zero
+explicitly disables the size limit.
 
 --- machine\system\eventd retentioncheckintervalminutes
 canonical: Machine\System\eventd RetentionCheckIntervalMinutes

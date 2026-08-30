@@ -19,6 +19,7 @@ const ROOT_KEY: &str = r"Machine\System\eventd";
 pub const HANDOFF_SLOTS: usize = 4_096;
 pub const HANDOFF_BYTES: usize = 16 * 1024 * 1024;
 pub const STRIPE_LENGTH: usize = 1_024;
+pub const DEFAULT_METRIC_RETENTION_MAX_BYTES: u64 = 1 << 30;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 
@@ -318,7 +319,11 @@ impl Config {
             metric_retention: Duration::from_secs(
                 u64::from(dword(values, b"MetricRetentionDays", 90, 1, 3_650)) * 86_400,
             ),
-            metric_retention_max_bytes: qword(values, b"MetricRetentionMaxBytes", 0),
+            metric_retention_max_bytes: qword(
+                values,
+                b"MetricRetentionMaxBytes",
+                DEFAULT_METRIC_RETENTION_MAX_BYTES,
+            ),
             retention_interval: Duration::from_secs(
                 u64::from(dword(
                     values,
@@ -1131,6 +1136,30 @@ mod tests {
         )]);
         assert_eq!(dword(&values, b"MaxBatchSize", 1, 100, 100_000), 10_000);
         assert_eq!(dword(&values, b"MaxBatchSize", 1, 20_000, 100_000), 1);
+    }
+
+    #[test]
+    fn metric_store_is_bounded_by_default_but_accepts_explicit_zero() {
+        assert_eq!(
+            Config::test_defaults().metric_retention_max_bytes,
+            DEFAULT_METRIC_RETENTION_MAX_BYTES
+        );
+        let values = HashMap::from([(
+            b"MetricRetentionMaxBytes".to_vec(),
+            record(
+                b"MetricRetentionMaxBytes",
+                ValueType::QWORD,
+                &0_u64.to_le_bytes(),
+            ),
+        )]);
+        assert_eq!(
+            qword(
+                &values,
+                b"MetricRetentionMaxBytes",
+                DEFAULT_METRIC_RETENTION_MAX_BYTES
+            ),
+            0
+        );
     }
 
     #[test]
