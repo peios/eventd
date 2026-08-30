@@ -29,6 +29,8 @@ pub struct ServerConfig {
     pub max_streaming: usize,
     pub max_distinct_stream_values: usize,
     pub timeout: Duration,
+    pub cross_type_window: Duration,
+    pub cross_type_max_lookback: Duration,
 }
 
 pub struct QueryServer {
@@ -203,11 +205,29 @@ fn handle(
     };
     let mut observed_generation = signal.generation();
     let (records, mut stream_state) = match if query.stream {
-        executor::start_stream(&query, stores, &authorizer, &Limits { deadline })
-            .map(|(records, state)| (records, Some(state)))
+        executor::start_stream(
+            &query,
+            stores,
+            &authorizer,
+            &Limits {
+                deadline,
+                cross_type_window: config.cross_type_window,
+                cross_type_max_lookback: config.cross_type_max_lookback,
+            },
+        )
+        .map(|(records, state)| (records, Some(state)))
     } else {
-        executor::execute(&query, stores, &authorizer, &Limits { deadline })
-            .map(|records| (records, None))
+        executor::execute(
+            &query,
+            stores,
+            &authorizer,
+            &Limits {
+                deadline,
+                cross_type_window: config.cross_type_window,
+                cross_type_max_lookback: config.cross_type_max_lookback,
+            },
+        )
+        .map(|records| (records, None))
     } {
         Ok(result) => result,
         Err(error) => {

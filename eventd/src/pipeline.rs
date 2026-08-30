@@ -252,6 +252,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_streaming: config.max_streaming_queries,
         max_distinct_stream_values: config.max_distinct_stream_values,
         timeout: config.query_timeout,
+        cross_type_window: config.cross_type_window,
+        cross_type_max_lookback: config.cross_type_max_lookback,
     });
     let query_stopping = Arc::clone(&stopping);
     let query_thread_server = Arc::clone(&query_server);

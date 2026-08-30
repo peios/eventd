@@ -38,6 +38,8 @@ pub struct Config {
     pub max_distinct_stream_values: usize,
     pub max_query_request_bytes: usize,
     pub query_response_target_bytes: usize,
+    pub cross_type_window: Duration,
+    pub cross_type_max_lookback: Duration,
     pub event_retention: Duration,
     pub event_retention_max_bytes: u64,
     pub log_retention: Duration,
@@ -188,6 +190,20 @@ impl Config {
                 16_777_216,
             ))
             .expect("QueryResponseTargetBytes fits usize"),
+            cross_type_window: Duration::from_millis(u64::from(dword(
+                &values,
+                b"CrossTypeWindowMs",
+                15_000,
+                1_000,
+                300_000,
+            ))),
+            cross_type_max_lookback: Duration::from_secs(u64::from(dword(
+                &values,
+                b"CrossTypeMaxLookbackSeconds",
+                604_800,
+                3_600,
+                2_592_000,
+            ))),
             event_retention: Duration::from_secs(
                 u64::from(dword(&values, b"EventRetentionDays", 30, 1, 3_650)) * 86_400,
             ),

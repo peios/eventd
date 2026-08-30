@@ -8,6 +8,7 @@ pub struct Query {
     pub since: Option<TimeExpr>,
     pub until: Option<TimeExpr>,
     pub predicates: Vec<Expr>,
+    pub cross_filters: Vec<CrossFilter>,
     pub sort: Vec<SortKey>,
     pub take: Option<u64>,
     pub skip: u64,
@@ -17,6 +18,23 @@ pub struct Query {
     pub metric_aggregate: Option<MetricAggregate>,
     pub stream: bool,
     pub index: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrossFilter {
+    Metric {
+        name: String,
+        labels: Option<Vec<Expr>>,
+        operator: Operator,
+        value: Literal,
+    },
+    EventExists {
+        pattern: String,
+    },
+    LogExists {
+        origin: String,
+        containing: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,7 +364,7 @@ impl Parser {
                 containing: None,
             },
             "METRIC" => Source::Metric {
-                name: self.identifier()?,
+                name: self.pattern_identifier()?,
                 labels: self.label_selector()?,
             },
             _ => {
@@ -360,6 +378,7 @@ impl Parser {
             since: None,
             until: None,
             predicates: Vec::new(),
+            cross_filters: Vec::new(),
             sort: Vec::new(),
             take: None,
             skip: 0,
@@ -382,7 +401,16 @@ impl Parser {
                     ensure_absent(query.until.as_ref(), "UNTIL")?;
                     query.until = Some(self.time()?);
                 }
-                "WHERE" => query.predicates.push(self.expression()?),
+                "WHERE" => {
+                    if self.peek_keyword("METRIC")
+                        || self.peek_keyword("EVENT")
+                        || self.peek_keyword("LOG")
+                    {
+                        query.cross_filters.push(self.cross_filter()?);
+                    } else {
+                        query.predicates.push(self.expression()?);
+                    }
+                }
                 "SORT" => {
                     if !query.sort.is_empty() {
                         return Err(ParseError::new("SORT appears more than once"));
@@ -511,6 +539,56 @@ impl Parser {
         Ok(Some(predicates))
     }
 
+    fn cross_filter(&mut self) -> Result<CrossFilter, ParseError> {
+        let kind = self.word()?.to_ascii_uppercase();
+        match kind.as_str() {
+            "METRIC" => {
+                let name = self.pattern_identifier()?;
+                let labels = self.label_selector()?;
+                let operator = self.comparison_operator(false)?;
+                if matches!(
+                    operator,
+                    Operator::StartsWith | Operator::EndsWith | Operator::Contains
+                ) {
+                    return Err(ParseError::new(
+                        "cross-type metric comparison requires a numeric operator",
+                    ));
+                }
+                let value = self.literal()?;
+                if !matches!(
+                    value,
+                    Literal::Signed(_) | Literal::Unsigned(_) | Literal::Float(_)
+                ) {
+                    return Err(ParseError::new(
+                        "cross-type metric comparison requires a number",
+                    ));
+                }
+                Ok(CrossFilter::Metric {
+                    name,
+                    labels,
+                    operator,
+                    value,
+                })
+            }
+            "EVENT" => {
+                let pattern = self.pattern_identifier()?;
+                self.expect_keyword("EXISTS")?;
+                Ok(CrossFilter::EventExists { pattern })
+            }
+            "LOG" => {
+                let origin = self.identifier()?;
+                let containing = if self.consume_keyword("CONTAINING") {
+                    Some(self.identifier()?)
+                } else {
+                    None
+                };
+                self.expect_keyword("EXISTS")?;
+                Ok(CrossFilter::LogExists { origin, containing })
+            }
+            _ => unreachable!("caller checked cross-filter keyword"),
+        }
+    }
+
     fn expression(&mut self) -> Result<Expr, ParseError> {
         self.or_expression()
     }
@@ -564,6 +642,24 @@ impl Parser {
                 values,
             });
         }
+        let operator = self.comparison_operator(label)?;
+        let value = self.literal()?;
+        if matches!(value, Literal::Binary(_))
+            && matches!(
+                operator,
+                Operator::Greater | Operator::GreaterEqual | Operator::Less | Operator::LessEqual
+            )
+        {
+            return Err(ParseError::new("binary values cannot be ordered"));
+        }
+        Ok(Expr::Compare {
+            field,
+            operator,
+            value,
+        })
+    }
+
+    fn comparison_operator(&mut self, label: bool) -> Result<Operator, ParseError> {
         let operator = if self.consume_symbol(Symbol::EqualEqual)
             || (label && self.consume_symbol(Symbol::Equal))
         {
@@ -587,20 +683,7 @@ impl Parser {
         } else {
             return Err(ParseError::new("expected comparison operator"));
         };
-        let value = self.literal()?;
-        if matches!(value, Literal::Binary(_))
-            && matches!(
-                operator,
-                Operator::Greater | Operator::GreaterEqual | Operator::Less | Operator::LessEqual
-            )
-        {
-            return Err(ParseError::new("binary values cannot be ordered"));
-        }
-        Ok(Expr::Compare {
-            field,
-            operator,
-            value,
-        })
+        Ok(operator)
     }
 
     fn literal(&mut self) -> Result<Literal, ParseError> {
@@ -775,6 +858,14 @@ impl Parser {
         }
     }
 
+    fn pattern_identifier(&mut self) -> Result<String, ParseError> {
+        match self.next() {
+            Some(Token::Word(value)) if !is_clause(&value) => Ok(value),
+            Some(Token::String(value)) => Ok(value),
+            _ => Err(ParseError::new("expected identifier pattern")),
+        }
+    }
+
     fn word(&mut self) -> Result<String, ParseError> {
         match self.next() {
             Some(Token::Word(value)) => Ok(value),
@@ -822,6 +913,10 @@ impl Parser {
         self.cursor += 1;
         Some(token)
     }
+
+    fn peek_keyword(&self, expected: &str) -> bool {
+        matches!(self.tokens.get(self.cursor), Some(Token::Word(word)) if word.eq_ignore_ascii_case(expected))
+    }
 }
 
 fn ensure_absent<T>(value: Option<&T>, clause: &str) -> Result<(), ParseError> {
@@ -848,6 +943,7 @@ fn validate_combinations(query: &Query) -> Result<(), ParseError> {
         && (query.since.is_some()
             || query.until.is_some()
             || !query.predicates.is_empty()
+            || !query.cross_filters.is_empty()
             || !query.sort.is_empty()
             || query.take.is_some()
             || query.skip != 0
@@ -858,6 +954,29 @@ fn validate_combinations(query: &Query) -> Result<(), ParseError> {
         return Err(ParseError::new(
             "INDEX cannot be combined with query clauses",
         ));
+    }
+    if !query.cross_filters.is_empty() && query.since.is_none() {
+        return Err(ParseError::new("cross-type filters require SINCE"));
+    }
+    for filter in &query.cross_filters {
+        let valid = matches!(
+            (&query.source, filter),
+            (
+                Source::Events { .. } | Source::Logs { .. },
+                CrossFilter::Metric { .. }
+            ) | (
+                Source::Logs { .. } | Source::Metric { .. },
+                CrossFilter::EventExists { .. }
+            ) | (
+                Source::Events { .. } | Source::Metric { .. },
+                CrossFilter::LogExists { .. }
+            )
+        );
+        if !valid {
+            return Err(ParseError::new(
+                "cross-type filter is not valid for this source",
+            ));
+        }
     }
     if query.aggregate.is_some() && !query.select.is_empty() {
         return Err(ParseError::new(
@@ -1120,6 +1239,31 @@ mod tests {
             query.metric_aggregate,
             Some(MetricAggregate::Window(AggregateFunction::Sum, _))
         ));
+    }
+
+    #[test]
+    fn parses_and_validates_cross_type_filters() {
+        let query = parse(
+            "EVENTS kacs.* SINCE 1h ago WHERE METRIC cpu.usage[core=\"0\"] > 80 \
+             WHERE LOG loregd CONTAINING \"error\" EXISTS",
+        )
+        .unwrap();
+        assert!(matches!(
+            &query.cross_filters[0],
+            CrossFilter::Metric { name, labels: Some(labels), operator: Operator::Greater, .. }
+                if name == "cpu.usage" && labels.len() == 1
+        ));
+        assert!(matches!(
+            &query.cross_filters[1],
+            CrossFilter::LogExists { origin, containing: Some(text) }
+                if origin == "loregd" && text == "error"
+        ));
+
+        assert!(parse("LOGS WHERE EVENT kacs.denied EXISTS").is_err());
+        assert!(parse("EVENTS SINCE 1h ago WHERE EVENT kacs.denied EXISTS").is_err());
+        assert!(parse("LOGS SINCE 1h ago WHERE METRIC cpu CONTAINS 1").is_err());
+        assert!(parse("LOGS SINCE 1h ago WHERE EVENT kacs.* EXISTS").is_ok());
+        assert!(parse("METRIC cpu.* SINCE 1h ago").is_ok());
     }
 
     #[test]

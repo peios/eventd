@@ -4,14 +4,14 @@ use core::cmp::Ordering;
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::security::{Authorizer, Namespace};
 use super::value::{Record, Value, ascii_equal, flatten_event_payload, guid_string, language_cmp};
 use crate::query_language::{
-    AggregateFunction, Expr, GroupFunction, Literal, MetricAggregate, Operator, Query,
+    AggregateFunction, CrossFilter, Expr, GroupFunction, Literal, MetricAggregate, Operator, Query,
     RecordAggregate, Source, TimeExpr, Transform,
 };
 
@@ -23,11 +23,15 @@ pub struct Stores {
 
 pub struct Limits {
     pub deadline: Instant,
+    pub cross_type_window: Duration,
+    pub cross_type_max_lookback: Duration,
 }
 
 pub struct StreamState {
     evaluation_time: i64,
     cursor: StoreCursor,
+    cross_type_window: Duration,
+    cross_type_max_lookback: Duration,
 }
 
 #[derive(Clone)]
@@ -58,6 +62,8 @@ pub fn execute(
             log_id: 0,
         },
         false,
+        limits.cross_type_window,
+        limits.cross_type_max_lookback,
     )
 }
 
@@ -82,12 +88,16 @@ pub fn start_stream(
         &cursor,
         &lower,
         false,
+        limits.cross_type_window,
+        limits.cross_type_max_lookback,
     )?;
     Ok((
         records,
         StreamState {
             evaluation_time,
             cursor,
+            cross_type_window: limits.cross_type_window,
+            cross_type_max_lookback: limits.cross_type_max_lookback,
         },
     ))
 }
@@ -115,6 +125,8 @@ pub fn stream_next(
         &upper,
         &state.cursor,
         true,
+        state.cross_type_window,
+        state.cross_type_max_lookback,
     )?;
     state.cursor = upper;
     Ok(records)
@@ -122,7 +134,8 @@ pub fn stream_next(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "stream snapshots require explicit lower and upper commit cursors"
+    clippy::too_many_lines,
+    reason = "the shared query pipeline keeps filtering and output stages in their mandated order"
 )]
 fn execute_at(
     query: &Query,
@@ -133,6 +146,8 @@ fn execute_at(
     upper: &StoreCursor,
     lower: &StoreCursor,
     watch: bool,
+    cross_type_window: Duration,
+    cross_type_max_lookback: Duration,
 ) -> Result<Vec<Record>, QueryError> {
     let (since, mut until) = time_range(query, evaluation_time)?;
     if watch {
@@ -141,6 +156,23 @@ fn execute_at(
     if since >= until {
         return Ok(Vec::new());
     }
+    let historical_ranges = if watch || query.cross_filters.is_empty() {
+        None
+    } else {
+        let maximum = duration_nanoseconds(cross_type_max_lookback);
+        if until.saturating_sub(since) > maximum {
+            return Err(QueryError::CrossTypeRangeTooLarge);
+        }
+        Some(cross_type_ranges(
+            &query.cross_filters,
+            stores,
+            authorizer,
+            since,
+            until,
+            duration_nanoseconds(cross_type_window),
+            deadline,
+        )?)
+    };
     let rows = match &query.source {
         Source::Events { pattern } => read_events(
             &stores.event_paths,
@@ -176,6 +208,7 @@ fn execute_at(
                 until,
                 authorizer,
                 deadline,
+                historical_ranges.as_deref(),
             );
         }
     };
@@ -190,6 +223,12 @@ fn execute_at(
     let mut visible = Vec::with_capacity(rows.len());
     for mut row in rows {
         check_deadline(deadline)?;
+        if historical_ranges
+            .as_deref()
+            .is_some_and(|ranges| !range_contains(ranges, timestamp(&row)))
+        {
+            continue;
+        }
         if authorize_row(authorizer, namespace, &mut row, &referenced, &mut cache)?
             && query
                 .predicates
@@ -200,6 +239,16 @@ fn execute_at(
         }
     }
     let mut rows = visible;
+    if watch && !query.cross_filters.is_empty() {
+        apply_watch_cross_filters(
+            &mut rows,
+            &query.cross_filters,
+            stores,
+            authorizer,
+            duration_nanoseconds(cross_type_window),
+            deadline,
+        )?;
+    }
 
     if let Some(aggregate) = &query.aggregate {
         let mut records = aggregate_records(rows, aggregate)?;
@@ -243,6 +292,485 @@ fn capture_cursor(stores: &Stores, source: &Source) -> Result<StoreCursor, Query
         Source::Metric { .. } => unreachable!("metric streams are rejected by the parser"),
     }
     Ok(cursor)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeRange {
+    start: i64,
+    end: i64,
+}
+
+fn duration_nanoseconds(duration: Duration) -> i64 {
+    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+fn cross_type_ranges(
+    filters: &[CrossFilter],
+    stores: &Stores,
+    authorizer: &Authorizer,
+    since: i64,
+    until: i64,
+    window: i64,
+    deadline: Option<Instant>,
+) -> Result<Vec<TimeRange>, QueryError> {
+    let mut combined = vec![TimeRange {
+        start: since,
+        end: until,
+    }];
+    for filter in filters {
+        check_deadline(deadline)?;
+        let ranges =
+            cross_filter_ranges(filter, stores, authorizer, since, until, window, deadline)?;
+        combined = intersect_ranges(&combined, &ranges);
+        if combined.is_empty() {
+            break;
+        }
+    }
+    Ok(combined)
+}
+
+fn cross_filter_ranges(
+    filter: &CrossFilter,
+    stores: &Stores,
+    authorizer: &Authorizer,
+    since: i64,
+    until: i64,
+    window: i64,
+    deadline: Option<Instant>,
+) -> Result<Vec<TimeRange>, QueryError> {
+    match filter {
+        CrossFilter::Metric {
+            name,
+            labels,
+            operator,
+            value,
+        } => metric_true_ranges(
+            &stores.metric_path,
+            name,
+            labels.as_deref(),
+            *operator,
+            value,
+            authorizer,
+            since,
+            until,
+            deadline,
+        ),
+        CrossFilter::EventExists { pattern } => {
+            let (lower, upper) = split_window(window);
+            let timestamps = cross_event_timestamps(
+                &stores.event_paths,
+                pattern,
+                since.saturating_sub(upper),
+                until.saturating_add(lower),
+                authorizer,
+                deadline,
+            )?;
+            Ok(existence_ranges(&timestamps, since, until, lower, upper))
+        }
+        CrossFilter::LogExists { origin, containing } => {
+            let (lower, upper) = split_window(window);
+            let timestamps = cross_log_timestamps(
+                &stores.log_path,
+                origin,
+                containing.as_deref(),
+                since.saturating_sub(upper),
+                until.saturating_add(lower),
+                authorizer,
+                deadline,
+            )?;
+            Ok(existence_ranges(&timestamps, since, until, lower, upper))
+        }
+    }
+}
+
+fn apply_watch_cross_filters(
+    rows: &mut Vec<Row>,
+    filters: &[CrossFilter],
+    stores: &Stores,
+    authorizer: &Authorizer,
+    window: i64,
+    deadline: Option<Instant>,
+) -> Result<(), QueryError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let first = rows.iter().map(timestamp).min().expect("rows is non-empty");
+    let last = rows.iter().map(timestamp).max().expect("rows is non-empty");
+    for filter in filters {
+        check_deadline(deadline)?;
+        match filter {
+            CrossFilter::Metric {
+                name,
+                labels,
+                operator,
+                value,
+            } => {
+                if !metric_condition_at(
+                    &stores.metric_path,
+                    name,
+                    labels.as_deref(),
+                    *operator,
+                    value,
+                    authorizer,
+                    last,
+                    deadline,
+                )? {
+                    rows.clear();
+                    return Ok(());
+                }
+            }
+            CrossFilter::EventExists { .. } | CrossFilter::LogExists { .. } => {
+                let ranges = cross_filter_ranges(
+                    filter,
+                    stores,
+                    authorizer,
+                    first,
+                    last.saturating_add(1),
+                    window,
+                    deadline,
+                )?;
+                rows.retain(|row| range_contains(&ranges, timestamp(row)));
+                if rows.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn split_window(window: i64) -> (i64, i64) {
+    let lower = window / 2;
+    (lower, window - lower)
+}
+
+fn existence_ranges(
+    timestamps: &[i64],
+    since: i64,
+    until: i64,
+    lower: i64,
+    upper: i64,
+) -> Vec<TimeRange> {
+    let ranges = timestamps.iter().filter_map(|timestamp| {
+        let start = timestamp.saturating_sub(lower).max(since);
+        let end = timestamp.saturating_add(upper).min(until);
+        (start < end).then_some(TimeRange { start, end })
+    });
+    merge_ranges(ranges)
+}
+
+fn merge_ranges(ranges: impl IntoIterator<Item = TimeRange>) -> Vec<TimeRange> {
+    let mut ranges: Vec<_> = ranges.into_iter().collect();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<TimeRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn intersect_ranges(left: &[TimeRange], right: &[TimeRange]) -> Vec<TimeRange> {
+    let (mut left_index, mut right_index) = (0, 0);
+    let mut output = Vec::new();
+    while left_index < left.len() && right_index < right.len() {
+        let start = left[left_index].start.max(right[right_index].start);
+        let end = left[left_index].end.min(right[right_index].end);
+        if start < end {
+            output.push(TimeRange { start, end });
+        }
+        if left[left_index].end <= right[right_index].end {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    output
+}
+
+fn range_contains(ranges: &[TimeRange], timestamp: i64) -> bool {
+    let index = ranges.partition_point(|range| range.start <= timestamp);
+    index != 0 && timestamp < ranges[index - 1].end
+}
+
+fn cross_event_timestamps(
+    paths: &[PathBuf],
+    pattern: &str,
+    since: i64,
+    until: i64,
+    authorizer: &Authorizer,
+    deadline: Option<Instant>,
+) -> Result<Vec<i64>, QueryError> {
+    let fields = vec!["timestamp".to_owned()];
+    let mut access = HashMap::<String, bool>::new();
+    let mut output = Vec::new();
+    let mut scanned = 0_usize;
+    for path in paths {
+        check_deadline(deadline)?;
+        let connection = open_read_only(path)?;
+        let mut statement = connection.prepare(
+            "SELECT event_type, timestamp FROM events \
+             WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC, id ASC",
+        )?;
+        let mut rows = statement.query(params![since, until])?;
+        while let Some(row) = rows.next()? {
+            scanned += 1;
+            if scanned.is_multiple_of(1_024) {
+                check_deadline(deadline)?;
+            }
+            let identifier: String = row.get(0)?;
+            if !glob_matches(pattern, &identifier) {
+                continue;
+            }
+            let allowed = if let Some(allowed) = access.get(&identifier) {
+                *allowed
+            } else {
+                let allowed = authorizer
+                    .check(Namespace::Events, &identifier, &fields)?
+                    .is_some_and(|visible| visible.contains("timestamp"));
+                access.insert(identifier, allowed);
+                allowed
+            };
+            if allowed {
+                output.push(row.get(1)?);
+            }
+        }
+    }
+    output.sort_unstable();
+    Ok(output)
+}
+
+fn cross_log_timestamps(
+    path: &Path,
+    origin: &str,
+    containing: Option<&str>,
+    since: i64,
+    until: i64,
+    authorizer: &Authorizer,
+    deadline: Option<Instant>,
+) -> Result<Vec<i64>, QueryError> {
+    let mut fields = vec!["timestamp".to_owned()];
+    if containing.is_some() {
+        fields.push("message".to_owned());
+    }
+    let connection = open_read_only(path)?;
+    let mut statement = connection.prepare(
+        "SELECT origin, timestamp, message FROM logs \
+         WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC, id ASC",
+    )?;
+    let mut rows = statement.query(params![since, until])?;
+    let mut access = HashMap::<String, bool>::new();
+    let mut output = Vec::new();
+    let mut scanned = 0_usize;
+    while let Some(row) = rows.next()? {
+        scanned += 1;
+        if scanned.is_multiple_of(1_024) {
+            check_deadline(deadline)?;
+        }
+        let identifier: String = row.get(0)?;
+        if !ascii_equal(&identifier, origin) {
+            continue;
+        }
+        let allowed = if let Some(allowed) = access.get(&identifier) {
+            *allowed
+        } else {
+            let allowed = authorizer
+                .check(Namespace::Logs, &identifier, &fields)?
+                .is_some_and(|visible| fields.iter().all(|field| visible.contains(field)));
+            access.insert(identifier, allowed);
+            allowed
+        };
+        if !allowed {
+            continue;
+        }
+        let message: String = row.get(2)?;
+        if containing.is_some_and(|needle| !ascii_contains(&message, needle)) {
+            continue;
+        }
+        output.push(row.get(1)?);
+    }
+    Ok(output)
+}
+
+struct CrossMetricSeries {
+    id: i64,
+}
+
+fn resolve_cross_metric(
+    connection: &Connection,
+    name_pattern: &str,
+    labels: Option<&[Expr]>,
+    authorizer: &Authorizer,
+    deadline: Option<Instant>,
+) -> Result<Option<CrossMetricSeries>, QueryError> {
+    let mut required = vec![
+        "timestamp".to_owned(),
+        "value".to_owned(),
+        "type".to_owned(),
+    ];
+    if let Some(labels) = labels {
+        for expression in labels {
+            expression.fields(&mut required);
+        }
+    }
+    required.sort_unstable();
+    required.dedup();
+    let mut statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
+    let mut rows = statement.query([])?;
+    let mut resolved = None;
+    while let Some(row) = rows.next()? {
+        check_deadline(deadline)?;
+        let id: i64 = row.get(0)?;
+        let name: String = row.get(1)?;
+        if !glob_matches(name_pattern, &name) {
+            continue;
+        }
+        let canonical_labels: String = row.get(2)?;
+        let metric_type: i64 = row.get(3)?;
+        let mut selector = parse_labels(&canonical_labels);
+        selector.insert("name".into(), Value::String(name.clone()));
+        selector.insert(
+            "type".into(),
+            Value::String(metric_type_name(metric_type)?.into()),
+        );
+        if labels.is_some_and(|items| !items.iter().all(|item| evaluate(item, &selector))) {
+            continue;
+        }
+        let visible = authorizer
+            .check(Namespace::Metrics, &name, &required)?
+            .is_some_and(|fields| required.iter().all(|field| fields.contains(field)));
+        if !visible {
+            continue;
+        }
+        if metric_type == 2 {
+            return Err(QueryError::CrossMetricHistogram);
+        }
+        if !matches!(metric_type, 0 | 1) {
+            return Err(QueryError::InvalidMetricType);
+        }
+        if resolved.is_some() {
+            return Err(QueryError::CrossMetricNeedsSelector);
+        }
+        resolved = Some(CrossMetricSeries { id });
+    }
+    Ok(resolved)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cross-metric semantics require explicit bounds"
+)]
+fn metric_true_ranges(
+    path: &Path,
+    name_pattern: &str,
+    labels: Option<&[Expr]>,
+    operator: Operator,
+    value: &Literal,
+    authorizer: &Authorizer,
+    since: i64,
+    until: i64,
+    deadline: Option<Instant>,
+) -> Result<Vec<TimeRange>, QueryError> {
+    let connection = open_read_only(path)?;
+    let Some(series) =
+        resolve_cross_metric(&connection, name_pattern, labels, authorizer, deadline)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut samples = Vec::<(i64, i64, f64)>::new();
+    if since > i64::MIN {
+        let preceding = connection.query_row(
+            "SELECT id, timestamp, value FROM samples WHERE series_id = ?1 AND timestamp < ?2 \
+             ORDER BY timestamp DESC, id DESC LIMIT 1",
+            params![series.id, since],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        match preceding {
+            Ok(sample) => samples.push(sample),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, timestamp, value FROM samples \
+         WHERE series_id = ?1 AND timestamp >= ?2 AND timestamp < ?3 \
+         ORDER BY timestamp ASC, id ASC",
+    )?;
+    let mut rows = statement.query(params![series.id, since, until])?;
+    while let Some(row) = rows.next()? {
+        if samples.len().is_multiple_of(1_024) {
+            check_deadline(deadline)?;
+        }
+        samples.push((row.get(0)?, row.get(1)?, row.get(2)?));
+    }
+    let mut true_ranges = Vec::new();
+    for (index, (_, timestamp, number)) in samples.iter().enumerate() {
+        if !number.is_finite() {
+            return Err(QueryError::NonFinite);
+        }
+        let start = (*timestamp).max(since);
+        let end = samples
+            .get(index + 1)
+            .map_or(until, |(_, timestamp, _)| *timestamp)
+            .min(until);
+        if start < end && metric_comparison(*number, operator, value) {
+            true_ranges.push(TimeRange { start, end });
+        }
+    }
+    Ok(merge_ranges(true_ranges))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "watch metric lookup is one bounded index seek"
+)]
+fn metric_condition_at(
+    path: &Path,
+    name_pattern: &str,
+    labels: Option<&[Expr]>,
+    operator: Operator,
+    value: &Literal,
+    authorizer: &Authorizer,
+    timestamp: i64,
+    deadline: Option<Instant>,
+) -> Result<bool, QueryError> {
+    check_deadline(deadline)?;
+    let connection = open_read_only(path)?;
+    let Some(series) =
+        resolve_cross_metric(&connection, name_pattern, labels, authorizer, deadline)?
+    else {
+        return Ok(false);
+    };
+    let sample = connection.query_row(
+        "SELECT value FROM samples WHERE series_id = ?1 AND timestamp <= ?2 \
+         ORDER BY timestamp DESC, id DESC LIMIT 1",
+        params![series.id, timestamp],
+        |row| row.get::<_, f64>(0),
+    );
+    match sample {
+        Ok(number) if number.is_finite() => Ok(metric_comparison(number, operator, value)),
+        Ok(_) => Err(QueryError::NonFinite),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn metric_comparison(number: f64, operator: Operator, value: &Literal) -> bool {
+    let mut record = Record::new();
+    record.insert("value".into(), Value::Float(number));
+    evaluate(
+        &Expr::Compare {
+            field: "value".into(),
+            operator,
+            value: value.clone(),
+        },
+        &record,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -868,6 +1396,7 @@ fn execute_metric(
     until: i64,
     authorizer: &Authorizer,
     deadline: Option<Instant>,
+    cross_ranges: Option<&[TimeRange]>,
 ) -> Result<Vec<Record>, QueryError> {
     let connection = open_read_only(path)?;
     let mut series_statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
@@ -939,6 +1468,9 @@ fn execute_metric(
         }
         let mut visible = Vec::with_capacity(inputs.len());
         for mut input in inputs {
+            if cross_ranges.is_some_and(|ranges| !range_contains(ranges, timestamp(&input.row))) {
+                continue;
+            }
             if authorize_row(
                 authorizer,
                 Namespace::Metrics,
@@ -1677,6 +2209,9 @@ pub enum QueryError {
     PercentileNeedsHistogram,
     RateNeedsCounter,
     MetricNeedsWindow,
+    CrossTypeRangeTooLarge,
+    CrossMetricNeedsSelector,
+    CrossMetricHistogram,
 }
 
 impl fmt::Display for QueryError {
@@ -1708,6 +2243,15 @@ impl fmt::Display for QueryError {
             }
             Self::MetricNeedsWindow => {
                 formatter.write_str("multiple metric series over time require a window aggregation")
+            }
+            Self::CrossTypeRangeTooLarge => formatter.write_str(
+                "cross-type query range is too large; narrow it with SINCE or UNTIL",
+            ),
+            Self::CrossMetricNeedsSelector => formatter.write_str(
+                "cross-type metric selector matches multiple series; use a bracketed or narrower selector",
+            ),
+            Self::CrossMetricHistogram => {
+                formatter.write_str("cross-type metric conditions require a counter or gauge series")
             }
         }
     }
@@ -1814,6 +2358,28 @@ mod tests {
             rows[0].record.get("value"),
             Some(Value::Float(value)) if (*value - 10.0).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn existence_ranges_are_half_open_merged_and_intersectable() {
+        let ranges = existence_ranges(&[10, 15, 30], 0, 40, 5, 5);
+        assert_eq!(
+            ranges,
+            [
+                TimeRange { start: 5, end: 20 },
+                TimeRange { start: 25, end: 35 }
+            ]
+        );
+        assert!(range_contains(&ranges, 5));
+        assert!(range_contains(&ranges, 19));
+        assert!(!range_contains(&ranges, 20));
+        assert_eq!(
+            intersect_ranges(&ranges, &[TimeRange { start: 18, end: 28 }]),
+            [
+                TimeRange { start: 18, end: 20 },
+                TimeRange { start: 25, end: 28 }
+            ]
+        );
     }
 
     fn test_row(timestamp: i64, value: Value) -> Row {
