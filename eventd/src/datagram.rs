@@ -1,13 +1,27 @@
 //! Bounded nonblocking Unix datagram ingestion socket.
 
 use core::fmt;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
 use peios::file::SecInfo;
+use peios::security::sddl;
+use peios::token::Token;
+
+/// The service manager is SYSTEM without the Service-logon group. Every
+/// phase-2 service, including a SYSTEM service, carries `SU` (S-1-5-6). The
+/// explicit deny therefore keeps services from forging peinit's log origins,
+/// while the following SYSTEM allow leaves the broker and owner operable.
+const LOG_BROKER_SDDL: &str = "O:SYG:SYD:P(D;;0x2;;;SU)(A;;GA;;;SY)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    Inherited,
+    PeinitLogBroker,
+}
 
 pub struct IngestionSocket {
     socket: UnixDatagram,
@@ -16,7 +30,11 @@ pub struct IngestionSocket {
 }
 
 impl IngestionSocket {
-    pub fn bind(path: &Path, datagram_ceiling: usize) -> Result<Self, SocketError> {
+    pub fn bind(
+        path: &Path,
+        datagram_ceiling: usize,
+        protection: Protection,
+    ) -> Result<Self, SocketError> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
                 std::fs::remove_file(path).map_err(SocketError::Io)?;
@@ -30,14 +48,7 @@ impl IngestionSocket {
         socket.set_nonblocking(true).map_err(SocketError::Io)?;
         set_receive_buffer(&socket, datagram_ceiling)?;
 
-        // Binding applies the parent directory's inheritable descriptor. Read it
-        // back and establish that complete descriptor explicitly before the
-        // first receive, so a directory without usable inheritance fails here.
-        let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
-        let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(SocketError::Security)?;
-        peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(SocketError::Security)?;
+        establish_protection(path, protection)?;
         Ok(Self {
             socket,
             path: path.to_owned(),
@@ -79,6 +90,29 @@ impl IngestionSocket {
         }
     }
 
+    /// Receive one datagram and the KACS identity conveyed with it. The SDK
+    /// reserves room for exactly one token and no ordinary descriptors; it
+    /// closes anything the caller did not request. Its token-only path uses a
+    /// fixed stack control buffer and performs no allocation.
+    pub fn receive_token(&self, buffer: &mut [u8]) -> Result<TokenReceive, SocketError> {
+        match peios::socket::recv_message(
+            self.socket.as_fd(),
+            buffer,
+            0,
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+        ) {
+            Ok(message) if message.truncated || message.control_truncated => {
+                Ok(TokenReceive::Truncated)
+            }
+            Ok(message) => Ok(TokenReceive::Datagram {
+                length: message.len,
+                token: message.token,
+            }),
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => Ok(TokenReceive::Empty),
+            Err(error) => Err(SocketError::Security(error)),
+        }
+    }
+
     pub fn configure_receive_buffer(&self, datagram_ceiling: usize) -> Result<(), SocketError> {
         set_receive_buffer(&self.socket, datagram_ceiling)
     }
@@ -104,6 +138,34 @@ impl IngestionSocket {
     pub fn unlink(&self) {
         unlink_if_owned(&self.path, self.identity);
     }
+}
+
+fn establish_protection(path: &Path, protection: Protection) -> Result<(), SocketError> {
+    let (secinfo, descriptor) = match protection {
+        Protection::Inherited => {
+            let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
+            let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
+                .map_err(SocketError::Security)?;
+            (secinfo, descriptor)
+        }
+        Protection::PeinitLogBroker => (
+            SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL,
+            sddl::parse(LOG_BROKER_SDDL).map_err(SocketError::Security)?,
+        ),
+    };
+    peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(SocketError::Security)?;
+
+    if protection == Protection::PeinitLogBroker {
+        let actual = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(SocketError::Security)?;
+        let actual = sddl::format(actual.as_bytes()).map_err(SocketError::Security)?;
+        let expected = sddl::format(descriptor.as_bytes()).map_err(SocketError::Security)?;
+        if actual != expected {
+            return Err(SocketError::Protection(path.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for IngestionSocket {
@@ -151,10 +213,18 @@ pub enum Receive {
 }
 
 #[derive(Debug)]
+pub enum TokenReceive {
+    Empty,
+    Truncated,
+    Datagram { length: usize, token: Option<Token> },
+}
+
+#[derive(Debug)]
 pub enum SocketError {
     Io(std::io::Error),
     Security(peios::Error),
     Occupied(PathBuf),
+    Protection(PathBuf),
     Length,
 }
 
@@ -170,6 +240,11 @@ impl fmt::Display for SocketError {
                 "configured socket path {} is not a socket",
                 path.display()
             ),
+            Self::Protection(path) => write!(
+                formatter,
+                "log ingestion socket {} does not have the required peinit-only descriptor",
+                path.display()
+            ),
             Self::Length => formatter.write_str("ingestion socket size exceeds the platform ABI"),
         }
     }
@@ -180,7 +255,21 @@ impl std::error::Error for SocketError {
         match self {
             Self::Io(error) => Some(error),
             Self::Security(error) => Some(error),
-            Self::Occupied(_) | Self::Length => None,
+            Self::Occupied(_) | Self::Protection(_) | Self::Length => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_broker_descriptor_denies_services_before_allowing_system() {
+        let descriptor = sddl::parse(LOG_BROKER_SDDL).expect("valid log broker descriptor");
+        assert_eq!(
+            sddl::format(descriptor.as_bytes()).expect("format descriptor"),
+            LOG_BROKER_SDDL
+        );
     }
 }

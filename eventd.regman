@@ -159,6 +159,17 @@ applies: live
 
 Maximum resolved metric series retained in the in-memory LRU cache.
 
+--- machine\system\eventd metricauthorizationcachesize
+canonical: Machine\System\eventd MetricAuthorizationCacheSize
+type: REG_DWORD
+default: 16384
+valid: 256 to 1000000
+applies: live
+
+Maximum cached metric publication verdicts. Entries are keyed by the KACS
+token ID and modified ID plus metric name, and all entries are invalidated
+when the eventd Security descriptor generation changes.
+
 --- machine\system\eventd adaptiveindexwindowhours
 canonical: Machine\System\eventd AdaptiveIndexWindowHours
 type: REG_DWORD

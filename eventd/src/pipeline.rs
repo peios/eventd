@@ -14,7 +14,7 @@ use eventd_core::{
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, ConfigWatch, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
-use crate::datagram::IngestionSocket;
+use crate::datagram::{IngestionSocket, Protection};
 use crate::directory::StoreDirectory;
 use crate::indexing::{PolicyMessage, Tracker};
 use crate::kmes::{self, DrainContext};
@@ -124,6 +124,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_socket = Arc::new(IngestionSocket::bind(
         &config.log_socket_path,
         config.max_log_datagram_bytes,
+        Protection::PeinitLogBroker,
     )?);
     let metric_path = metric_directory.child("metrics.db");
     let (metric_store, metric_recovery) = MetricStore::open_recovering(
@@ -138,6 +139,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_socket = Arc::new(IngestionSocket::bind(
         &config.metric_socket_path,
         config.max_metric_datagram_bytes,
+        Protection::Inherited,
     )?);
     let query_server = Arc::new(QueryServer::bind(&config.query_socket_path)?);
 
@@ -250,6 +252,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
     let metric_thread_socket = Arc::clone(&metric_socket);
     let metric_error_events = queues[0].clone();
+    let metric_descriptors = Arc::clone(&descriptors);
     let metric_handle = std::thread::Builder::new()
         .name("eventd-metric".to_owned())
         .spawn(move || {
@@ -262,6 +265,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &metric_stopping,
                 &metric_maintenance_receiver,
                 &metric_retention_requested,
+                metric_descriptors,
             )
             .map_err(|error| error.to_string())
         })?;
@@ -678,7 +682,7 @@ fn diagnostic_dump(
     query_server: &QueryServer,
 ) {
     let (active_queries, streaming_queries) = query_server.counts();
-    let (metric_series, errors) = crate::diagnostics::snapshot();
+    let (metric_series, metric_ingress, errors) = crate::diagnostics::snapshot();
     eprintln!("eventd diagnostic dump:");
     eprintln!("  boot_id: {canonical_boot_id}");
     eprintln!(
@@ -688,6 +692,13 @@ fn diagnostic_dump(
     );
     eprintln!("  queries: active={active_queries} streaming={streaming_queries}");
     eprintln!("  metric_series_cache: {metric_series}");
+    eprintln!(
+        "  metric_ingress: missing_identity={} truncated={} unauthorized_records={} authorization_errors={}",
+        metric_ingress.missing_identity,
+        metric_ingress.truncated,
+        metric_ingress.unauthorized_records,
+        metric_ingress.authorization_errors,
+    );
     match load_receipts(active_paths, historical_paths) {
         Ok(receipts) => {
             let mut range_counts = std::collections::HashMap::<u16, usize>::new();

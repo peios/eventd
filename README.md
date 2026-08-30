@@ -5,6 +5,11 @@ ring per logical CPU into receipt-backed SQLite event shards, accepts service
 logs and metrics over bounded Unix datagram sockets, and serves authorized
 observability queries over a Unix stream socket.
 
+Log origins are broker-attested: the log socket denies the Service logon group
+before allowing SYSTEM, admitting peinit but not phase-2 services. Metric
+producers convey their effective KACS token on every datagram and eventd checks
+`EVENTD_PUBLISH` for each metric name through a bounded generation-aware cache.
+
 The workspace is split deliberately:
 
 - `eventd-core` contains the bounded handoff, recovery model and SQLite stores.

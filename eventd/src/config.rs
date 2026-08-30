@@ -50,6 +50,7 @@ pub struct Config {
     pub metric_max_batch_latency: Duration,
     pub max_metric_datagram_bytes: usize,
     pub metric_series_cache_size: usize,
+    pub metric_authorization_cache_size: usize,
     pub query_timeout: Duration,
     pub max_concurrent_queries: usize,
     pub max_streaming_queries: usize,
@@ -207,6 +208,14 @@ impl Config {
                 1_000_000,
             ))
             .expect("MetricSeriesCacheSize fits usize"),
+            metric_authorization_cache_size: usize::try_from(dword(
+                values,
+                b"MetricAuthorizationCacheSize",
+                16_384,
+                256,
+                1_000_000,
+            ))
+            .expect("MetricAuthorizationCacheSize fits usize"),
             query_timeout: Duration::from_millis(u64::from(dword(
                 values,
                 b"QueryTimeoutMs",
@@ -412,6 +421,12 @@ impl Config {
             metric_series_cache_size,
             b"MetricSeriesCacheSize",
             1_000,
+            1_000_000
+        );
+        retain_invalid_dword!(
+            metric_authorization_cache_size,
+            b"MetricAuthorizationCacheSize",
+            256,
             1_000_000
         );
         retain_invalid_dword!(query_timeout, b"QueryTimeoutMs", 1_000, 300_000);
@@ -623,6 +638,11 @@ impl Config {
         value!(
             metric_series_cache_size,
             "MetricSeriesCacheSize",
+            "REG_DWORD"
+        );
+        value!(
+            metric_authorization_cache_size,
+            "MetricAuthorizationCacheSize",
             "REG_DWORD"
         );
         seconds!(adaptive_index_window, "AdaptiveIndexWindowHours", 3_600);

@@ -16,6 +16,7 @@ mod query;
 mod query_language;
 mod retention;
 mod synthetic;
+mod write_security;
 mod writer;
 
 /// Start eventd.

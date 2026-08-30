@@ -13,7 +13,9 @@ use eventd_core::{
 use peios::msgpack::{Reader, Type};
 
 use crate::config::{Config, SharedConfig};
-use crate::datagram::{IngestionSocket, Receive, SocketError};
+use crate::datagram::{IngestionSocket, SocketError, TokenReceive};
+use crate::query::DescriptorCache;
+use crate::write_security::MetricPublishAuthorizer;
 use crate::writer::WriterMessage;
 
 pub enum MetricMaintenance {
@@ -39,41 +41,71 @@ pub fn run(
     stopping: &Arc<AtomicBool>,
     maintenance: &Receiver<MetricMaintenance>,
     retention_requested: &Arc<AtomicBool>,
+    descriptors: Arc<DescriptorCache>,
 ) -> Result<(), MetricIngestError> {
     crate::diagnostics::metric_series(store.cache_len());
-    let (initial_batch_size, mut datagram_ceiling) = Config::read(runtime, |config| {
-        (
-            config.metric_max_batch_size,
-            config.max_metric_datagram_bytes,
-        )
-    });
+    let (initial_batch_size, mut datagram_ceiling, authorization_cache_size) =
+        Config::read(runtime, |config| {
+            (
+                config.metric_max_batch_size,
+                config.max_metric_datagram_bytes,
+                config.metric_authorization_cache_size,
+            )
+        });
+    let mut authorizer = MetricPublishAuthorizer::new(descriptors, authorization_cache_size);
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(initial_batch_size);
     let mut started = None;
+    let mut last_authorization_error = None;
     while !stopping.load(Ordering::Acquire) {
-        let (max_batch_size, max_batch_latency, checkpoint_pages, cache_size, next_ceiling) =
-            Config::read(runtime, |config| {
-                (
-                    config.metric_max_batch_size,
-                    config.metric_max_batch_latency,
-                    config.wal_checkpoint_pages,
-                    config.metric_series_cache_size,
-                    config.max_metric_datagram_bytes,
-                )
-            });
+        let (
+            max_batch_size,
+            max_batch_latency,
+            checkpoint_pages,
+            cache_size,
+            next_ceiling,
+            next_authorization_cache_size,
+        ) = Config::read(runtime, |config| {
+            (
+                config.metric_max_batch_size,
+                config.metric_max_batch_latency,
+                config.wal_checkpoint_pages,
+                config.metric_series_cache_size,
+                config.max_metric_datagram_bytes,
+                config.metric_authorization_cache_size,
+            )
+        });
         store.configure(checkpoint_pages, cache_size);
+        authorizer.configure(next_authorization_cache_size);
         if datagram_ceiling != next_ceiling {
             datagram_ceiling = next_ceiling;
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
-        match socket.receive(&mut buffer)? {
-            Receive::Datagram(length) => {
+        match socket.receive_token(&mut buffer)? {
+            TokenReceive::Datagram {
+                length,
+                token: Some(token),
+            } => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(records) = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                let Some(mut records) =
+                    parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
                 else {
                     continue;
                 };
+                match authorizer.authorize(&token, &mut records) {
+                    Ok(rejected) => crate::diagnostics::metric_unauthorized(rejected),
+                    Err(error) => {
+                        crate::diagnostics::metric_authorization_error();
+                        if last_authorization_error
+                            .is_none_or(|last: Instant| last.elapsed().as_secs() >= 1)
+                        {
+                            eprintln!("eventd: metric datagram rejected: {error}");
+                            last_authorization_error = Some(Instant::now());
+                        }
+                        continue;
+                    }
+                }
                 for record in records {
                     started.get_or_insert_with(Instant::now);
                     batch.push(record);
@@ -92,9 +124,12 @@ pub fn run(
                     }
                 }
             }
-            Receive::Truncated => {}
-            Receive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
-            Receive::Empty => {
+            TokenReceive::Datagram { token: None, .. } => {
+                crate::diagnostics::metric_missing_identity();
+            }
+            TokenReceive::Truncated => crate::diagnostics::metric_truncated(),
+            TokenReceive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
+            TokenReceive::Empty => {
                 commit_batch(
                     &mut store,
                     &batch,
@@ -116,13 +151,23 @@ pub fn run(
     }
     loop {
         let max_batch_size = Config::read(runtime, |config| config.metric_max_batch_size);
-        match socket.receive(&mut buffer)? {
-            Receive::Datagram(length) => {
+        match socket.receive_token(&mut buffer)? {
+            TokenReceive::Datagram {
+                length,
+                token: Some(token),
+            } => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(records) = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                let Some(mut records) =
+                    parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
                 else {
                     continue;
                 };
+                if let Ok(rejected) = authorizer.authorize(&token, &mut records) {
+                    crate::diagnostics::metric_unauthorized(rejected);
+                } else {
+                    crate::diagnostics::metric_authorization_error();
+                    continue;
+                }
                 for record in records {
                     batch.push(record);
                     if batch.len() == max_batch_size {
@@ -137,8 +182,11 @@ pub fn run(
                     }
                 }
             }
-            Receive::Truncated => {}
-            Receive::Empty => break,
+            TokenReceive::Datagram { token: None, .. } => {
+                crate::diagnostics::metric_missing_identity();
+            }
+            TokenReceive::Truncated => crate::diagnostics::metric_truncated(),
+            TokenReceive::Empty => break,
         }
     }
     if !batch.is_empty() {

@@ -1,7 +1,7 @@
 //! KACS-backed per-identifier and per-field query authorization.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, RwLock};
@@ -14,26 +14,37 @@ use peios::token::Token;
 const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
 const EVENTD_READ: u32 = 0x0001;
 const EVENTD_ADMINISTER: u32 = 0x0004;
-const DEFAULT_DESCRIPTORS: [(&str, &str, &str); 4] = [
+const EVENTD_PUBLISH: u32 = 0x0008;
+const EVENTD_GENERIC_MAPPING: peios_sys::kacs_generic_mapping = peios_sys::kacs_generic_mapping {
+    read: 0x0002_0001,
+    write: 0x0002_000e,
+    execute: 0x0002_0001,
+    all: 0x000f_000f,
+};
+const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 4] = [
     (
         "Events",
         "*",
         "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)",
+        None,
     ),
     (
         "Logs",
         "*",
         "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+        None,
     ),
     (
         "Metrics",
         "*",
-        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+        "O:SYG:SYD:P(A;;0x00000009;;;SY)(A;;0x00000009;;;BA)(A;;0x00000001;;;AU)",
+        Some("O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)"),
     ),
     (
         "",
         "Admin",
         "O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)",
+        None,
     ),
 ];
 
@@ -47,7 +58,7 @@ pub fn provision_defaults() -> Result<(), SecurityError> {
         None,
     )
     .map_err(SecurityError::Peios)?;
-    for (namespace, name, sddl) in DEFAULT_DESCRIPTORS {
+    for (namespace, name, sddl, legacy_sddl) in DEFAULT_DESCRIPTORS {
         let namespace_key = if namespace.is_empty() {
             None
         } else {
@@ -73,6 +84,19 @@ pub fn provision_defaults() -> Result<(), SecurityError> {
         )
         .map_err(SecurityError::Peios)?;
         match key.query_value(b"", None) {
+            Ok(value)
+                if legacy_sddl.is_some_and(|legacy| {
+                    value.ty == ValueType::BINARY
+                        && peios::security::sddl::parse(legacy)
+                            .is_ok_and(|descriptor| descriptor.as_bytes() == value.data)
+                }) =>
+            {
+                let descriptor =
+                    peios::security::sddl::parse(sddl).map_err(SecurityError::Peios)?;
+                key.set_value(b"", ValueType::BINARY, descriptor.as_bytes())
+                    .call()
+                    .map_err(SecurityError::Peios)?;
+            }
             Ok(_) => {}
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
                 let descriptor =
@@ -163,12 +187,7 @@ impl Authorizer {
             sd: descriptor.as_bytes().as_ptr().cast(),
             sd_len: descriptor.as_bytes().len(),
             desired: EVENTD_READ,
-            mapping: peios_sys::kacs_generic_mapping {
-                read: 0x0002_0001,
-                write: 0x0002_0006,
-                execute: 0x0002_0001,
-                all: 0x000f_0007,
-            },
+            mapping: EVENTD_GENERIC_MAPPING,
             self_sid: core::ptr::null(),
             self_sid_len: 0,
             privilege_intent: 0,
@@ -223,12 +242,7 @@ impl Authorizer {
             sd: descriptor.as_bytes().as_ptr().cast(),
             sd_len: descriptor.as_bytes().len(),
             desired: EVENTD_ADMINISTER,
-            mapping: peios_sys::kacs_generic_mapping {
-                read: 0x0002_0001,
-                write: 0x0002_0006,
-                execute: 0x0002_0001,
-                all: 0x000f_0007,
-            },
+            mapping: EVENTD_GENERIC_MAPPING,
             self_sid: core::ptr::null(),
             self_sid_len: 0,
             privilege_intent: 0,
@@ -274,7 +288,6 @@ struct ResolvedDescriptor {
 }
 
 struct DescriptorState {
-    generation: u64,
     healthy: bool,
     resolved: HashMap<(Namespace, String), Option<ResolvedDescriptor>>,
     admin: AdminDescriptor,
@@ -288,14 +301,15 @@ enum AdminDescriptor {
 }
 
 pub struct DescriptorCache {
+    generation: AtomicU64,
     state: RwLock<DescriptorState>,
 }
 
 impl DescriptorCache {
     pub fn new() -> Self {
         Self {
+            generation: AtomicU64::new(0),
             state: RwLock::new(DescriptorState {
-                generation: 0,
                 healthy: true,
                 resolved: HashMap::new(),
                 admin: AdminDescriptor::Unresolved,
@@ -303,11 +317,70 @@ impl DescriptorCache {
         }
     }
 
-    fn generation(&self) -> u64 {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generation
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Check whether `token` may publish one concrete metric identifier.
+    /// The generation returned with the verdict is the descriptor snapshot
+    /// against which it was reached; callers use it to invalidate local
+    /// hot-path caches without sharing those caches across threads.
+    pub(crate) fn check_metric_publish(
+        &self,
+        token: &Token,
+        identifier: &str,
+    ) -> Result<(u64, bool), SecurityError> {
+        loop {
+            let generation = self.generation();
+            let Some((pattern, descriptor)) = self.resolve(Namespace::Metrics, identifier)? else {
+                if self.generation() == generation {
+                    return Ok((generation, false));
+                }
+                continue;
+            };
+            let audit_context = format!("metric-publish:{pattern}");
+            let request = peios_sys::peios_access_request {
+                token_fd: token.as_raw_fd(),
+                sd: descriptor.as_bytes().as_ptr().cast(),
+                sd_len: descriptor.as_bytes().len(),
+                desired: EVENTD_PUBLISH,
+                mapping: EVENTD_GENERIC_MAPPING,
+                self_sid: core::ptr::null(),
+                self_sid_len: 0,
+                privilege_intent: 0,
+                object_tree: core::ptr::null(),
+                object_tree_count: 0,
+                local_claims: core::ptr::null(),
+                local_claims_len: 0,
+                pip_type: 0,
+                pip_trust: 0,
+                audit_context: audit_context.as_ptr().cast(),
+                audit_context_len: audit_context.len(),
+            };
+            let mut granted = 0_u32;
+            // SAFETY: request borrows the live token, descriptor and audit
+            // context; `granted` is a writable out-parameter for the call.
+            let result = unsafe {
+                peios_sys::peios_access_check(
+                    &raw const request,
+                    &raw mut granted,
+                    core::ptr::null_mut(),
+                )
+            };
+            let allowed = if result == 0 {
+                granted & EVENTD_PUBLISH != 0
+            } else {
+                let error = peios::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EACCES) {
+                    false
+                } else {
+                    return Err(SecurityError::Peios(error));
+                }
+            };
+            if self.generation() == generation {
+                return Ok((generation, allowed));
+            }
+        }
     }
 
     fn resolve(
@@ -327,7 +400,7 @@ impl DescriptorCache {
                         (resolved.pattern.clone(), Arc::clone(&resolved.descriptor))
                     }));
                 }
-                (state.generation, state.healthy)
+                (self.generation(), state.healthy)
             };
             if !healthy {
                 return Ok(None);
@@ -342,7 +415,7 @@ impl DescriptorCache {
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.generation != generation || !state.healthy {
+            if self.generation() != generation || !state.healthy {
                 continue;
             }
             state.resolved.insert(key, loaded.clone());
@@ -363,7 +436,7 @@ impl DescriptorCache {
                     AdminDescriptor::Missing => return Ok(None),
                     AdminDescriptor::Unresolved => {}
                 }
-                (state.generation, state.healthy)
+                (self.generation(), state.healthy)
             };
             if !healthy {
                 return Ok(None);
@@ -373,7 +446,7 @@ impl DescriptorCache {
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.generation != generation || !state.healthy {
+            if self.generation() != generation || !state.healthy {
                 continue;
             }
             state.admin = loaded
@@ -391,7 +464,7 @@ impl DescriptorCache {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.generation = state.generation.wrapping_add(1);
+        self.generation.fetch_add(1, Ordering::Release);
         state.healthy = true;
         state.resolved.clear();
         state.admin = AdminDescriptor::Unresolved;
@@ -402,8 +475,10 @@ impl DescriptorCache {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.generation = state.generation.wrapping_add(1);
+        self.generation.fetch_add(1, Ordering::Release);
         state.healthy = false;
+        state.resolved.clear();
+        state.admin = AdminDescriptor::Unresolved;
     }
 }
 
@@ -569,7 +644,7 @@ mod tests {
 
     #[test]
     fn default_descriptors_are_valid_and_cache_generation_advances() {
-        for (_, _, sddl) in DEFAULT_DESCRIPTORS {
+        for (_, _, sddl, _) in DEFAULT_DESCRIPTORS {
             peios::security::sddl::parse(sddl).unwrap();
         }
         let cache = DescriptorCache::new();
