@@ -77,6 +77,19 @@ pub struct IngestItem {
     pub event: RealEvent,
 }
 
+/// A daemon-generated event written directly to an event shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticEvent {
+    /// Kernel boot in which eventd generated the record.
+    pub boot_id: Guid,
+    /// Nanoseconds since the Unix epoch.
+    pub timestamp: u64,
+    /// Event type beginning with `synthetic.`.
+    pub event_type: Box<str>,
+    /// `MessagePack` map following the stable synthetic-event schema.
+    pub payload: Box<[u8]>,
+}
+
 impl IngestItem {
     /// Exact bytes reserved before copying this item out of KMES.
     #[must_use]

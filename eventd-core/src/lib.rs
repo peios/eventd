@@ -16,7 +16,7 @@ pub use metric_store::{
     Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError, MetricType,
     MetricValue,
 };
-pub use model::{Gap, Guid, IngestItem, RealEvent};
+pub use model::{Gap, Guid, IngestItem, RealEvent, SyntheticEvent};
 pub use queue::{BoundedQueue, Pop, QueueConfigError, ReserveError};
 pub use receipt::{Coverage, Interval};
 pub use reconcile::{Observation, ReconcileError, Reconciler};

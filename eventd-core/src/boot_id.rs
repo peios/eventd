@@ -34,6 +34,34 @@ impl BootId {
     pub const fn as_bytes(&self) -> &Guid {
         &self.0
     }
+
+    /// Format the identifier in canonical PCDS GUID text form.
+    #[must_use]
+    pub fn canonical(self) -> String {
+        let mut rfc = self.0;
+        rfc[0..4].reverse();
+        rfc[4..6].reverse();
+        rfc[6..8].reverse();
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            rfc[0],
+            rfc[1],
+            rfc[2],
+            rfc[3],
+            rfc[4],
+            rfc[5],
+            rfc[6],
+            rfc[7],
+            rfc[8],
+            rfc[9],
+            rfc[10],
+            rfc[11],
+            rfc[12],
+            rfc[13],
+            rfc[14],
+            rfc[15]
+        )
+    }
 }
 
 impl core::str::FromStr for BootId {
@@ -133,6 +161,7 @@ mod tests {
                 0xee, 0xff,
             ]
         );
+        assert_eq!(id.canonical(), "00112233-4455-6677-8899-aabbccddeeff");
     }
 
     #[test]

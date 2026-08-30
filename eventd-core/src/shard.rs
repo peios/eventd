@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
-use crate::{Guid, IngestItem, Interval};
+use crate::{Guid, IngestItem, Interval, SyntheticEvent};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -197,6 +197,33 @@ impl Shard {
                 + items.iter().map(|item| item.gaps.len()).sum::<usize>(),
             receipt_rows: receipts.values().map(Vec::len).sum(),
         })
+    }
+
+    /// Commit one daemon-generated event in its own durability transaction.
+    pub fn commit_synthetic(&mut self, event: &SyntheticEvent) -> Result<(), ShardError> {
+        if !event.event_type.starts_with("synthetic.") {
+            return Err(ShardError::InvalidSyntheticType);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
+            [event.event_type.as_ref()],
+        )?;
+        transaction.execute(
+            "INSERT INTO events (boot_id, timestamp, event_type, payload) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &event.boot_id[..],
+                sqlite_integer(event.timestamp, "synthetic timestamp")?,
+                event.event_type.as_ref(),
+                event.payload.as_ref(),
+            ],
+        )?;
+        transaction.commit()?;
+        self.known_types.insert(event.event_type.clone());
+        self.checkpoint_if_needed()
     }
 
     /// Read all receipt rows from this shard for startup reconciliation.
@@ -447,6 +474,8 @@ pub enum ShardError {
     UnknownVersion(String),
     /// An unsigned kernel value cannot fit `SQLite`'s signed `INTEGER`.
     IntegerRange(&'static str),
+    /// The direct-write API was given a non-synthetic event type.
+    InvalidSyntheticType,
 }
 
 impl fmt::Display for ShardError {
@@ -461,6 +490,9 @@ impl fmt::Display for ShardError {
                 write!(formatter, "unsupported event shard schema {version}")
             }
             Self::IntegerRange(field) => write!(formatter, "{field} exceeds SQLite INTEGER range"),
+            Self::InvalidSyntheticType => {
+                formatter.write_str("direct event type does not begin with synthetic.")
+            }
         }
     }
 }
@@ -470,7 +502,10 @@ impl std::error::Error for ShardError {
         match self {
             Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSchema(_) | Self::UnknownVersion(_) | Self::IntegerRange(_) => None,
+            Self::InvalidSchema(_)
+            | Self::UnknownVersion(_)
+            | Self::IntegerRange(_)
+            | Self::InvalidSyntheticType => None,
         }
     }
 }
@@ -551,6 +586,32 @@ mod tests {
             Shard::open(&path, 1_000),
             Err(ShardError::UnknownVersion(version)) if version == "99"
         ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn commits_synthetic_event_directly() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        shard
+            .commit_synthetic(&SyntheticEvent {
+                boot_id: [1; 16],
+                timestamp: 42,
+                event_type: "synthetic.startup".into(),
+                payload: [0x80].into(),
+            })
+            .unwrap();
+        let count: u32 = shard
+            .connection
+            .query_row(
+                "SELECT count(*) FROM events WHERE event_type = 'synthetic.startup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

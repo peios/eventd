@@ -3,17 +3,20 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
-    BoundedQueue, Coverage, IngestItem, LogStore, MetricStore, Shard, StripeRouter, assigned_shards,
+    BoundedQueue, Coverage, LogStore, MetricStore, Shard, StripeRouter, assigned_shards,
 };
 
 use crate::config::{Config, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
 use crate::kmes::{self, DrainContext};
+use crate::writer::WriterMessage;
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -38,17 +41,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.storage_shards
     };
 
-    let boot_id = eventd_core::BootId::read_kernel()?.into_bytes();
+    let boot = eventd_core::BootId::read_kernel()?;
+    let canonical_boot_id = boot.canonical();
+    let boot_id = boot.into_bytes();
     let historical_paths = discover_historical(&event_directory, shard_count)?;
     let mut shards = Vec::with_capacity(shard_count);
+    let mut active_paths = Vec::with_capacity(shard_count);
     let mut receipts = Vec::new();
     let mut restart = false;
     for index in 0..shard_count {
         let path = event_directory.child(&format!("shard-{index:04}.db"));
-        let shard = Shard::open(path, config.wal_checkpoint_pages)?;
+        let shard = Shard::open(&path, config.wal_checkpoint_pages)?;
         restart |= shard.contains_boot(&boot_id)?;
         receipts.extend(shard.receipts()?);
         shards.push(shard);
+        active_paths.push(path);
     }
     for path in &historical_paths {
         match Shard::historical_receipts(path) {
@@ -81,7 +88,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_socket =
         IngestionSocket::bind(&config.metric_socket_path, config.max_metric_datagram_bytes)?;
 
-    let queues: Arc<[BoundedQueue<IngestItem>]> = (0..shard_count)
+    let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..shard_count)
         .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
         .collect::<Result<Vec<_>, _>>()?
         .into();
@@ -150,6 +157,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?,
     );
 
+    let (startup_sender, startup_receiver) = sync_channel(cpu_count);
     let mut drains = Vec::with_capacity(cpu_count);
     for (ordinal, attachment) in attachments.into_iter().enumerate() {
         let cpu_id = attachment.cpu_id;
@@ -162,6 +170,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             ),
             coverage: Arc::clone(&coverage),
             stopping: Arc::clone(&stopping),
+            startup: startup_sender.clone(),
         };
         drains.push(
             std::thread::Builder::new()
@@ -171,8 +180,68 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })?,
         );
     }
+    drop(startup_sender);
+    let mut cpu_ids = Vec::with_capacity(cpu_count);
+    for _ in 0..cpu_count {
+        let cpu_id = startup_receiver
+            .recv()
+            .map_err(|_| "event drain stopped before recovery committed")??;
+        cpu_ids.push(cpu_id);
+    }
+    cpu_ids.sort_unstable();
+    let committed_coverage = load_coverage(&active_paths, &historical_paths)?;
+    let resume_points: Vec<_> = cpu_ids
+        .into_iter()
+        .map(|cpu_id| {
+            (
+                cpu_id,
+                committed_coverage.highest_contiguous(&boot_id, cpu_id),
+            )
+        })
+        .collect();
+    commit_synthetic(
+        &queues[0],
+        crate::synthetic::startup(
+            boot_id,
+            &canonical_boot_id,
+            restart,
+            shard_count,
+            &resume_points,
+            realtime_nanoseconds()?,
+        ),
+    )?;
 
     supervise(drains, writers, &queues, &stopping)
+}
+
+fn load_coverage(
+    active_paths: &[PathBuf],
+    historical_paths: &[PathBuf],
+) -> Result<Coverage, Box<dyn std::error::Error>> {
+    let mut receipts = Vec::new();
+    for path in active_paths.iter().chain(historical_paths) {
+        receipts.extend(Shard::historical_receipts(path)?);
+    }
+    Ok(Coverage::from_receipts(receipts))
+}
+
+fn commit_synthetic(
+    queue: &BoundedQueue<WriterMessage>,
+    event: eventd_core::SyntheticEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (sender, receiver) = sync_channel(1);
+    queue
+        .reserve(core::mem::size_of::<WriterMessage>())?
+        .publish(WriterMessage::Synthetic(event, sender));
+    receiver
+        .recv()
+        .map_err(|_| "event writer stopped before synthetic event commit")??;
+    Ok(())
+}
+
+fn realtime_nanoseconds() -> Result<u64, Box<dyn std::error::Error>> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(u64::try_from(elapsed.as_nanos())?)
 }
 
 fn discover_historical(
@@ -220,7 +289,7 @@ fn install_signal_handlers() -> Result<(), std::io::Error> {
 fn supervise(
     drains: Vec<JoinHandle<Result<(), String>>>,
     writers: Vec<JoinHandle<Result<(), String>>>,
-    queues: &[BoundedQueue<IngestItem>],
+    queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     while !SIGNAL_STOP.load(Ordering::Acquire)

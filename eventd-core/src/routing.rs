@@ -48,6 +48,12 @@ impl StripeRouter {
         self.shards[self.shard_index]
     }
 
+    /// Shards this CPU may target, in stripe order.
+    #[must_use]
+    pub fn shards(&self) -> &[usize] {
+        &self.shards
+    }
+
     /// Consume one successfully handed-off real event.
     pub fn advance(&mut self) {
         self.sent_in_stripe += 1;

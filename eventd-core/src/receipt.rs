@@ -78,6 +78,15 @@ impl Coverage {
             .get(&(*boot_id, cpu_id))
             .map_or(&[], Vec::as_slice)
     }
+
+    /// Highest sequence covered contiguously from sequence one.
+    #[must_use]
+    pub fn highest_contiguous(&self, boot_id: &Guid, cpu_id: u16) -> u64 {
+        self.intervals(boot_id, cpu_id)
+            .first()
+            .filter(|interval| interval.first == 1)
+            .map_or(0, |interval| interval.last)
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +114,6 @@ mod tests {
         );
         assert!(coverage.contains(&boot, 3, 10));
         assert!(!coverage.contains(&boot, 3, 19));
+        assert_eq!(coverage.highest_contiguous(&boot, 3), 12);
     }
 }

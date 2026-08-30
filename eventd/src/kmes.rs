@@ -3,13 +3,15 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
-    BoundedQueue, Coverage, IngestItem, RealEvent, ReconcileError, Reconciler, ReserveError,
-    StripeRouter,
+    BoundedQueue, Coverage, RealEvent, ReconcileError, Reconciler, ReserveError, StripeRouter,
 };
 use peios::event::{EventRing, OriginClass};
+
+use crate::writer::WriterMessage;
 
 pub struct Attachment {
     pub cpu_id: u16,
@@ -53,17 +55,24 @@ fn slot_count() -> Result<u64, KmesError> {
 
 pub struct DrainContext {
     pub boot_id: [u8; 16],
-    pub queues: Arc<[BoundedQueue<IngestItem>]>,
+    pub queues: Arc<[BoundedQueue<WriterMessage>]>,
     pub router: StripeRouter,
     pub coverage: Arc<Coverage>,
     pub stopping: Arc<AtomicBool>,
+    pub startup: SyncSender<Result<u16, String>>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ring state machine stays linear so resize and recovery ordering remain auditable"
+)]
 pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), KmesError> {
     let cpu_id = attachment.cpu_id;
     let mut ring = attachment.ring;
     let mut read_position = ring.tail_pos();
     let mut generation = ring.generation();
+    let mut recovery_boundary = ring.write_pos();
+    let mut recovery_complete = false;
     let mut reconciler = Reconciler::new(&context.coverage, context.boot_id, cpu_id);
     let mut last_sequence = None;
 
@@ -105,7 +114,7 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), Km
             }
 
             let shard = context.router.current_shard();
-            let charged_bytes = core::mem::size_of::<IngestItem>()
+            let charged_bytes = core::mem::size_of::<WriterMessage>()
                 + observation.gaps.len() * core::mem::size_of::<eventd_core::Gap>()
                 + event.event_type.len()
                 + event.payload.len();
@@ -130,11 +139,11 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), Km
                 continue;
             }
             let sequence = owned.sequence;
-            permit.publish(IngestItem {
+            permit.publish(WriterMessage::Event(eventd_core::IngestItem {
                 gaps: observation.gaps,
                 store_event: observation.store_event,
                 event: owned,
-            });
+            }));
             context.router.advance();
             read_position = advance(read_position, event_size)?;
             last_sequence = Some(sequence);
@@ -149,11 +158,46 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), Km
             ring = replacement;
             read_position = replacement_position;
             generation = ring.generation();
+            if !recovery_complete {
+                recovery_boundary = ring.write_pos();
+            }
             continue;
+        }
+        if !recovery_complete && read_position >= recovery_boundary {
+            match commit_recovery_markers(&context) {
+                Ok(()) => {
+                    recovery_complete = true;
+                    let _ = context.startup.send(Ok(cpu_id));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = context.startup.send(Err(message));
+                    return Err(error);
+                }
+            }
         }
         if !progressed {
             ring.wait(read_position, 1_000).map_err(KmesError::Peios)?;
         }
+    }
+    Ok(())
+}
+
+fn commit_recovery_markers(context: &DrainContext) -> Result<(), KmesError> {
+    let mut acknowledgements = Vec::with_capacity(context.router.shards().len());
+    for &shard in context.router.shards() {
+        let (sender, receiver) = sync_channel(1);
+        context.queues[shard]
+            .reserve(core::mem::size_of::<WriterMessage>())
+            .map_err(KmesError::Queue)?
+            .publish(WriterMessage::Barrier(sender));
+        acknowledgements.push(receiver);
+    }
+    for receiver in acknowledgements {
+        receiver
+            .recv()
+            .map_err(|_| KmesError::WriterStopped)?
+            .map_err(KmesError::Writer)?;
     }
     Ok(())
 }
@@ -228,6 +272,8 @@ pub enum KmesError {
     NoBuffers,
     PositionOverflow,
     Clock,
+    WriterStopped,
+    Writer(String),
 }
 
 impl fmt::Display for KmesError {
@@ -251,6 +297,10 @@ impl fmt::Display for KmesError {
             Self::Clock => {
                 formatter.write_str("system realtime clock is outside the u64 nanosecond range")
             }
+            Self::WriterStopped => formatter.write_str("event writer stopped during recovery"),
+            Self::Writer(error) => {
+                write!(formatter, "event writer failed during recovery: {error}")
+            }
         }
     }
 }
@@ -266,7 +316,9 @@ impl std::error::Error for KmesError {
             | Self::CpuMismatch { .. }
             | Self::NoBuffers
             | Self::PositionOverflow
-            | Self::Clock => None,
+            | Self::Clock
+            | Self::WriterStopped
+            | Self::Writer(_) => None,
         }
     }
 }

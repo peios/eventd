@@ -9,6 +9,7 @@ mod kmes;
 mod log_ingest;
 mod metric_ingest;
 mod pipeline;
+mod synthetic;
 mod writer;
 
 /// Start eventd.
