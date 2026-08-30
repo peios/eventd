@@ -38,6 +38,14 @@ pub struct Config {
     pub max_distinct_stream_values: usize,
     pub max_query_request_bytes: usize,
     pub query_response_target_bytes: usize,
+    pub event_retention: Duration,
+    pub event_retention_max_bytes: u64,
+    pub log_retention: Duration,
+    pub log_retention_max_bytes: u64,
+    pub metric_retention: Duration,
+    pub metric_retention_max_bytes: u64,
+    pub retention_interval: Duration,
+    pub retention_delete_batch_rows: usize,
 }
 
 impl Config {
@@ -180,8 +188,47 @@ impl Config {
                 16_777_216,
             ))
             .expect("QueryResponseTargetBytes fits usize"),
+            event_retention: Duration::from_secs(
+                u64::from(dword(&values, b"EventRetentionDays", 30, 1, 3_650)) * 86_400,
+            ),
+            event_retention_max_bytes: qword(&values, b"EventRetentionMaxBytes", 0),
+            log_retention: Duration::from_secs(
+                u64::from(dword(&values, b"LogRetentionDays", 14, 1, 3_650)) * 86_400,
+            ),
+            log_retention_max_bytes: qword(&values, b"LogRetentionMaxBytes", 0),
+            metric_retention: Duration::from_secs(
+                u64::from(dword(&values, b"MetricRetentionDays", 90, 1, 3_650)) * 86_400,
+            ),
+            metric_retention_max_bytes: qword(&values, b"MetricRetentionMaxBytes", 0),
+            retention_interval: Duration::from_secs(
+                u64::from(dword(
+                    &values,
+                    b"RetentionCheckIntervalMinutes",
+                    60,
+                    1,
+                    1_440,
+                )) * 60,
+            ),
+            retention_delete_batch_rows: usize::try_from(dword(
+                &values,
+                b"RetentionDeleteBatchRows",
+                10_000,
+                100,
+                100_000,
+            ))
+            .expect("RetentionDeleteBatchRows fits usize"),
         })
     }
+}
+
+fn qword(values: &HashMap<Vec<u8>, ValueRecord>, name: &'static [u8], default: u64) -> u64 {
+    let Some(record) = values.get(name) else {
+        return default;
+    };
+    if record.ty != ValueType::QWORD || record.data.len() != 8 {
+        return default;
+    }
+    u64::from_le_bytes(record.data.as_slice().try_into().expect("length checked"))
 }
 
 fn required_path(

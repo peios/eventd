@@ -226,6 +226,53 @@ impl Shard {
         self.checkpoint_if_needed()
     }
 
+    /// Delete at most `limit` event rows older than `cutoff`.
+    pub fn retain_before(&mut self, cutoff: i64, limit: usize) -> Result<usize, ShardError> {
+        self.delete_bounded(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events \
+             WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2)",
+            cutoff,
+            limit,
+        )
+    }
+
+    /// Delete at most `limit` rows belonging to one complete boot.
+    pub fn retain_boot(&mut self, boot_id: &Guid, limit: usize) -> Result<usize, ShardError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = transaction.execute(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events \
+             WHERE boot_id = ?1 ORDER BY timestamp, id LIMIT ?2)",
+            params![&boot_id[..], sqlite_limit(limit)?],
+        )?;
+        transaction.commit()?;
+        self.checkpoint_if_needed()?;
+        Ok(deleted)
+    }
+
+    /// Ask the sole writer connection to perform a passive checkpoint.
+    pub fn passive_checkpoint(&self) -> Result<(), ShardError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
+    fn delete_bounded(
+        &mut self,
+        sql: &str,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<usize, ShardError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = transaction.execute(sql, params![cutoff, sqlite_limit(limit)?])?;
+        transaction.commit()?;
+        self.checkpoint_if_needed()?;
+        Ok(deleted)
+    }
+
     /// Read all receipt rows from this shard for startup reconciliation.
     pub fn receipts(&self) -> Result<Vec<(Guid, u16, Interval)>, ShardError> {
         read_receipts(&self.connection)
@@ -386,6 +433,10 @@ fn merge_intervals(intervals: &mut Vec<Interval>) {
 
 fn sqlite_integer(value: u64, field: &'static str) -> Result<i64, ShardError> {
     i64::try_from(value).map_err(|_| ShardError::IntegerRange(field))
+}
+
+fn sqlite_limit(limit: usize) -> Result<i64, ShardError> {
+    i64::try_from(limit).map_err(|_| ShardError::IntegerRange("retention batch size"))
 }
 
 fn encode_gap_payload(cpu_id: u16, gap: crate::Gap) -> Vec<u8> {
@@ -565,6 +616,11 @@ mod tests {
         assert_eq!(type_count, 2);
         assert!(shard.contains_boot(&[1; 16]).unwrap());
         assert!(!shard.contains_boot(&[9; 16]).unwrap());
+        assert_eq!(shard.retain_before(5, 1).unwrap(), 1);
+        assert_eq!(
+            shard.receipts().unwrap()[0].2,
+            Interval { first: 1, last: 5 }
+        );
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -4,6 +4,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{LogRecord, LogStore, LogStoreError};
@@ -11,6 +12,15 @@ use peios::msgpack::{Reader, Type};
 
 use crate::commit_signal::CommitSignal;
 use crate::datagram::{IngestionSocket, Receive, SocketError};
+
+pub enum LogMaintenance {
+    DeleteOldest {
+        older_than: Option<i64>,
+        limit: usize,
+        response: SyncSender<Result<usize, String>>,
+    },
+    Checkpoint(SyncSender<Result<usize, String>>),
+}
 
 #[allow(
     clippy::too_many_arguments,
@@ -25,6 +35,7 @@ pub fn run(
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
+    maintenance: &Receiver<LogMaintenance>,
 ) -> Result<(), LogIngestError> {
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
@@ -59,6 +70,7 @@ pub fn run(
                 started = None;
             }
         }
+        process_maintenance(&mut store, maintenance)?;
     }
     loop {
         match socket.receive(&mut buffer)? {
@@ -86,6 +98,34 @@ pub fn run(
         commits.committed();
     }
     Ok(())
+}
+
+fn process_maintenance(
+    store: &mut LogStore,
+    receiver: &Receiver<LogMaintenance>,
+) -> Result<(), LogIngestError> {
+    let command = match receiver.try_recv() {
+        Ok(command) => command,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
+    };
+    let (result, response) = match command {
+        LogMaintenance::DeleteOldest {
+            older_than,
+            limit,
+            response,
+        } => (store.retain_oldest(older_than, limit), response),
+        LogMaintenance::Checkpoint(response) => (store.passive_checkpoint().map(|()| 0), response),
+    };
+    match result {
+        Ok(deleted) => {
+            let _ = response.send(Ok(deleted));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = response.send(Err(error.to_string()));
+            Err(error.into())
+        }
+    }
 }
 
 fn realtime_nanoseconds() -> Result<i64, LogIngestError> {

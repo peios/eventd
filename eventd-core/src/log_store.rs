@@ -138,6 +138,41 @@ impl LogStore {
         self.checkpoint_if_needed()
     }
 
+    /// Delete at most `limit` oldest rows, optionally constrained by age.
+    pub fn retain_oldest(
+        &mut self,
+        older_than: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, LogStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limit = i64::try_from(limit).map_err(|_| LogStoreError::IntegerRange)?;
+        let deleted = if let Some(cutoff) = older_than {
+            transaction.execute(
+                "DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp < ?1 \
+                 ORDER BY timestamp, id LIMIT ?2)",
+                params![cutoff, limit],
+            )?
+        } else {
+            transaction.execute(
+                "DELETE FROM logs WHERE id IN (SELECT id FROM logs \
+                 ORDER BY timestamp, id LIMIT ?1)",
+                [limit],
+            )?
+        };
+        transaction.commit()?;
+        self.checkpoint_if_needed()?;
+        Ok(deleted)
+    }
+
+    /// Ask the sole writer connection to perform a passive checkpoint.
+    pub fn passive_checkpoint(&self) -> Result<(), LogStoreError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
     fn checkpoint_if_needed(&self) -> Result<(), LogStoreError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -203,6 +238,8 @@ pub enum LogStoreError {
     InvalidSchema(&'static str),
     /// Unsupported schema version.
     UnknownVersion(String),
+    /// Retention batch size exceeds `SQLite`'s integer range.
+    IntegerRange,
 }
 
 impl fmt::Display for LogStoreError {
@@ -214,6 +251,9 @@ impl fmt::Display for LogStoreError {
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported log-store schema {version}")
             }
+            Self::IntegerRange => {
+                formatter.write_str("log retention batch size exceeds SQLite range")
+            }
         }
     }
 }
@@ -223,7 +263,7 @@ impl std::error::Error for LogStoreError {
         match self {
             Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSchema(_) | Self::UnknownVersion(_) => None,
+            Self::InvalidSchema(_) | Self::UnknownVersion(_) | Self::IntegerRange => None,
         }
     }
 }
@@ -261,6 +301,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (2, 1));
+        assert_eq!(store.retain_oldest(Some(11), 1).unwrap(), 1);
+        assert_eq!(store.retain_oldest(Some(11), 10).unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

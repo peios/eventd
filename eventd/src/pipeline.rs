@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,7 +51,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         event_directory.child("eventd-meta.db"),
         config.wal_checkpoint_pages,
     )?;
-    let historical_paths = discover_historical(&event_directory, shard_count)?;
+    let discovered_historical = discover_historical(&event_directory, shard_count)?;
+    let mut historical_paths = Vec::new();
     let mut shards = Vec::with_capacity(shard_count);
     let mut active_paths = Vec::with_capacity(shard_count);
     let mut receipts = Vec::new();
@@ -64,7 +65,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         shards.push(shard);
         active_paths.push(path);
     }
-    for path in &historical_paths {
+    for path in &discovered_historical {
         match Shard::historical_receipts(path) {
             Ok(rows) => receipts.extend(rows),
             Err(error) => {
@@ -76,6 +77,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         restart |= Shard::historical_contains_boot(path, &boot_id).unwrap_or(false);
+        historical_paths.push(path.clone());
     }
     eprintln!(
         "eventd: {} with {cpu_count} KMES buffer(s), {shard_count} active shard(s); sockets {}, {}, {}",
@@ -140,6 +142,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_batch_latency = config.log_max_batch_latency;
     let log_datagram_ceiling = config.max_log_datagram_bytes;
     let log_writer_commits = Arc::clone(&log_commits);
+    let (log_maintenance_sender, log_maintenance_receiver) = channel();
     let log_thread_socket = Arc::clone(&log_socket);
     let log_handle = std::thread::Builder::new()
         .name("eventd-log".to_owned())
@@ -153,6 +156,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 log_batch_latency,
                 &log_stopping,
                 &log_writer_commits,
+                &log_maintenance_receiver,
             )
             .map_err(|error| error.to_string())
         })?;
@@ -160,6 +164,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_batch_size = config.metric_max_batch_size;
     let metric_batch_latency = config.metric_max_batch_latency;
     let metric_datagram_ceiling = config.max_metric_datagram_bytes;
+    let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
     let metric_thread_socket = Arc::clone(&metric_socket);
     let metric_handle = std::thread::Builder::new()
         .name("eventd-metric".to_owned())
@@ -172,6 +177,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 metric_batch_size,
                 metric_batch_latency,
                 &metric_stopping,
+                &metric_maintenance_receiver,
             )
             .map_err(|error| error.to_string())
         })?;
@@ -236,8 +242,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .chain(&historical_paths)
             .cloned()
             .collect(),
-        log_path,
-        metric_path,
+        log_path: log_path.clone(),
+        metric_path: metric_path.clone(),
     });
     let query_config = Arc::new(ServerConfig {
         max_request_bytes: config.max_query_request_bytes,
@@ -262,6 +268,38 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map_err(|error| error.to_string())
         })?;
+    let retention_config = crate::retention::RetentionConfig {
+        event_age: config.event_retention,
+        event_max_bytes: config.event_retention_max_bytes,
+        log_age: config.log_retention,
+        log_max_bytes: config.log_retention_max_bytes,
+        metric_age: config.metric_retention,
+        metric_max_bytes: config.metric_retention_max_bytes,
+        interval: config.retention_interval,
+        batch_rows: config.retention_delete_batch_rows,
+        checkpoint_pages: config.wal_checkpoint_pages,
+    };
+    let retention_stores = crate::retention::Stores {
+        event_paths: active_paths.clone(),
+        historical_event_paths: historical_paths.clone(),
+        log_path,
+        metric_path,
+    };
+    let retention_queues = Arc::clone(&queues);
+    let retention_stopping = Arc::clone(&stopping);
+    let retention_handle = std::thread::Builder::new()
+        .name("eventd-retention".to_owned())
+        .spawn(move || {
+            crate::retention::run(
+                retention_config,
+                retention_stores,
+                retention_queues,
+                log_maintenance_sender,
+                metric_maintenance_sender,
+                boot_id,
+                retention_stopping,
+            )
+        })?;
     notify_ready()?;
 
     supervise(
@@ -270,6 +308,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_handle,
         metric_handle,
         query_handle,
+        retention_handle,
         &queues,
         &stopping,
         query_server,
@@ -386,6 +425,7 @@ fn supervise(
     log_handle: JoinHandle<Result<(), String>>,
     metric_handle: JoinHandle<Result<(), String>>,
     query_handle: JoinHandle<Result<(), String>>,
+    retention_handle: JoinHandle<Result<(), String>>,
     queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
     query_server: Arc<QueryServer>,
@@ -403,6 +443,7 @@ fn supervise(
         && !log_handle.is_finished()
         && !metric_handle.is_finished()
         && !query_handle.is_finished()
+        && !retention_handle.is_finished()
     {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -413,6 +454,7 @@ fn supervise(
     stopping.store(true, Ordering::Release);
 
     let mut first_error = None;
+    join_worker(retention_handle, &mut first_error);
     join_worker(query_handle, &mut first_error);
     join_worker(log_handle, &mut first_error);
     join_worker(metric_handle, &mut first_error);

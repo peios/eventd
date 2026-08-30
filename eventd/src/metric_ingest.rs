@@ -4,6 +4,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
@@ -13,6 +14,19 @@ use peios::msgpack::{Reader, Type};
 
 use crate::datagram::{IngestionSocket, Receive, SocketError};
 
+pub enum MetricMaintenance {
+    DeleteOldest {
+        older_than: Option<i64>,
+        limit: usize,
+        response: SyncSender<Result<usize, String>>,
+    },
+    Checkpoint(SyncSender<Result<usize, String>>),
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sole metric owner receives its fixed batching and maintenance dependencies explicitly"
+)]
 pub fn run(
     socket: &IngestionSocket,
     mut store: MetricStore,
@@ -21,6 +35,7 @@ pub fn run(
     max_batch_size: usize,
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
+    maintenance: &Receiver<MetricMaintenance>,
 ) -> Result<(), MetricIngestError> {
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
@@ -53,6 +68,7 @@ pub fn run(
                 started = None;
             }
         }
+        process_maintenance(&mut store, maintenance)?;
     }
     loop {
         match socket.receive(&mut buffer)? {
@@ -78,6 +94,36 @@ pub fn run(
         store.commit(&batch)?;
     }
     Ok(())
+}
+
+fn process_maintenance(
+    store: &mut MetricStore,
+    receiver: &Receiver<MetricMaintenance>,
+) -> Result<(), MetricIngestError> {
+    let command = match receiver.try_recv() {
+        Ok(command) => command,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(()),
+    };
+    let (result, response) = match command {
+        MetricMaintenance::DeleteOldest {
+            older_than,
+            limit,
+            response,
+        } => (store.retain_oldest(older_than, limit), response),
+        MetricMaintenance::Checkpoint(response) => {
+            (store.passive_checkpoint().map(|()| 0), response)
+        }
+    };
+    match result {
+        Ok(deleted) => {
+            let _ = response.send(Ok(deleted));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = response.send(Err(error.to_string()));
+            Err(error.into())
+        }
+    }
 }
 
 pub fn parse_datagram(

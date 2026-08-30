@@ -215,6 +215,50 @@ impl MetricStore {
         })
     }
 
+    /// Delete at most `limit` oldest samples and prune now-empty series.
+    pub fn retain_oldest(
+        &mut self,
+        older_than: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, MetricStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limit = i64::try_from(limit).map_err(|_| MetricStoreError::IntegerRange)?;
+        let deleted = if let Some(cutoff) = older_than {
+            transaction.execute(
+                "DELETE FROM samples WHERE id IN (SELECT id FROM samples WHERE timestamp < ?1 \
+                 ORDER BY timestamp, id LIMIT ?2)",
+                params![cutoff, limit],
+            )?
+        } else {
+            transaction.execute(
+                "DELETE FROM samples WHERE id IN (SELECT id FROM samples \
+                 ORDER BY timestamp, id LIMIT ?1)",
+                [limit],
+            )?
+        };
+        transaction.execute(
+            "DELETE FROM series WHERE id IN (SELECT series.id FROM series \
+             WHERE NOT EXISTS (SELECT 1 FROM samples WHERE samples.series_id = series.id) \
+             LIMIT ?1)",
+            [limit],
+        )?;
+        transaction.commit()?;
+        if deleted != 0 {
+            self.cache.clear();
+        }
+        self.checkpoint_if_needed()?;
+        Ok(deleted)
+    }
+
+    /// Ask the sole writer connection to perform a passive checkpoint.
+    pub fn passive_checkpoint(&self) -> Result<(), MetricStoreError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok(())
+    }
+
     fn checkpoint_if_needed(&self) -> Result<(), MetricStoreError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -444,6 +488,8 @@ pub enum MetricStoreError {
     InvalidSchema(&'static str),
     /// Unsupported schema version.
     UnknownVersion(String),
+    /// Retention batch size exceeds `SQLite`'s integer range.
+    IntegerRange,
 }
 
 impl fmt::Display for MetricStoreError {
@@ -457,6 +503,9 @@ impl fmt::Display for MetricStoreError {
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported metric-store schema {version}")
             }
+            Self::IntegerRange => {
+                formatter.write_str("metric retention batch size exceeds SQLite range")
+            }
         }
     }
 }
@@ -466,7 +515,7 @@ impl std::error::Error for MetricStoreError {
         match self {
             Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSchema(_) | Self::UnknownVersion(_) => None,
+            Self::InvalidSchema(_) | Self::UnknownVersion(_) | Self::IntegerRange => None,
         }
     }
 }
@@ -515,6 +564,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 2));
+        assert_eq!(store.retain_oldest(Some(11), 10).unwrap(), 2);
+        let series: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(series, 0);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

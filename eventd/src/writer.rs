@@ -17,6 +17,15 @@ pub enum WriterMessage {
     Barrier(SyncSender<Result<(), String>>),
     /// Commit a daemon-generated event immediately, then acknowledge it.
     Synthetic(SyntheticEvent, SyncSender<Result<(), String>>),
+    /// One bounded low-priority retention or checkpoint operation.
+    Maintenance(EventMaintenance, SyncSender<Result<usize, String>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum EventMaintenance {
+    DeleteBefore { cutoff: i64, limit: usize },
+    DeleteBoot { boot_id: [u8; 16], limit: usize },
+    Checkpoint,
 }
 
 pub fn run(
@@ -110,6 +119,27 @@ fn handle_control(
                 Err(error)
             }
         },
+        WriterMessage::Maintenance(command, sender) => {
+            let result = match command {
+                EventMaintenance::DeleteBefore { cutoff, limit } => {
+                    shard.retain_before(cutoff, limit)
+                }
+                EventMaintenance::DeleteBoot { boot_id, limit } => {
+                    shard.retain_boot(&boot_id, limit)
+                }
+                EventMaintenance::Checkpoint => shard.passive_checkpoint().map(|()| 0),
+            };
+            match result {
+                Ok(deleted) => {
+                    let _ = sender.send(Ok(deleted));
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
@@ -117,6 +147,9 @@ fn fail_control(message: WriterMessage, error: &ShardError) {
     match message {
         WriterMessage::Event(_) => {}
         WriterMessage::Barrier(sender) | WriterMessage::Synthetic(_, sender) => {
+            let _ = sender.send(Err(error.to_string()));
+        }
+        WriterMessage::Maintenance(_, sender) => {
             let _ = sender.send(Err(error.to_string()));
         }
     }

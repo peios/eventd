@@ -12,6 +12,7 @@ mod metric_ingest;
 mod pipeline;
 mod query;
 mod query_language;
+mod retention;
 mod synthetic;
 mod writer;
 
