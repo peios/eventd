@@ -23,6 +23,15 @@ use crate::indexing::{PolicyMessage, Tracker};
 use crate::query_language::{RecordAggregate, Source};
 
 pub use executor::{Limits, Stores};
+pub use security::DescriptorCache;
+
+pub fn watch_security_descriptors(cache: &Arc<DescriptorCache>, stopping: &AtomicBool) {
+    security::watch_descriptors(cache, stopping);
+}
+
+pub fn provision_security_defaults() -> Result<(), security::SecurityError> {
+    security::provision_defaults()
+}
 
 pub struct ServerConfig {
     pub max_request_bytes: usize,
@@ -35,6 +44,7 @@ pub struct ServerConfig {
     pub cross_type_max_lookback: Duration,
     pub index_tracker: Arc<Tracker>,
     pub index_policy: SyncSender<PolicyMessage>,
+    pub descriptors: Arc<DescriptorCache>,
 }
 
 pub struct QueryServer {
@@ -174,7 +184,8 @@ fn handle(
         .set_write_timeout(Some(config.timeout))
         .map_err(QuerySocketError::Io)?;
     let authorizer =
-        security::Authorizer::from_peer(stream.as_fd()).map_err(QuerySocketError::Security)?;
+        security::Authorizer::from_peer(stream.as_fd(), Arc::clone(&config.descriptors))
+            .map_err(QuerySocketError::Security)?;
     let query_text = match read_request(&mut stream, config.max_request_bytes) {
         Ok(query) => query,
         Err(error) => {

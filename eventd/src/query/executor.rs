@@ -32,6 +32,7 @@ pub struct StreamState {
     cursor: StoreCursor,
     cross_type_window: Duration,
     cross_type_max_lookback: Duration,
+    authorization: AuthorizationCache,
 }
 
 #[derive(Clone)]
@@ -47,6 +48,7 @@ pub fn execute(
     limits: &Limits,
 ) -> Result<Vec<Record>, QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
+    let mut authorization = AuthorizationCache::new(authorizer);
     execute_at(
         query,
         stores,
@@ -64,6 +66,7 @@ pub fn execute(
         false,
         limits.cross_type_window,
         limits.cross_type_max_lookback,
+        &mut authorization,
     )
 }
 
@@ -74,6 +77,7 @@ pub fn start_stream(
     limits: &Limits,
 ) -> Result<(Vec<Record>, StreamState), QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
+    let mut authorization = AuthorizationCache::new(authorizer);
     let cursor = capture_cursor(stores, &query.source)?;
     let lower = StoreCursor {
         event_ids: vec![0; stores.event_paths.len()],
@@ -90,6 +94,7 @@ pub fn start_stream(
         false,
         limits.cross_type_window,
         limits.cross_type_max_lookback,
+        &mut authorization,
     )?;
     Ok((
         records,
@@ -98,6 +103,7 @@ pub fn start_stream(
             cursor,
             cross_type_window: limits.cross_type_window,
             cross_type_max_lookback: limits.cross_type_max_lookback,
+            authorization,
         },
     ))
 }
@@ -127,6 +133,7 @@ pub fn stream_next(
         true,
         state.cross_type_window,
         state.cross_type_max_lookback,
+        &mut state.authorization,
     )?;
     state.cursor = upper;
     Ok(records)
@@ -148,6 +155,7 @@ fn execute_at(
     watch: bool,
     cross_type_window: Duration,
     cross_type_max_lookback: Duration,
+    authorization: &mut AuthorizationCache,
 ) -> Result<Vec<Record>, QueryError> {
     let (since, mut until) = time_range(query, evaluation_time)?;
     if watch {
@@ -220,7 +228,6 @@ fn execute_at(
         Source::Metric { .. } => unreachable!(),
     };
     let referenced = referenced_fields(query);
-    let mut cache = HashMap::new();
     let mut visible = Vec::with_capacity(rows.len());
     for mut row in rows {
         check_deadline(deadline)?;
@@ -230,7 +237,7 @@ fn execute_at(
         {
             continue;
         }
-        if authorize_row(authorizer, namespace, &mut row, &referenced, &mut cache)?
+        if authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
             && query
                 .predicates
                 .iter()
@@ -988,17 +995,18 @@ fn authorize_row(
     namespace: Namespace,
     row: &mut Row,
     referenced: &[String],
-    cache: &mut HashMap<(String, Vec<String>), Option<std::collections::HashSet<String>>>,
+    cache: &mut AuthorizationCache,
 ) -> Result<bool, QueryError> {
+    cache.refresh(authorizer);
     let mut fields: Vec<_> = row.record.keys().cloned().collect();
     fields.extend(referenced.iter().cloned());
     fields.sort_unstable();
     let key = (row.identifier.clone(), fields.clone());
-    let allowed = if let Some(allowed) = cache.get(&key) {
+    let allowed = if let Some(allowed) = cache.entries.get(&key) {
         allowed.clone()
     } else {
         let allowed = authorizer.check(namespace, &row.identifier, &fields)?;
-        cache.insert(key, allowed.clone());
+        cache.entries.insert(key, allowed.clone());
         allowed
     };
     let Some(allowed) = allowed else {
@@ -1009,6 +1017,30 @@ fn authorize_row(
     }
     row.record.retain(|field, _| allowed.contains(field));
     Ok(true)
+}
+
+type AccessEntries = HashMap<(String, Vec<String>), Option<std::collections::HashSet<String>>>;
+
+struct AuthorizationCache {
+    generation: u64,
+    entries: AccessEntries,
+}
+
+impl AuthorizationCache {
+    fn new(authorizer: &Authorizer) -> Self {
+        Self {
+            generation: authorizer.descriptor_generation(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn refresh(&mut self, authorizer: &Authorizer) {
+        let generation = authorizer.descriptor_generation();
+        if self.generation != generation {
+            self.generation = generation;
+            self.entries.clear();
+        }
+    }
 }
 
 fn referenced_fields(query: &Query) -> Vec<String> {
@@ -1510,7 +1542,7 @@ fn execute_metric(
         return Err(QueryError::MetricNeedsWindow);
     }
     let referenced = referenced_fields(query);
-    let mut authorization_cache = HashMap::new();
+    let mut authorization_cache = AuthorizationCache::new(authorizer);
     let mut resolved = Vec::with_capacity(series_count);
     for (series_id, name, metric_type, label_map) in series {
         check_deadline(deadline)?;

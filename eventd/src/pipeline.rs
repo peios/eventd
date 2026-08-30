@@ -18,7 +18,7 @@ use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
 use crate::indexing::{PolicyConfig, PolicyMessage, Tracker};
 use crate::kmes::{self, DrainContext};
-use crate::query::{QueryServer, ServerConfig};
+use crate::query::{DescriptorCache, QueryServer, ServerConfig};
 use crate::writer::{SheddingConfig, WriterMessage};
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
@@ -33,6 +33,7 @@ extern "C" fn stop_signal(_signal: libc::c_int) {
 )]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
+    crate::query::provision_security_defaults()?;
     validate_distinct_paths(&config)?;
     let event_directory = StoreDirectory::open(&config.event_store_path)?;
     let log_directory = StoreDirectory::open(&config.log_store_path)?;
@@ -119,6 +120,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?
         .into();
     let stopping = Arc::new(AtomicBool::new(false));
+    let descriptors = Arc::new(DescriptorCache::new());
+    let descriptor_thread_cache = Arc::clone(&descriptors);
+    let descriptor_thread_stopping = Arc::clone(&stopping);
+    let descriptor_handle = std::thread::Builder::new()
+        .name("eventd-security-watch".to_owned())
+        .spawn(move || {
+            crate::query::watch_security_descriptors(
+                &descriptor_thread_cache,
+                &descriptor_thread_stopping,
+            );
+            Ok(())
+        })?;
     let ring_pressure: Arc<[AtomicU8]> = (0..cpu_count)
         .map(|_| AtomicU8::new(0))
         .collect::<Vec<_>>()
@@ -300,6 +313,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         cross_type_max_lookback: config.cross_type_max_lookback,
         index_tracker,
         index_policy: index_policy_sender.clone(),
+        descriptors,
     });
     let query_stopping = Arc::clone(&stopping);
     let query_thread_server = Arc::clone(&query_server);
@@ -358,6 +372,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         query_handle,
         retention_handle,
         index_handle,
+        descriptor_handle,
         &queues,
         &stopping,
         query_server,
@@ -476,6 +491,7 @@ fn supervise(
     query_handle: JoinHandle<Result<(), String>>,
     retention_handle: JoinHandle<Result<(), String>>,
     index_handle: JoinHandle<Result<(), String>>,
+    descriptor_handle: JoinHandle<Result<(), String>>,
     queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
     query_server: Arc<QueryServer>,
@@ -495,6 +511,7 @@ fn supervise(
         && !query_handle.is_finished()
         && !retention_handle.is_finished()
         && !index_handle.is_finished()
+        && !descriptor_handle.is_finished()
     {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -507,6 +524,7 @@ fn supervise(
     let mut first_error = None;
     join_worker(retention_handle, &mut first_error);
     join_worker(query_handle, &mut first_error);
+    join_worker(descriptor_handle, &mut first_error);
     join_worker(log_handle, &mut first_error);
     join_worker(metric_handle, &mut first_error);
     drop(query_server);

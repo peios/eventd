@@ -1,18 +1,62 @@
 //! KACS-backed per-identifier and per-field query authorization.
 
 use core::fmt;
-use std::collections::HashSet;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use peios::registry::{Key, KeyAccess, OpenFlags, ValueType};
+use peios::registry::{
+    CreateFlags, Disposition, Key, KeyAccess, NotifyFilter, OpenFlags, ValueType,
+};
 use peios::security::SecurityDescriptor;
 use peios::token::Token;
 
 const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
 const EVENTD_READ: u32 = 0x0001;
 const EVENTD_ADMINISTER: u32 = 0x0004;
+const DEFAULT_DESCRIPTORS: [(&str, &str); 4] = [
+    (
+        r"Machine\System\eventd\Security\Events\*",
+        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)",
+    ),
+    (
+        r"Machine\System\eventd\Security\Logs\*",
+        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+    ),
+    (
+        r"Machine\System\eventd\Security\Metrics\*",
+        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+    ),
+    (
+        r"Machine\System\eventd\Security\Admin",
+        "O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)",
+    ),
+];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub fn provision_defaults() -> Result<(), SecurityError> {
+    for (path, sddl) in DEFAULT_DESCRIPTORS {
+        let (key, disposition) = Key::create(
+            None,
+            path,
+            KeyAccess::QUERY_VALUE | KeyAccess::SET_VALUE,
+            CreateFlags::default(),
+            None,
+            None,
+        )
+        .map_err(SecurityError::Peios)?;
+        if disposition == Disposition::CreatedNew {
+            let descriptor = peios::security::sddl::parse(sddl).map_err(SecurityError::Peios)?;
+            key.set_value(b"", ValueType::BINARY, descriptor.as_bytes())
+                .call()
+                .map_err(SecurityError::Peios)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Namespace {
     Events,
     Logs,
@@ -43,12 +87,17 @@ impl Namespace {
 
 pub struct Authorizer {
     token: Token,
+    descriptors: Arc<DescriptorCache>,
 }
 
 impl Authorizer {
-    pub fn from_peer(socket: BorrowedFd<'_>) -> Result<Self, SecurityError> {
+    pub fn from_peer(
+        socket: BorrowedFd<'_>,
+        descriptors: Arc<DescriptorCache>,
+    ) -> Result<Self, SecurityError> {
         Ok(Self {
             token: Token::open_peer(socket).map_err(SecurityError::Peios)?,
+            descriptors,
         })
     }
 
@@ -58,7 +107,7 @@ impl Authorizer {
         identifier: &str,
         fields: &[String],
     ) -> Result<Option<HashSet<String>>, SecurityError> {
-        let Some((pattern, descriptor)) = resolve_descriptor(namespace, identifier)? else {
+        let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
             return Ok(None);
         };
         let mut tree = Vec::with_capacity(fields.len() + 1);
@@ -135,7 +184,7 @@ impl Authorizer {
     }
 
     pub fn administer(&self) -> Result<bool, SecurityError> {
-        let Some(descriptor) = load_admin_descriptor()? else {
+        let Some(descriptor) = self.descriptors.admin()? else {
             return Ok(false);
         };
         let request = peios_sys::peios_access_request {
@@ -181,6 +230,205 @@ impl Authorizer {
             Err(SecurityError::Peios(error))
         }
     }
+
+    pub fn descriptor_generation(&self) -> u64 {
+        self.descriptors.generation()
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedDescriptor {
+    pattern: String,
+    descriptor: Arc<SecurityDescriptor>,
+}
+
+struct DescriptorState {
+    generation: u64,
+    healthy: bool,
+    resolved: HashMap<(Namespace, String), Option<ResolvedDescriptor>>,
+    admin: AdminDescriptor,
+}
+
+#[derive(Clone)]
+enum AdminDescriptor {
+    Unresolved,
+    Missing,
+    Present(Arc<SecurityDescriptor>),
+}
+
+pub struct DescriptorCache {
+    state: RwLock<DescriptorState>,
+}
+
+impl DescriptorCache {
+    pub fn new() -> Self {
+        Self {
+            state: RwLock::new(DescriptorState {
+                generation: 0,
+                healthy: true,
+                resolved: HashMap::new(),
+                admin: AdminDescriptor::Unresolved,
+            }),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    fn resolve(
+        &self,
+        namespace: Namespace,
+        identifier: &str,
+    ) -> Result<Option<(String, Arc<SecurityDescriptor>)>, SecurityError> {
+        let key = (namespace, identifier.to_owned());
+        loop {
+            let (generation, healthy) = {
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(cached) = state.resolved.get(&key) {
+                    return Ok(cached.as_ref().map(|resolved| {
+                        (resolved.pattern.clone(), Arc::clone(&resolved.descriptor))
+                    }));
+                }
+                (state.generation, state.healthy)
+            };
+            if !healthy {
+                return Ok(None);
+            }
+            let loaded = resolve_descriptor(namespace, identifier)?.map(|(pattern, descriptor)| {
+                ResolvedDescriptor {
+                    pattern,
+                    descriptor: Arc::new(descriptor),
+                }
+            });
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation != generation || !state.healthy {
+                continue;
+            }
+            state.resolved.insert(key, loaded.clone());
+            drop(state);
+            return Ok(loaded.map(|resolved| (resolved.pattern, resolved.descriptor)));
+        }
+    }
+
+    fn admin(&self) -> Result<Option<Arc<SecurityDescriptor>>, SecurityError> {
+        loop {
+            let (generation, healthy) = {
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &state.admin {
+                    AdminDescriptor::Present(cached) => return Ok(Some(Arc::clone(cached))),
+                    AdminDescriptor::Missing => return Ok(None),
+                    AdminDescriptor::Unresolved => {}
+                }
+                (state.generation, state.healthy)
+            };
+            if !healthy {
+                return Ok(None);
+            }
+            let loaded = load_admin_descriptor()?.map(Arc::new);
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation != generation || !state.healthy {
+                continue;
+            }
+            state.admin = loaded
+                .as_ref()
+                .map_or(AdminDescriptor::Missing, |descriptor| {
+                    AdminDescriptor::Present(Arc::clone(descriptor))
+                });
+            drop(state);
+            return Ok(loaded);
+        }
+    }
+
+    fn invalidate(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.healthy = true;
+        state.resolved.clear();
+        state.admin = AdminDescriptor::Unresolved;
+    }
+
+    fn fail_watch(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.healthy = false;
+    }
+}
+
+pub fn watch_descriptors(cache: &Arc<DescriptorCache>, stopping: &AtomicBool) {
+    while !stopping.load(Ordering::Acquire) {
+        if let Err(error) = watch_once(cache, stopping) {
+            cache.fail_watch();
+            eprintln!("eventd: security descriptor watch degraded: {error}");
+            for _ in 0..10 {
+                if stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn watch_once(cache: &DescriptorCache, stopping: &AtomicBool) -> Result<(), SecurityError> {
+    let key = Key::open(None, SECURITY_ROOT, KeyAccess::NOTIFY, OpenFlags::default())
+        .map_err(SecurityError::Peios)?;
+    key.notify(NotifyFilter::ALL, true)
+        .map_err(SecurityError::Peios)?;
+    key.set_nonblocking(true).map_err(SecurityError::Peios)?;
+    cache.invalidate();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while !stopping.load(Ordering::Acquire) {
+        let mut poll = libc::pollfd {
+            fd: key.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized descriptor for the call.
+        let result = unsafe { libc::poll(&raw mut poll, 1, 100) };
+        if result < 0 {
+            let error = peios::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SecurityError::Peios(error));
+        }
+        if result == 0 {
+            continue;
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(SecurityError::WatchClosed);
+        }
+        if !key
+            .read_watch_events(&mut buffer)
+            .map_err(SecurityError::Peios)?
+            .is_empty()
+        {
+            cache.invalidate();
+        }
+    }
+    Ok(())
 }
 
 fn load_admin_descriptor() -> Result<Option<SecurityDescriptor>, SecurityError> {
@@ -366,6 +614,7 @@ pub enum SecurityError {
     Peios(peios::Error),
     InvalidDescriptorType(String),
     TooManyFields,
+    WatchClosed,
 }
 
 impl fmt::Display for SecurityError {
@@ -376,6 +625,7 @@ impl fmt::Display for SecurityError {
                 write!(formatter, "security descriptor at {path} is not REG_BINARY")
             }
             Self::TooManyFields => formatter.write_str("record has too many fields to authorize"),
+            Self::WatchClosed => formatter.write_str("security registry watch closed"),
         }
     }
 }
@@ -384,7 +634,7 @@ impl std::error::Error for SecurityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Peios(error) => Some(error),
-            Self::InvalidDescriptorType(_) | Self::TooManyFields => None,
+            Self::InvalidDescriptorType(_) | Self::TooManyFields | Self::WatchClosed => None,
         }
     }
 }
@@ -410,6 +660,26 @@ mod tests {
                 0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
                 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
             ]
+        );
+    }
+
+    #[test]
+    fn default_descriptors_are_valid_and_cache_generation_advances() {
+        for (_, sddl) in DEFAULT_DESCRIPTORS {
+            peios::security::sddl::parse(sddl).unwrap();
+        }
+        let cache = DescriptorCache::new();
+        assert_eq!(cache.generation(), 0);
+        cache.invalidate();
+        assert_eq!(cache.generation(), 1);
+        cache.fail_watch();
+        assert_eq!(cache.generation(), 2);
+        assert!(
+            !cache
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .healthy
         );
     }
 }
