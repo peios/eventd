@@ -7,50 +7,81 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use peios::registry::{
-    CreateFlags, Disposition, Key, KeyAccess, NotifyFilter, OpenFlags, ValueType,
-};
+use peios::registry::{CreateFlags, Key, KeyAccess, NotifyFilter, OpenFlags, ValueType};
 use peios::security::SecurityDescriptor;
 use peios::token::Token;
 
 const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
 const EVENTD_READ: u32 = 0x0001;
 const EVENTD_ADMINISTER: u32 = 0x0004;
-const DEFAULT_DESCRIPTORS: [(&str, &str); 4] = [
+const DEFAULT_DESCRIPTORS: [(&str, &str, &str); 4] = [
     (
-        r"Machine\System\eventd\Security\Events\*",
+        "Events",
+        "*",
         "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)",
     ),
     (
-        r"Machine\System\eventd\Security\Logs\*",
+        "Logs",
+        "*",
         "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
     ),
     (
-        r"Machine\System\eventd\Security\Metrics\*",
+        "Metrics",
+        "*",
         "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
     ),
     (
-        r"Machine\System\eventd\Security\Admin",
+        "",
+        "Admin",
         "O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)",
     ),
 ];
 
 pub fn provision_defaults() -> Result<(), SecurityError> {
-    for (path, sddl) in DEFAULT_DESCRIPTORS {
-        let (key, disposition) = Key::create(
-            None,
-            path,
+    let (security, _) = Key::create(
+        None,
+        SECURITY_ROOT,
+        KeyAccess::CREATE_SUB_KEY,
+        CreateFlags::default(),
+        None,
+        None,
+    )
+    .map_err(SecurityError::Peios)?;
+    for (namespace, name, sddl) in DEFAULT_DESCRIPTORS {
+        let namespace_key = if namespace.is_empty() {
+            None
+        } else {
+            let (parent, _) = Key::create(
+                Some(&security),
+                namespace,
+                KeyAccess::CREATE_SUB_KEY,
+                CreateFlags::default(),
+                None,
+                None,
+            )
+            .map_err(SecurityError::Peios)?;
+            Some(parent)
+        };
+        let parent = namespace_key.as_ref().unwrap_or(&security);
+        let (key, _) = Key::create(
+            Some(parent),
+            name,
             KeyAccess::QUERY_VALUE | KeyAccess::SET_VALUE,
             CreateFlags::default(),
             None,
             None,
         )
         .map_err(SecurityError::Peios)?;
-        if disposition == Disposition::CreatedNew {
-            let descriptor = peios::security::sddl::parse(sddl).map_err(SecurityError::Peios)?;
-            key.set_value(b"", ValueType::BINARY, descriptor.as_bytes())
-                .call()
-                .map_err(SecurityError::Peios)?;
+        match key.query_value(b"", None) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                let descriptor =
+                    peios::security::sddl::parse(sddl).map_err(SecurityError::Peios)?;
+                key.set_value(b"", ValueType::BINARY, descriptor.as_bytes())
+                    .call()
+                    .map_err(SecurityError::Peios)?;
+            }
+            Err(error) => return Err(SecurityError::Peios(error)),
         }
     }
     Ok(())
@@ -538,7 +569,7 @@ mod tests {
 
     #[test]
     fn default_descriptors_are_valid_and_cache_generation_advances() {
-        for (_, sddl) in DEFAULT_DESCRIPTORS {
+        for (_, _, sddl) in DEFAULT_DESCRIPTORS {
             peios::security::sddl::parse(sddl).unwrap();
         }
         let cache = DescriptorCache::new();

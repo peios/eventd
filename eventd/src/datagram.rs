@@ -1,13 +1,13 @@
 //! Bounded nonblocking Unix datagram ingestion socket.
 
 use core::fmt;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
-use peios::file::{File, SecInfo};
+use peios::file::SecInfo;
 
 pub struct IngestionSocket {
     socket: UnixDatagram,
@@ -33,11 +33,10 @@ impl IngestionSocket {
         // Binding applies the parent directory's inheritable descriptor. Read it
         // back and establish that complete descriptor explicitly before the
         // first receive, so a directory without usable inheritance fails here.
-        let duplicate = duplicate_fd(socket.as_raw_fd())?;
-        let file = File::from(duplicate);
         let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
-        let descriptor = file.fd_get_sd(secinfo).map_err(SocketError::Security)?;
-        file.fd_set_sd(secinfo, &descriptor)
+        let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(SocketError::Security)?;
+        peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
             .map_err(SocketError::Security)?;
         Ok(Self {
             socket,
@@ -118,17 +117,6 @@ fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
         metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
     }) {
         let _ = std::fs::remove_file(path);
-    }
-}
-
-fn duplicate_fd(raw: i32) -> Result<OwnedFd, SocketError> {
-    // SAFETY: F_DUPFD_CLOEXEC returns a fresh descriptor or -1.
-    let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        Err(SocketError::Io(std::io::Error::last_os_error()))
-    } else {
-        // SAFETY: `duplicate` is a fresh owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 }
 

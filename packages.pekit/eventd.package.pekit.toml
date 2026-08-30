@@ -15,3 +15,8 @@ description = "Peios durable event, log and metric daemon"
 ":var/state/eventd/events" = "var/state/eventd/events"
 ":var/state/eventd/logs" = "var/state/eventd/logs"
 ":var/state/eventd/metrics" = "var/state/eventd/metrics"
+
+[sd_overrides]
+"var/state/eventd/events" = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+"var/state/eventd/logs" = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"
+"var/state/eventd/metrics" = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"

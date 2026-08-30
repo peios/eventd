@@ -49,7 +49,7 @@ fn open_components(path: &Path) -> Result<OwnedFd, DirectoryError> {
     let root = unsafe {
         libc::open(
             c"/".as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if root < 0 {
@@ -72,7 +72,7 @@ fn open_components(path: &Path) -> Result<OwnedFd, DirectoryError> {
             libc::openat(
                 current.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if next < 0 {

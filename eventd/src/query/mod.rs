@@ -7,7 +7,7 @@ mod value;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use peios::file::{File, SecInfo};
+use peios::file::SecInfo;
 use peios::msgpack::{Reader, Type, Writer};
 
 use crate::commit_signal::CommitSignal;
@@ -89,16 +89,10 @@ impl QueryServer {
             .map_err(QuerySocketError::Io)?;
         let metadata = std::fs::symlink_metadata(path).map_err(QuerySocketError::Io)?;
 
-        let duplicate =
-            unsafe { libc::fcntl(listener.as_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicate < 0 {
-            return Err(QuerySocketError::Io(std::io::Error::last_os_error()));
-        }
-        // SAFETY: fcntl returned a fresh owned descriptor.
-        let file = File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) });
         let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
-        let descriptor = file.fd_get_sd(secinfo).map_err(QuerySocketError::Peios)?;
-        file.fd_set_sd(secinfo, &descriptor)
+        let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(QuerySocketError::Peios)?;
+        peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
             .map_err(QuerySocketError::Peios)?;
         Ok(Self {
             listener,

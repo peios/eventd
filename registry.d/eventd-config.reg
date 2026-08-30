@@ -4,8 +4,9 @@
     "eventd intentionally has no compiled fallback that could write audit data",
     "somewhere an operator did not choose.",
     "",
-    "The package supplies the three empty /var/state directories. peinit",
-    "supplies /run/eventd through RuntimeDirectories in eventd-service.reg.",
+    "The package supplies the three empty /var/state directories. The required",
+    "ProvisionedPaths entries establish their protected inheritable descriptor",
+    "before phase 2. peinit supplies /run/eventd through RuntimeDirectories.",
     "",
     "This seed is inert until an image names eventd-config.reg in its",
     "[registry] autoapply list. Tuning values are omitted because eventd's",
@@ -13,6 +14,35 @@
   ],
   "keys": [
     { "path": "Machine\\System" },
+    { "path": "Machine\\System\\Init" },
+    { "path": "Machine\\System\\Init\\ProvisionedPaths" },
+    {
+      "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-events",
+      "values": [
+        { "name": "Kind",     "type": "sz",     "data": "directory" },
+        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/events" },
+        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
+        { "name": "Required", "type": "dword",  "data": 1 }
+      ]
+    },
+    {
+      "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-logs",
+      "values": [
+        { "name": "Kind",     "type": "sz",     "data": "directory" },
+        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/logs" },
+        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
+        { "name": "Required", "type": "dword",  "data": 1 }
+      ]
+    },
+    {
+      "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-metrics",
+      "values": [
+        { "name": "Kind",     "type": "sz",     "data": "directory" },
+        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/metrics" },
+        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
+        { "name": "Required", "type": "dword",  "data": 1 }
+      ]
+    },
     {
       "path": "Machine\\System\\eventd",
       "values": [
