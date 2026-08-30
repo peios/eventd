@@ -7,7 +7,8 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use eventd_core::{
-    BoundedQueue, DesiredIndex, Gap, Guid, IngestItem, Pop, Shard, ShardError, SyntheticEvent,
+    BoundedQueue, DesiredIndex, Gap, Guid, IndexAction, IngestItem, Pop, Shard, ShardError,
+    SyntheticEvent,
 };
 
 use crate::commit_signal::CommitSignal;
@@ -399,13 +400,19 @@ fn handle_control(
             handle_maintenance(shard, &command, &sender, context)
         }
         WriterMessage::IndexPolicy(desired) => {
-            if context.queue.is_empty() {
-                let result = shard.converge_indexes(&desired, {
+            let mut retry = !context.queue.is_empty();
+            while !retry {
+                let action = shard.converge_indexes(&desired, {
                     let queue = context.queue.clone();
                     move || !queue.is_empty()
                 });
-                if let Err(error) = result {
-                    if error.is_corruption() {
+                match action {
+                    Ok(IndexAction::Created(_) | IndexAction::Dropped(_)) => {
+                        retry = !context.queue.is_empty();
+                    }
+                    Ok(IndexAction::Cancelled) => retry = true,
+                    Ok(IndexAction::Unchanged) => break,
+                    Err(error) if error.is_corruption() => {
                         recover_corruption(
                             shard,
                             context.shard_index,
@@ -414,12 +421,22 @@ fn handle_control(
                             context.retention_requested,
                             &error,
                         )?;
-                    } else {
+                        retry = true;
+                    }
+                    Err(error) => {
                         eprintln!("eventd: adaptive index convergence failed: {error}");
+                        break;
                     }
                 }
             }
-            *current_desired = desired;
+            *current_desired = Arc::clone(&desired);
+            if retry
+                && let Ok(permit) = context
+                    .queue
+                    .try_reserve(core::mem::size_of::<WriterMessage>())
+            {
+                permit.publish(WriterMessage::IndexPolicy(desired));
+            }
             Ok(())
         }
     }

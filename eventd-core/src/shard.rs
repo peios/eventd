@@ -99,6 +99,7 @@ impl Shard {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        crate::payload_index::register(&connection)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -390,10 +391,8 @@ impl Shard {
     where
         F: FnMut() -> bool + Send + 'static,
     {
-        let wanted: Vec<_> = desired
-            .iter()
-            .filter_map(|index| header_index_name(&index.field_path).map(str::to_owned))
-            .collect();
+        let wanted: Vec<_> = desired.iter().filter_map(adaptive_index).collect();
+        let wanted_names: Vec<_> = wanted.iter().map(|(name, _)| name.clone()).collect();
         let mut statement = self.connection.prepare(
             "SELECT name FROM sqlite_master WHERE type = 'index' \
              AND name LIKE 'idx_events_%' AND name <> 'idx_events_timestamp' ORDER BY name",
@@ -403,26 +402,22 @@ impl Shard {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
 
-        if let Some(name) = material.iter().rev().find(|name| !wanted.contains(name)) {
+        if let Some(name) = material
+            .iter()
+            .rev()
+            .find(|name| !wanted_names.contains(name))
+        {
             self.connection
                 .execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
             return Ok(IndexAction::Dropped(name.clone()));
         }
-        for name in wanted {
+        for (name, expression) in wanted {
             if material.contains(&name) {
                 continue;
             }
-            let column = name
-                .strip_prefix("idx_events_")
-                .expect("header index names have a fixed prefix");
-            let collation = if column == "event_type" {
-                " COLLATE NOCASE"
-            } else {
-                ""
-            };
             self.connection.progress_handler(1_000, Some(cancel));
             let result = self.connection.execute_batch(&format!(
-                "CREATE INDEX IF NOT EXISTS {name} ON events({column}{collation})"
+                "CREATE INDEX IF NOT EXISTS {name} ON events({expression})"
             ));
             self.connection.progress_handler(0, None::<fn() -> bool>);
             match result {
@@ -455,15 +450,16 @@ impl Shard {
     ) -> Result<Option<String>, ShardError> {
         let material = self.material_indexes()?;
         let candidate = desired.iter().rev().find_map(|index| {
-            header_index_name(&index.field_path)
-                .filter(|name| material.iter().any(|item| item == name))
+            adaptive_index(index)
+                .map(|(name, _)| name)
+                .filter(|name| material.contains(name))
         });
         let Some(name) = candidate else {
             return Ok(None);
         };
         self.connection
             .execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
-        Ok(Some(name.to_owned()))
+        Ok(Some(name))
     }
 
     fn material_indexes(&self) -> Result<Vec<String>, ShardError> {
@@ -505,6 +501,7 @@ impl Shard {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        crate::payload_index::register(&connection)?;
         validate_schema(&connection)?;
         read_receipts(&connection)
     }
@@ -530,6 +527,7 @@ impl Shard {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        crate::payload_index::register(&connection)?;
         validate_schema(&connection)?;
         connection
             .query_row(
@@ -575,6 +573,24 @@ fn header_index_name(field: &str) -> Option<&'static str> {
         "process_guid" => Some("idx_events_process_guid"),
         "boot_id" => Some("idx_events_boot_id"),
         _ => None,
+    }
+}
+
+fn adaptive_index(index: &DesiredIndex) -> Option<(String, String)> {
+    if index.is_expression {
+        Some((
+            crate::payload_index_name(&index.field_path)?,
+            crate::payload_index::expression(&index.field_path)?,
+        ))
+    } else {
+        let name = header_index_name(&index.field_path)?;
+        let column = name.strip_prefix("idx_events_")?;
+        let collation = if column == "event_type" {
+            " COLLATE NOCASE"
+        } else {
+            ""
+        };
+        Some((name.to_owned(), format!("{column}{collation}")))
     }
 }
 
@@ -904,6 +920,52 @@ mod tests {
             shard.converge_indexes(&[], || false).unwrap(),
             IndexAction::Dropped("idx_events_event_type".into())
         );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn converges_and_maintains_payload_expression_index() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let mut first = event(1, "example.payload");
+        first.event.payload = [
+            0x81, 0xa6, b's', b'o', b'u', b'r', b'c', b'e', 0x81, 0xa4, b'n', b'a', b'm', b'e',
+            0xa5, b'A', b'l', b'p', b'h', b'a',
+        ]
+        .into();
+        shard.commit(&[first]).unwrap();
+        let desired = [DesiredIndex {
+            field_path: "source.name".into(),
+            priority: 0,
+            is_expression: true,
+        }];
+        let index_name = crate::payload_index_name("source.name").unwrap();
+        assert_eq!(
+            shard.converge_indexes(&desired, || false).unwrap(),
+            IndexAction::Created(index_name.clone())
+        );
+
+        let mut second = event(2, "example.payload");
+        second.event.payload = [
+            0x81, 0xa6, b's', b'o', b'u', b'r', b'c', b'e', 0x81, 0xa4, b'n', b'a', b'm', b'e',
+            0xa4, b'b', b'e', b't', b'a',
+        ]
+        .into();
+        shard.commit(&[second]).unwrap();
+        let key = crate::payload_query_key(crate::PayloadIndexValue::String("alpha"));
+        let count: u32 = shard
+            .connection
+            .query_row(
+                "SELECT count(*) FROM events \
+                 WHERE eventd_payload_key(payload, 'source.name') = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(shard.shed_lowest_index(&desired).unwrap(), Some(index_name));
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }

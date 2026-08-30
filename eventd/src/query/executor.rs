@@ -812,11 +812,16 @@ fn read_events(
     lower_ids: &[i64],
     upper_ids: &[i64],
 ) -> Result<Vec<Row>, QueryError> {
-    let constraint = predicates.iter().find_map(header_constraint);
+    let header_constraint = predicates.iter().find_map(sql_header_constraint);
     let mut output = Vec::new();
     for (shard, path) in paths.iter().enumerate() {
         check_deadline(deadline)?;
         let connection = open_read_only(path, deadline)?;
+        let constraint = if let Some(constraint) = header_constraint.clone() {
+            Some(constraint)
+        } else {
+            first_payload_constraint(predicates, &connection)?
+        };
         let mut sql = String::from(
             "SELECT id, boot_id, timestamp, cpu_id, sequence, origin_class, event_type, \
              effective_token_guid, true_token_guid, process_guid, payload \
@@ -828,10 +833,12 @@ fn read_events(
             rusqlite::types::Value::Integer(lower_ids[shard]),
             rusqlite::types::Value::Integer(upper_ids[shard]),
         ];
-        if let Some(constraint) = &constraint {
+        if let Some(constraint) = constraint {
             sql.push_str(" AND ");
-            sql.push_str(constraint.sql);
-            values.push(constraint.value.clone());
+            sql.push_str(&constraint.sql);
+            if let Some(value) = constraint.value {
+                values.push(value);
+            }
         }
         let mut statement = connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(values))?;
@@ -879,12 +886,13 @@ fn read_events(
     Ok(output)
 }
 
-struct HeaderConstraint {
-    sql: &'static str,
-    value: rusqlite::types::Value,
+#[derive(Clone)]
+struct SqlConstraint {
+    sql: String,
+    value: Option<rusqlite::types::Value>,
 }
 
-fn header_constraint(expression: &Expr) -> Option<HeaderConstraint> {
+fn sql_header_constraint(expression: &Expr) -> Option<SqlConstraint> {
     let Expr::Compare {
         field,
         operator,
@@ -897,9 +905,9 @@ fn header_constraint(expression: &Expr) -> Option<HeaderConstraint> {
         let Literal::String(value) = value else {
             return None;
         };
-        return Some(HeaderConstraint {
-            sql: "event_type = ?5 COLLATE NOCASE",
-            value: rusqlite::types::Value::Text(value.clone()),
+        return Some(SqlConstraint {
+            sql: "event_type = ?5 COLLATE NOCASE".into(),
+            value: Some(rusqlite::types::Value::Text(value.clone())),
         });
     }
     if !matches!(field.as_str(), "cpu_id" | "origin_class") {
@@ -925,10 +933,82 @@ fn header_constraint(expression: &Expr) -> Option<HeaderConstraint> {
         ("origin_class", Operator::LessEqual) => "origin_class <= ?5",
         _ => return None,
     };
-    Some(HeaderConstraint {
-        sql,
-        value: rusqlite::types::Value::Integer(value),
+    Some(SqlConstraint {
+        sql: sql.into(),
+        value: Some(rusqlite::types::Value::Integer(value)),
     })
+}
+
+fn sql_payload_constraint(
+    expression: &Expr,
+    connection: &Connection,
+) -> Result<Option<SqlConstraint>, QueryError> {
+    if let Expr::And(left, right) = expression {
+        return sql_payload_constraint(left, connection)?.map_or_else(
+            || sql_payload_constraint(right, connection),
+            |constraint| Ok(Some(constraint)),
+        );
+    }
+    let (field, key) = match expression {
+        Expr::Compare {
+            field,
+            operator: Operator::Equal,
+            value,
+        } => {
+            let key = match value {
+                Literal::Bool(value) => {
+                    eventd_core::payload_query_key(eventd_core::PayloadIndexValue::Bool(*value))
+                }
+                Literal::String(value) => {
+                    eventd_core::payload_query_key(eventd_core::PayloadIndexValue::String(value))
+                }
+                Literal::Binary(value) => {
+                    eventd_core::payload_query_key(eventd_core::PayloadIndexValue::Binary(value))
+                }
+                Literal::Signed(_) | Literal::Unsigned(_) | Literal::Float(_) => return Ok(None),
+            };
+            (field, Some(rusqlite::types::Value::Blob(key)))
+        }
+        Expr::Null {
+            field,
+            negated: false,
+        } => (field, None),
+        _ => return Ok(None),
+    };
+    let Some(name) = eventd_core::payload_index_name(field) else {
+        return Ok(None);
+    };
+    let Some(index_expression) = eventd_core::payload_index::expression(field) else {
+        return Ok(None);
+    };
+    let material: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        [&name],
+        |row| row.get(0),
+    )?;
+    if !material {
+        return Ok(None);
+    }
+    Ok(Some(SqlConstraint {
+        sql: if key.is_some() {
+            format!("{index_expression} = ?5")
+        } else {
+            format!("{index_expression} IS NULL")
+        },
+        value: key,
+    }))
+}
+
+fn first_payload_constraint(
+    predicates: &[Expr],
+    connection: &Connection,
+) -> Result<Option<SqlConstraint>, QueryError> {
+    for predicate in predicates {
+        if let Some(constraint) = sql_payload_constraint(predicate, connection)? {
+            return Ok(Some(constraint));
+        }
+    }
+    Ok(None)
 }
 
 #[allow(
@@ -2264,6 +2344,7 @@ fn open_read_only(path: &Path, deadline: Option<Instant>) -> Result<Connection, 
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(QueryError::Sql)?;
+    eventd_core::payload_index::register(&connection)?;
     if let Some(deadline) = deadline {
         connection.progress_handler(1_000, Some(move || Instant::now() >= deadline));
     }
@@ -2534,11 +2615,11 @@ mod tests {
             operator: Operator::Equal,
             value: Literal::String("KACS.Denied".into()),
         };
-        let constraint = header_constraint(&event_type).unwrap();
+        let constraint = sql_header_constraint(&event_type).unwrap();
         assert_eq!(constraint.sql, "event_type = ?5 COLLATE NOCASE");
         assert_eq!(
             constraint.value,
-            rusqlite::types::Value::Text("KACS.Denied".into())
+            Some(rusqlite::types::Value::Text("KACS.Denied".into()))
         );
         let origin = Expr::Compare {
             field: "origin_class".into(),
@@ -2546,8 +2627,50 @@ mod tests {
             value: Literal::String("kacs".into()),
         };
         assert_eq!(
-            header_constraint(&origin).unwrap().value,
-            rusqlite::types::Value::Integer(2)
+            sql_header_constraint(&origin).unwrap().value,
+            Some(rusqlite::types::Value::Integer(2))
+        );
+    }
+
+    #[test]
+    fn payload_constraint_requires_a_material_compatible_index() {
+        let connection = Connection::open_in_memory().unwrap();
+        eventd_core::payload_index::register(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events(payload BLOB);\
+                 CREATE INDEX idx_events_payload_2602646b558759b4af6e77009f3ebc3d \
+                 ON events(eventd_payload_key(payload, 'source.name'));",
+            )
+            .unwrap();
+        let predicate = Expr::Compare {
+            field: "source.name".into(),
+            operator: Operator::Equal,
+            value: Literal::String("Alpha".into()),
+        };
+        let constraint = sql_payload_constraint(&predicate, &connection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            constraint.sql,
+            "eventd_payload_key(payload, 'source.name') = ?5"
+        );
+        assert_eq!(
+            constraint.value,
+            Some(rusqlite::types::Value::Blob(
+                eventd_core::payload_query_key(eventd_core::PayloadIndexValue::String("alpha"))
+            ))
+        );
+
+        let absent = Expr::Compare {
+            field: "source.other".into(),
+            operator: Operator::Equal,
+            value: Literal::String("Alpha".into()),
+        };
+        assert!(
+            sql_payload_constraint(&absent, &connection)
+                .unwrap()
+                .is_none()
         );
     }
 

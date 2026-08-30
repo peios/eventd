@@ -172,6 +172,12 @@ pub fn run(
     runtime: &SharedConfig,
     receiver: &Receiver<PolicyMessage>,
 ) -> Result<(), IndexError> {
+    broadcast_desired(
+        &desired
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        queues,
+    );
     loop {
         let (config, checkpoint_pages) = Config::read(runtime, |live| {
             (
@@ -269,13 +275,17 @@ fn recompute(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone_from(&indexes);
+    broadcast_desired(&indexes, queues);
+    Ok(())
+}
+
+fn broadcast_desired(indexes: &[DesiredIndex], queues: &[BoundedQueue<WriterMessage>]) {
     let snapshot: Arc<[DesiredIndex]> = indexes.into();
     for queue in queues {
         if let Ok(permit) = queue.try_reserve(core::mem::size_of::<WriterMessage>()) {
             permit.publish(WriterMessage::IndexPolicy(Arc::clone(&snapshot)));
         }
     }
-    Ok(())
 }
 
 fn duration_ns(duration: Duration) -> u64 {

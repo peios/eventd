@@ -1081,11 +1081,15 @@ fn is_clause(word: &str) -> bool {
 }
 
 fn valid_identifier(value: &str) -> bool {
+    !value.is_empty() && value.split('.').all(valid_identifier_segment)
+}
+
+fn valid_identifier_segment(value: &str) -> bool {
     let mut bytes = value.bytes();
     bytes
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn parse_number(value: &str) -> Result<Literal, ParseError> {
@@ -1226,6 +1230,13 @@ mod tests {
     fn rejects_unknown_log_fields_during_parsing() {
         assert!(parse("LOGS WHERE payload.secret == 1").is_err());
         assert!(parse("LOGS SELECT message, imaginary").is_err());
+    }
+
+    #[test]
+    fn field_paths_require_valid_flattened_segments() {
+        assert!(parse("EVENTS WHERE source.name == value").is_ok());
+        assert!(parse("EVENTS WHERE source..name == value").is_err());
+        assert!(parse("EVENTS WHERE source.1name == value").is_err());
     }
 
     #[test]

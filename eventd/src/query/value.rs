@@ -61,7 +61,32 @@ impl Value {
     }
 
     pub fn language_equal(&self, other: &Self) -> bool {
-        language_cmp(self, other) == Ordering::Equal
+        if let Some(ordering) = numeric_cmp(self, other) {
+            return ordering == Ordering::Equal;
+        }
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::String(left), Self::String(right)) => ascii_equal(left, right),
+            (Self::Binary(left), Self::Binary(right)) => left == right,
+            (Self::Array(left), Self::Array(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.language_equal(right))
+            }
+            (Self::Map(left), Self::Map(right)) => {
+                left.len() == right.len()
+                    && left.iter().zip(right).all(
+                        |((left_key, left_value), (right_key, right_value))| {
+                            left_key.language_equal(right_key)
+                                && left_value.language_equal(right_value)
+                        },
+                    )
+            }
+            _ => false,
+        }
     }
 }
 
@@ -348,6 +373,12 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn string_equality_uses_ascii_folding() {
+        assert!(Value::String("Alpha".into()).language_equal(&Value::String("alpha".into())));
+        assert!(!Value::String("Alpha".into()).language_equal(&Value::String("alphas".into())));
     }
 
     #[test]

@@ -434,11 +434,13 @@ fn boot_inventory(paths: &[PathBuf]) -> Result<HashMap<[u8; 16], i64>, String> {
 }
 
 fn open_read_only(path: &Path) -> Result<Connection, String> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    eventd_core::payload_index::register(&connection).map_err(|error| error.to_string())?;
+    Ok(connection)
 }
 
 fn realtime_nanoseconds() -> Result<i64, String> {
