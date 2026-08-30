@@ -5,9 +5,10 @@
 # them.
 
 [package]
-description = "Peios durable event, log and metric daemon"
+description = "Peios durable event, log and metric daemon and query client"
 
 [files]
+":usr/bin/evctl" = "usr/bin/evctl"
 ":usr/sbin/eventd" = "usr/sbin/eventd"
 ":usr/share/regim/eventd-config.reg" = "usr/share/regim/eventd-config.reg"
 ":usr/share/regim/eventd-service.reg" = "usr/share/regim/eventd-service.reg"

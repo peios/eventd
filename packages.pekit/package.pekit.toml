@@ -3,6 +3,7 @@
 format = "peipkg"
 
 [package]
-version      = "{{version}}-1"
+# Revision 2 adds the evctl client to the package payload.
+version      = "{{version}}-2"
 architecture = "x86_64"
 license      = "MIT"

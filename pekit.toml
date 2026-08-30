@@ -49,9 +49,10 @@ fi
 
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(gcc -print-file-name=include) ${BINDGEN_EXTRA_CLANG_ARGS:-}"
 
-cargo build --release --locked --bin eventd --target-dir "$PEKIT_OUT/target"
+cargo build --release --locked --bin eventd --bin evctl --target-dir "$PEKIT_OUT/target"
 
-mkdir -p "$PEKIT_OUT/usr/sbin" "$PEKIT_OUT/usr/share/regim" "$PEKIT_OUT/usr/share/regman"
+mkdir -p "$PEKIT_OUT/usr/bin" "$PEKIT_OUT/usr/sbin" "$PEKIT_OUT/usr/share/regim" "$PEKIT_OUT/usr/share/regman"
+install -m 0755 "$PEKIT_OUT/target/release/evctl" "$PEKIT_OUT/usr/bin/evctl"
 install -m 0755 "$PEKIT_OUT/target/release/eventd" "$PEKIT_OUT/usr/sbin/eventd"
 install -m 0644 "$SRC/registry.d/eventd-config.reg" "$PEKIT_OUT/usr/share/regim/eventd-config.reg"
 install -m 0644 "$SRC/registry.d/eventd-service.reg" "$PEKIT_OUT/usr/share/regim/eventd-service.reg"

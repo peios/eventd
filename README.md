@@ -12,12 +12,26 @@ The workspace is split deliberately:
   an ordinary development host.
 - `eventd` owns KMES attachment, ingestion, retention, adaptive indexing,
   access control, querying, configuration reload and lifecycle supervision. It
-  is the only crate linked to libpeios.
+  is the only long-running process in the workspace and the only one that
+  attaches to kernel event state.
+- `evctl` is the native query client. It sends one PSPU query to eventd and
+  renders the authorized response without ever opening the stores directly.
+
+The common interface is deliberately just the query:
+
+```sh
+evctl 'EVENTS kacs.* SINCE 1h ago TAKE 50'
+evctl --format jsonl 'LOGS FROM authd ERROR ONLY STREAM'
+```
+
+Run `evctl help` for socket, file, stdin and output-format options. Initial
+results are transactionally spooled until eventd sends `end` or `watch`, so a
+late query error can never leak an invalid partial result to a pipeline.
 
 The implementation follows the eventd TRM in the Peios `learn` repository.
 
 Run `tools/check` before committing. Run `tools/bench` on deployment-class
 hardware before changing queue, batch or SQLite parameters. `pekit build`
 produces the release tree and `pekit package --version <version>` produces the
-Peios package, including the inert registry seeds and the standard
+Peios package, including `evctl`, the inert registry seeds and the standard
 `/var/state/eventd/{events,logs,metrics}` directory skeleton.

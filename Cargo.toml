@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["eventd-core", "eventd"]
+members = ["eventd-core", "eventd", "evctl"]
 
 [workspace.package]
 version = "0.1.0"

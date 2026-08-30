@@ -1,0 +1,18 @@
+[package]
+name = "evctl"
+description = "Native command-line client for Peios eventd queries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "evctl"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+peios = { workspace = true }
+
+[lints]
+workspace = true

@@ -12,6 +12,6 @@ export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS
 export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 cd "$repo"
-cargo fmt -p eventd-core -p eventd -- --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
