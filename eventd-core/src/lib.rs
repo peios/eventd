@@ -13,7 +13,7 @@ pub mod shard;
 
 pub use boot_id::{BootId, BootIdError};
 pub use log_store::{LogRecord, LogStore, LogStoreError};
-pub use meta_store::{MetaStore, MetaStoreError};
+pub use meta_store::{DesiredIndex, IndexCounter, MetaStore, MetaStoreError};
 pub use metric_store::{
     Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError, MetricType,
     MetricValue,
@@ -23,4 +23,4 @@ pub use queue::{BoundedQueue, Pop, QueueConfigError, ReserveError};
 pub use receipt::{Coverage, Interval};
 pub use reconcile::{Observation, ReconcileError, Reconciler};
 pub use routing::{StripeRouter, assigned_shards};
-pub use shard::{CommitStats, Shard, ShardError};
+pub use shard::{CommitStats, IndexAction, Shard, ShardError};

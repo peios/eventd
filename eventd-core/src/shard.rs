@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
-use crate::{Guid, IngestItem, Interval, SyntheticEvent};
+use crate::{DesiredIndex, Guid, IngestItem, Interval, SyntheticEvent};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -51,6 +51,19 @@ pub struct Shard {
     known_types: HashSet<Box<str>>,
     checkpoint_pages: u32,
     page_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of one quiet-period index convergence step.
+pub enum IndexAction {
+    /// A secondary index was materialized.
+    Created(String),
+    /// A secondary index was removed.
+    Dropped(String),
+    /// The shard is converged or no supported action is available.
+    Unchanged,
+    /// Index creation yielded immediately to newly queued ingestion.
+    Cancelled,
 }
 
 impl Shard {
@@ -258,6 +271,102 @@ impl Shard {
         Ok(())
     }
 
+    /// Move one step toward the global desired secondary-index set.
+    pub fn converge_indexes<F>(
+        &mut self,
+        desired: &[DesiredIndex],
+        cancel: F,
+    ) -> Result<IndexAction, ShardError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let wanted: Vec<_> = desired
+            .iter()
+            .filter_map(|index| header_index_name(&index.field_path).map(str::to_owned))
+            .collect();
+        let mut statement = self.connection.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND name LIKE 'idx_events_%' AND name <> 'idx_events_timestamp' ORDER BY name",
+        )?;
+        let material = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        if let Some(name) = material.iter().rev().find(|name| !wanted.contains(name)) {
+            self.connection
+                .execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
+            return Ok(IndexAction::Dropped(name.clone()));
+        }
+        for name in wanted {
+            if material.contains(&name) {
+                continue;
+            }
+            let column = name
+                .strip_prefix("idx_events_")
+                .expect("header index names have a fixed prefix");
+            let collation = if column == "event_type" {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            };
+            self.connection.progress_handler(1_000, Some(cancel));
+            let result = self.connection.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON events({column}{collation})"
+            ));
+            self.connection.progress_handler(0, None::<fn() -> bool>);
+            match result {
+                Ok(()) => return Ok(IndexAction::Created(name)),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+                {
+                    return Ok(IndexAction::Cancelled);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(IndexAction::Unchanged)
+    }
+
+    /// Drop every adaptive secondary index, retaining the timestamp index.
+    pub fn shed_all_indexes(&mut self) -> Result<usize, ShardError> {
+        let material = self.material_indexes()?;
+        for name in &material {
+            self.connection
+                .execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
+        }
+        Ok(material.len())
+    }
+
+    /// Drop the lowest-priority currently materialized desired index.
+    pub fn shed_lowest_index(
+        &mut self,
+        desired: &[DesiredIndex],
+    ) -> Result<Option<String>, ShardError> {
+        let material = self.material_indexes()?;
+        let candidate = desired.iter().rev().find_map(|index| {
+            header_index_name(&index.field_path)
+                .filter(|name| material.iter().any(|item| item == name))
+        });
+        let Some(name) = candidate else {
+            return Ok(None);
+        };
+        self.connection
+            .execute_batch(&format!("DROP INDEX IF EXISTS {name}"))?;
+        Ok(Some(name.to_owned()))
+    }
+
+    fn material_indexes(&self) -> Result<Vec<String>, ShardError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND name LIKE 'idx_events_%' AND name <> 'idx_events_timestamp' ORDER BY name",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ShardError::Sql)
+    }
+
     fn delete_bounded(
         &mut self,
         sql: &str,
@@ -343,6 +452,19 @@ impl Shard {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
         Ok(())
+    }
+}
+
+fn header_index_name(field: &str) -> Option<&'static str> {
+    match field {
+        "event_type" => Some("idx_events_event_type"),
+        "origin_class" => Some("idx_events_origin_class"),
+        "cpu_id" => Some("idx_events_cpu_id"),
+        "effective_token_guid" => Some("idx_events_effective_token_guid"),
+        "true_token_guid" => Some("idx_events_true_token_guid"),
+        "process_guid" => Some("idx_events_process_guid"),
+        "boot_id" => Some("idx_events_boot_id"),
+        _ => None,
     }
 }
 
@@ -620,6 +742,32 @@ mod tests {
         assert_eq!(
             shard.receipts().unwrap()[0].2,
             Interval { first: 1, last: 5 }
+        );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn converges_one_header_index_step_at_a_time() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let desired = [DesiredIndex {
+            field_path: "event_type".into(),
+            priority: 0,
+            is_expression: false,
+        }];
+        assert_eq!(
+            shard.converge_indexes(&desired, || false).unwrap(),
+            IndexAction::Created("idx_events_event_type".into())
+        );
+        assert_eq!(
+            shard.converge_indexes(&desired, || false).unwrap(),
+            IndexAction::Unchanged
+        );
+        assert_eq!(
+            shard.converge_indexes(&[], || false).unwrap(),
+            IndexAction::Dropped("idx_events_event_type".into())
         );
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();

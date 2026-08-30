@@ -10,6 +10,7 @@ use peios::token::Token;
 
 const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
 const EVENTD_READ: u32 = 0x0001;
+const EVENTD_ADMINISTER: u32 = 0x0004;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Namespace {
@@ -132,6 +133,74 @@ impl Authorizer {
                 .collect(),
         ))
     }
+
+    pub fn administer(&self) -> Result<bool, SecurityError> {
+        let Some(descriptor) = load_admin_descriptor()? else {
+            return Ok(false);
+        };
+        let request = peios_sys::peios_access_request {
+            token_fd: self.token.as_raw_fd(),
+            sd: descriptor.as_bytes().as_ptr().cast(),
+            sd_len: descriptor.as_bytes().len(),
+            desired: EVENTD_ADMINISTER,
+            mapping: peios_sys::kacs_generic_mapping {
+                read: 0x0002_0001,
+                write: 0x0002_0006,
+                execute: 0x0002_0001,
+                all: 0x000f_0007,
+            },
+            self_sid: core::ptr::null(),
+            self_sid_len: 0,
+            privilege_intent: 0,
+            object_tree: core::ptr::null(),
+            object_tree_count: 0,
+            local_claims: core::ptr::null(),
+            local_claims_len: 0,
+            pip_type: 0,
+            pip_trust: 0,
+            audit_context: b"admin".as_ptr().cast(),
+            audit_context_len: 5,
+        };
+        let mut granted = 0_u32;
+        // SAFETY: the request borrows the live token, descriptor and static
+        // audit context for this call; granted is a writable out-parameter.
+        let result = unsafe {
+            peios_sys::peios_access_check(
+                &raw const request,
+                &raw mut granted,
+                core::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            return Ok(granted & EVENTD_ADMINISTER != 0);
+        }
+        let error = peios::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EACCES) {
+            Ok(false)
+        } else {
+            Err(SecurityError::Peios(error))
+        }
+    }
+}
+
+fn load_admin_descriptor() -> Result<Option<SecurityDescriptor>, SecurityError> {
+    let path = format!("{SECURITY_ROOT}\\Admin");
+    let key = match Key::open(None, &path, KeyAccess::QUERY_VALUE, OpenFlags::default()) {
+        Ok(key) => key,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) => return Err(SecurityError::Peios(error)),
+    };
+    let value = match key.query_value(b"", None) {
+        Ok(value) => value,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) => return Err(SecurityError::Peios(error)),
+    };
+    if value.ty != ValueType::BINARY {
+        return Err(SecurityError::InvalidDescriptorType(path));
+    }
+    SecurityDescriptor::from_validated_bytes(value.data)
+        .map(Some)
+        .map_err(SecurityError::Peios)
 }
 
 fn resolve_descriptor(

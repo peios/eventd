@@ -40,6 +40,13 @@ pub struct Config {
     pub query_response_target_bytes: usize,
     pub cross_type_window: Duration,
     pub cross_type_max_lookback: Duration,
+    pub adaptive_index_window: Duration,
+    pub adaptive_index_policy_interval: Duration,
+    pub adaptive_index_create_threshold: u64,
+    pub adaptive_index_drop_threshold: u64,
+    pub shedding_window: Duration,
+    pub shedding_batch_percent: u32,
+    pub emergency_shedding_buffer_percent: u8,
     pub event_retention: Duration,
     pub event_retention_max_bytes: u64,
     pub log_retention: Duration,
@@ -69,6 +76,19 @@ impl Config {
             .into_iter()
             .map(|record| (record.name.clone(), record))
             .collect::<HashMap<_, _>>();
+
+        let adaptive_index_create_threshold = u64::from(dword(
+            &values,
+            b"AdaptiveIndexCreateThreshold",
+            100,
+            10,
+            10_000,
+        ));
+        let adaptive_index_drop_threshold =
+            u64::from(dword(&values, b"AdaptiveIndexDropThreshold", 10, 1, 1_000));
+        if adaptive_index_drop_threshold >= adaptive_index_create_threshold {
+            return Err(ConfigError::Invalid(b"AdaptiveIndexDropThreshold"));
+        }
 
         Ok(Self {
             event_store_path: required_path(&values, b"EventStorePath")?,
@@ -204,6 +224,36 @@ impl Config {
                 3_600,
                 2_592_000,
             ))),
+            adaptive_index_window: Duration::from_secs(
+                u64::from(dword(&values, b"AdaptiveIndexWindowHours", 24, 1, 168)) * 3_600,
+            ),
+            adaptive_index_policy_interval: Duration::from_secs(
+                u64::from(dword(
+                    &values,
+                    b"AdaptiveIndexPolicyIntervalMinutes",
+                    60,
+                    60,
+                    1_440,
+                )) * 60,
+            ),
+            adaptive_index_create_threshold,
+            adaptive_index_drop_threshold,
+            shedding_window: Duration::from_secs(u64::from(dword(
+                &values,
+                b"SheddingWindowSeconds",
+                30,
+                10,
+                300,
+            ))),
+            shedding_batch_percent: dword(&values, b"SheddingBatchPercent", 75, 50, 100),
+            emergency_shedding_buffer_percent: u8::try_from(dword(
+                &values,
+                b"EmergencySheddingBufferPercent",
+                75,
+                50,
+                95,
+            ))
+            .expect("emergency shedding percentage fits u8"),
             event_retention: Duration::from_secs(
                 u64::from(dword(&values, b"EventRetentionDays", 30, 1, 3_650)) * 86_400,
             ),

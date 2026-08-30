@@ -12,12 +12,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use peios::file::{File, SecInfo};
 use peios::msgpack::{Reader, Type, Writer};
 
 use crate::commit_signal::CommitSignal;
+use crate::indexing::{PolicyMessage, Tracker};
 use crate::query_language::{RecordAggregate, Source};
 
 pub use executor::{Limits, Stores};
@@ -31,6 +33,8 @@ pub struct ServerConfig {
     pub timeout: Duration,
     pub cross_type_window: Duration,
     pub cross_type_max_lookback: Duration,
+    pub index_tracker: Arc<Tracker>,
+    pub index_policy: SyncSender<PolicyMessage>,
 }
 
 pub struct QueryServer {
@@ -190,6 +194,24 @@ fn handle(
         send_error(&mut stream, "query timed out")?;
         return Ok(());
     }
+    if let Some(field) = query.index.as_deref() {
+        match authorizer.administer() {
+            Ok(true) => {}
+            Ok(false) => {
+                send_error(&mut stream, "INDEX requires EVENTD_ADMINISTER")?;
+                return Ok(());
+            }
+            Err(error) => {
+                send_error(&mut stream, &error.to_string())?;
+                return Ok(());
+            }
+        }
+        config.index_tracker.prioritize(field);
+        let _ = config.index_policy.try_send(PolicyMessage::Recompute);
+        send_status(&mut stream, "end", Some(deadline))?;
+        return Ok(());
+    }
+    config.index_tracker.record_query(&query);
     let stream_guard = if query.stream {
         if !try_acquire(streaming_count, config.max_streaming) {
             send_error(&mut stream, "too many concurrent streaming queries")?;

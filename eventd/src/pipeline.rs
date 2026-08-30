@@ -1,9 +1,9 @@
 //! Startup and supervision of the event-ingestion vertical slice.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{channel, sync_channel};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,9 +16,10 @@ use crate::commit_signal::CommitSignal;
 use crate::config::{Config, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
+use crate::indexing::{PolicyConfig, PolicyMessage, Tracker};
 use crate::kmes::{self, DrainContext};
 use crate::query::{QueryServer, ServerConfig};
-use crate::writer::WriterMessage;
+use crate::writer::{SheddingConfig, WriterMessage};
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -51,6 +52,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         event_directory.child("eventd-meta.db"),
         config.wal_checkpoint_pages,
     )?;
+    let (persisted_counters, persisted_desired) = meta_store.load_index_state()?;
+    let index_tracker = Arc::new(Tracker::from_persisted(
+        persisted_counters,
+        config.adaptive_index_window,
+        config.adaptive_index_create_threshold,
+    ));
+    let desired_indexes = Arc::new(RwLock::new(persisted_desired));
+    let (index_policy_sender, index_policy_receiver) = sync_channel(1);
     let discovered_historical = discover_historical(&event_directory, shard_count)?;
     let mut historical_paths = Vec::new();
     let mut shards = Vec::with_capacity(shard_count);
@@ -110,6 +119,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, _>>()?
         .into();
     let stopping = Arc::new(AtomicBool::new(false));
+    let ring_pressure: Arc<[AtomicU8]> = (0..cpu_count)
+        .map(|_| AtomicU8::new(0))
+        .collect::<Vec<_>>()
+        .into();
     let event_commits = Arc::new(CommitSignal::new());
     let log_commits = Arc::new(CommitSignal::new());
     install_signal_handlers()?;
@@ -121,6 +134,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let max_batch_size = config.max_batch_size;
         let max_batch_latency = config.max_batch_latency;
         let writer_commits = Arc::clone(&event_commits);
+        let writer_ring_pressure = Arc::clone(&ring_pressure);
+        let shedding = SheddingConfig {
+            window: config.shedding_window,
+            batch_percent: config.shedding_batch_percent,
+            emergency_buffer_percent: config.emergency_shedding_buffer_percent,
+        };
         event_writers.push(
             std::thread::Builder::new()
                 .name(format!("eventd-writer-{index:04}"))
@@ -132,11 +151,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         max_batch_latency,
                         &writer_stopping,
                         &writer_commits,
+                        shedding,
+                        &writer_ring_pressure,
                     )
                     .map_err(|error| error.to_string())
                 })?,
         );
     }
+    let index_policy_config = PolicyConfig {
+        interval: config.adaptive_index_policy_interval,
+        create_threshold: config.adaptive_index_create_threshold,
+        drop_threshold: config.adaptive_index_drop_threshold,
+    };
+    let index_thread_tracker = Arc::clone(&index_tracker);
+    let index_thread_desired = Arc::clone(&desired_indexes);
+    let index_thread_queues = Arc::clone(&queues);
+    let index_handle = std::thread::Builder::new()
+        .name("eventd-index-policy".to_owned())
+        .spawn(move || {
+            crate::indexing::run(
+                meta_store,
+                &index_thread_tracker,
+                &index_thread_desired,
+                &index_thread_queues,
+                index_policy_config,
+                &index_policy_receiver,
+            )
+            .map_err(|error| error.to_string())
+        })?;
     let log_stopping = Arc::clone(&stopping);
     let log_batch_size = config.log_max_batch_size;
     let log_batch_latency = config.log_max_batch_latency;
@@ -196,6 +238,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             coverage: Arc::clone(&coverage),
             stopping: Arc::clone(&stopping),
             startup: startup_sender.clone(),
+            ring_pressure: Arc::clone(&ring_pressure),
+            pressure_slot: ordinal,
         };
         drains.push(
             std::thread::Builder::new()
@@ -254,6 +298,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         timeout: config.query_timeout,
         cross_type_window: config.cross_type_window,
         cross_type_max_lookback: config.cross_type_max_lookback,
+        index_tracker,
+        index_policy: index_policy_sender.clone(),
     });
     let query_stopping = Arc::clone(&stopping);
     let query_thread_server = Arc::clone(&query_server);
@@ -311,6 +357,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         metric_handle,
         query_handle,
         retention_handle,
+        index_handle,
         &queues,
         &stopping,
         query_server,
@@ -320,7 +367,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &historical_paths,
         boot_id,
         &cpu_ids,
-        meta_store,
+        &index_policy_sender,
     )
 }
 
@@ -428,6 +475,7 @@ fn supervise(
     metric_handle: JoinHandle<Result<(), String>>,
     query_handle: JoinHandle<Result<(), String>>,
     retention_handle: JoinHandle<Result<(), String>>,
+    index_handle: JoinHandle<Result<(), String>>,
     queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
     query_server: Arc<QueryServer>,
@@ -437,7 +485,7 @@ fn supervise(
     historical_paths: &[PathBuf],
     boot_id: [u8; 16],
     cpu_ids: &[u16],
-    mut meta_store: MetaStore,
+    index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     while !SIGNAL_STOP.load(Ordering::Acquire)
         && !drains.iter().any(JoinHandle::is_finished)
@@ -446,6 +494,7 @@ fn supervise(
         && !metric_handle.is_finished()
         && !query_handle.is_finished()
         && !retention_handle.is_finished()
+        && !index_handle.is_finished()
     {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -497,10 +546,19 @@ fn supervise(
     }
     match realtime_nanoseconds() {
         Ok(timestamp) => {
-            if let Err(error) =
-                meta_store.write_sequence_checkpoints(&boot_id, &sequences, timestamp)
+            let (sender, receiver) = sync_channel(1);
+            if index_policy
+                .send(PolicyMessage::Checkpoint {
+                    boot_id,
+                    sequences: sequences.clone(),
+                    updated_at: timestamp,
+                    reply: sender,
+                })
+                .is_err()
             {
-                first_error.get_or_insert_with(|| error.to_string());
+                first_error.get_or_insert_with(|| "index policy thread stopped".to_owned());
+            } else if let Ok(Err(error)) = receiver.recv() {
+                first_error.get_or_insert(error);
             }
             let shutdown = crate::synthetic::shutdown(boot_id, &sequences, timestamp);
             if let Err(error) = commit_synthetic_fallback(queues, &shutdown) {
@@ -519,7 +577,13 @@ fn supervise(
     for writer in event_writers {
         join_worker(writer, &mut first_error);
     }
-    drop(meta_store);
+    let (sender, receiver) = sync_channel(1);
+    if index_policy.send(PolicyMessage::Stop(sender)).is_ok()
+        && let Ok(Err(error)) = receiver.recv()
+    {
+        first_error.get_or_insert(error);
+    }
+    join_worker(index_handle, &mut first_error);
     drop(mapped_rings);
     first_error.map_or_else(|| Ok(()), |error| Err(error.into()))
 }

@@ -1,11 +1,12 @@
 //! Adaptive single-owner event-shard writer loop.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use eventd_core::{BoundedQueue, IngestItem, Pop, Shard, ShardError, SyntheticEvent};
+use eventd_core::{BoundedQueue, DesiredIndex, IngestItem, Pop, Shard, ShardError, SyntheticEvent};
 
 use crate::commit_signal::CommitSignal;
 
@@ -19,6 +20,8 @@ pub enum WriterMessage {
     Synthetic(SyntheticEvent, SyncSender<Result<(), String>>),
     /// One bounded low-priority retention or checkpoint operation.
     Maintenance(EventMaintenance, SyncSender<Result<usize, String>>),
+    /// Reconsider one secondary index at a quiet point.
+    IndexPolicy(Arc<[DesiredIndex]>),
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +31,17 @@ pub enum EventMaintenance {
     Checkpoint,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SheddingConfig {
+    pub window: Duration,
+    pub batch_percent: u32,
+    pub emergency_buffer_percent: u8,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shard owner receives immutable batching and pressure policy explicitly"
+)]
 pub fn run(
     mut shard: Shard,
     queue: &BoundedQueue<WriterMessage>,
@@ -35,14 +49,20 @@ pub fn run(
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
+    shedding: SheddingConfig,
+    ring_pressure: &Arc<[AtomicU8]>,
 ) -> Result<(), ShardError> {
     let mut batch = Vec::with_capacity(max_batch_size);
+    let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
+    let mut batch_history = VecDeque::new();
     loop {
         let first = queue.pop_wait();
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
-                if let Err(error) = handle_control(&mut shard, control, commits) {
+                if let Err(error) =
+                    handle_control(&mut shard, control, commits, queue, &mut desired)
+                {
                     stopping.store(true, Ordering::Release);
                     queue.close();
                     return Err(error);
@@ -58,17 +78,25 @@ pub fn run(
             match queue.pop() {
                 Pop::Item(WriterMessage::Event(item)) => batch.push(item),
                 Pop::Item(control) => {
-                    if let Err(error) = shard.commit(&batch) {
+                    if let Err(error) = commit_batch(
+                        &mut shard,
+                        &batch,
+                        commits,
+                        max_batch_size,
+                        shedding,
+                        ring_pressure,
+                        &desired,
+                        &mut batch_history,
+                    ) {
                         fail_control(control, &error);
                         stopping.store(true, Ordering::Release);
                         queue.close();
                         return Err(error);
                     }
-                    if !batch.is_empty() {
-                        commits.committed();
-                    }
                     batch.clear();
-                    if let Err(error) = handle_control(&mut shard, control, commits) {
+                    if let Err(error) =
+                        handle_control(&mut shard, control, commits, queue, &mut desired)
+                    {
                         stopping.store(true, Ordering::Release);
                         queue.close();
                         return Err(error);
@@ -82,13 +110,19 @@ pub fn run(
                 }
             }
         }
-        if let Err(error) = shard.commit(&batch) {
+        if let Err(error) = commit_batch(
+            &mut shard,
+            &batch,
+            commits,
+            max_batch_size,
+            shedding,
+            ring_pressure,
+            &desired,
+            &mut batch_history,
+        ) {
             stopping.store(true, Ordering::Release);
             queue.close();
             return Err(error);
-        }
-        if !batch.is_empty() {
-            commits.committed();
         }
         batch.clear();
         if closed {
@@ -97,10 +131,61 @@ pub fn run(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit boundary owns both durability notification and pressure shedding"
+)]
+fn commit_batch(
+    shard: &mut Shard,
+    batch: &[IngestItem],
+    commits: &CommitSignal,
+    max_batch_size: usize,
+    shedding: SheddingConfig,
+    ring_pressure: &[AtomicU8],
+    desired: &[DesiredIndex],
+    history: &mut VecDeque<(Instant, bool)>,
+) -> Result<(), ShardError> {
+    shard.commit(batch)?;
+    if batch.is_empty() {
+        return Ok(());
+    }
+    commits.committed();
+    let now = Instant::now();
+    history.push_back((
+        now,
+        batch.len().saturating_mul(4) > max_batch_size.saturating_mul(3),
+    ));
+    while history
+        .front()
+        .is_some_and(|(at, _)| now.duration_since(*at) > shedding.window)
+    {
+        history.pop_front();
+    }
+    let emergency = batch.len() == max_batch_size
+        && ring_pressure
+            .iter()
+            .any(|pressure| pressure.load(Ordering::Acquire) >= shedding.emergency_buffer_percent);
+    if emergency {
+        shard.shed_all_indexes()?;
+        return Ok(());
+    }
+    let overloaded = history.iter().filter(|(_, large)| *large).count();
+    if overloaded.saturating_mul(100)
+        > history
+            .len()
+            .saturating_mul(shedding.batch_percent as usize)
+    {
+        let _ = shard.shed_lowest_index(desired)?;
+    }
+    Ok(())
+}
+
 fn handle_control(
     shard: &mut Shard,
     message: WriterMessage,
     commits: &CommitSignal,
+    queue: &BoundedQueue<WriterMessage>,
+    current_desired: &mut Arc<[DesiredIndex]>,
 ) -> Result<(), ShardError> {
     match message {
         WriterMessage::Event(_) => unreachable!("events are handled by the batch loop"),
@@ -140,12 +225,24 @@ fn handle_control(
                 }
             }
         }
+        WriterMessage::IndexPolicy(desired) => {
+            if queue.is_empty()
+                && let Err(error) = shard.converge_indexes(&desired, {
+                    let queue = queue.clone();
+                    move || !queue.is_empty()
+                })
+            {
+                eprintln!("eventd: adaptive index convergence failed: {error}");
+            }
+            *current_desired = desired;
+            Ok(())
+        }
     }
 }
 
 fn fail_control(message: WriterMessage, error: &ShardError) {
     match message {
-        WriterMessage::Event(_) => {}
+        WriterMessage::Event(_) | WriterMessage::IndexPolicy(_) => {}
         WriterMessage::Barrier(sender) | WriterMessage::Synthetic(_, sender) => {
             let _ = sender.send(Err(error.to_string()));
         }

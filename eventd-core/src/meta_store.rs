@@ -42,6 +42,28 @@ pub struct MetaStore {
     page_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One persisted adaptive-index frequency counter.
+pub struct IndexCounter {
+    /// Query-language field or flattened payload path.
+    pub field_path: String,
+    /// Queries referencing the field in the current window.
+    pub query_count: u64,
+    /// Current window start in realtime nanoseconds.
+    pub window_start: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One member of the global desired secondary-index set.
+pub struct DesiredIndex {
+    /// Query-language field or flattened payload path.
+    pub field_path: String,
+    /// Lower values are converged first and shed last.
+    pub priority: u64,
+    /// Whether this is a payload expression rather than a header column.
+    pub is_expression: bool,
+}
+
 impl MetaStore {
     /// Open the reconstructible database, replacing malformed state with defaults.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, MetaStoreError> {
@@ -90,6 +112,77 @@ impl MetaStore {
                     i64::from(cpu_id),
                     sqlite_integer(sequence)?,
                     updated_at,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        self.checkpoint_if_needed()
+    }
+
+    /// Load reconstructible adaptive-index state at startup.
+    pub fn load_index_state(
+        &self,
+    ) -> Result<(Vec<IndexCounter>, Vec<DesiredIndex>), MetaStoreError> {
+        let mut counters_statement = self
+            .connection
+            .prepare("SELECT field_path, query_count, window_start FROM index_counters")?;
+        let counters = counters_statement
+            .query_map([], |row| {
+                Ok(IndexCounter {
+                    field_path: row.get(0)?,
+                    query_count: row.get(1)?,
+                    window_start: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut desired_statement = self.connection.prepare(
+            "SELECT field_path, priority, is_expression FROM desired_indexes \
+             ORDER BY priority, field_path",
+        )?;
+        let desired = desired_statement
+            .query_map([], |row| {
+                Ok(DesiredIndex {
+                    field_path: row.get(0)?,
+                    priority: row.get(1)?,
+                    is_expression: row.get::<_, i64>(2)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((counters, desired))
+    }
+
+    /// Atomically replace the current adaptive-index counters and desired set.
+    pub fn write_index_state(
+        &mut self,
+        counters: &[IndexCounter],
+        desired: &[DesiredIndex],
+    ) -> Result<(), MetaStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM index_counters", [])?;
+        transaction.execute("DELETE FROM desired_indexes", [])?;
+        {
+            let mut insert_counter = transaction.prepare_cached(
+                "INSERT INTO index_counters(field_path, query_count, window_start) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for counter in counters {
+                insert_counter.execute(params![
+                    counter.field_path,
+                    sqlite_integer(counter.query_count)?,
+                    sqlite_integer(counter.window_start)?,
+                ])?;
+            }
+            let mut insert_desired = transaction.prepare_cached(
+                "INSERT INTO desired_indexes(field_path, priority, is_expression) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for index in desired {
+                insert_desired.execute(params![
+                    index.field_path,
+                    sqlite_integer(index.priority)?,
+                    i64::from(index.is_expression),
                 ])?;
             }
         }
@@ -279,6 +372,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (9, 10));
+        let counters = [IndexCounter {
+            field_path: "event_type".into(),
+            query_count: 12,
+            window_start: 34,
+        }];
+        let desired = [DesiredIndex {
+            field_path: "event_type".into(),
+            priority: 0,
+            is_expression: false,
+        }];
+        store.write_index_state(&counters, &desired).unwrap();
+        assert_eq!(
+            store.load_index_state().unwrap(),
+            (counters.into(), desired.into())
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }

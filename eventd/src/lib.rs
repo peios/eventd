@@ -6,6 +6,7 @@ mod commit_signal;
 mod config;
 mod datagram;
 mod directory;
+mod indexing;
 mod kmes;
 mod log_ingest;
 mod metric_ingest;

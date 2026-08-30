@@ -177,6 +177,7 @@ fn execute_at(
         Source::Events { pattern } => read_events(
             &stores.event_paths,
             pattern.as_deref(),
+            &query.predicates,
             since,
             until,
             deadline,
@@ -786,26 +787,43 @@ enum Tie {
     Single(i64),
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "event shards use independent selector, predicate, time and stream-cursor bounds"
+)]
 fn read_events(
     paths: &[PathBuf],
     pattern: Option<&str>,
+    predicates: &[Expr],
     since: i64,
     until: i64,
     deadline: Option<Instant>,
     lower_ids: &[i64],
     upper_ids: &[i64],
 ) -> Result<Vec<Row>, QueryError> {
+    let constraint = predicates.iter().find_map(header_constraint);
     let mut output = Vec::new();
     for (shard, path) in paths.iter().enumerate() {
         check_deadline(deadline)?;
         let connection = open_read_only(path)?;
-        let mut statement = connection.prepare(
+        let mut sql = String::from(
             "SELECT id, boot_id, timestamp, cpu_id, sequence, origin_class, event_type, \
              effective_token_guid, true_token_guid, process_guid, payload \
              FROM events WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4",
-        )?;
-        let mut rows =
-            statement.query(params![since, until, lower_ids[shard], upper_ids[shard]])?;
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Integer(since),
+            rusqlite::types::Value::Integer(until),
+            rusqlite::types::Value::Integer(lower_ids[shard]),
+            rusqlite::types::Value::Integer(upper_ids[shard]),
+        ];
+        if let Some(constraint) = &constraint {
+            sql.push_str(" AND ");
+            sql.push_str(constraint.sql);
+            values.push(constraint.value.clone());
+        }
+        let mut statement = connection.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(values))?;
         while let Some(row) = rows.next()? {
             if output.len().is_multiple_of(1_024) {
                 check_deadline(deadline)?;
@@ -848,6 +866,58 @@ fn read_events(
         }
     }
     Ok(output)
+}
+
+struct HeaderConstraint {
+    sql: &'static str,
+    value: rusqlite::types::Value,
+}
+
+fn header_constraint(expression: &Expr) -> Option<HeaderConstraint> {
+    let Expr::Compare {
+        field,
+        operator,
+        value,
+    } = expression
+    else {
+        return None;
+    };
+    if field == "event_type" && *operator == Operator::Equal {
+        let Literal::String(value) = value else {
+            return None;
+        };
+        return Some(HeaderConstraint {
+            sql: "event_type = ?5 COLLATE NOCASE",
+            value: rusqlite::types::Value::Text(value.clone()),
+        });
+    }
+    if !matches!(field.as_str(), "cpu_id" | "origin_class") {
+        return None;
+    }
+    let value = match literal_value(field, value) {
+        Value::Signed(value) => value,
+        Value::Unsigned(value) => i64::try_from(value).ok()?,
+        _ => return None,
+    };
+    let sql = match (field.as_str(), operator) {
+        ("cpu_id", Operator::Equal) => "cpu_id = ?5",
+        ("cpu_id", Operator::NotEqual) => "cpu_id <> ?5",
+        ("cpu_id", Operator::Greater) => "cpu_id > ?5",
+        ("cpu_id", Operator::GreaterEqual) => "cpu_id >= ?5",
+        ("cpu_id", Operator::Less) => "cpu_id < ?5",
+        ("cpu_id", Operator::LessEqual) => "cpu_id <= ?5",
+        ("origin_class", Operator::Equal) => "origin_class = ?5",
+        ("origin_class", Operator::NotEqual) => "origin_class <> ?5",
+        ("origin_class", Operator::Greater) => "origin_class > ?5",
+        ("origin_class", Operator::GreaterEqual) => "origin_class >= ?5",
+        ("origin_class", Operator::Less) => "origin_class < ?5",
+        ("origin_class", Operator::LessEqual) => "origin_class <= ?5",
+        _ => return None,
+    };
+    Some(HeaderConstraint {
+        sql,
+        value: rusqlite::types::Value::Integer(value),
+    })
 }
 
 #[allow(
@@ -2379,6 +2449,30 @@ mod tests {
                 TimeRange { start: 18, end: 20 },
                 TimeRange { start: 25, end: 28 }
             ]
+        );
+    }
+
+    #[test]
+    fn header_constraints_preserve_query_language_comparison_semantics() {
+        let event_type = Expr::Compare {
+            field: "event_type".into(),
+            operator: Operator::Equal,
+            value: Literal::String("KACS.Denied".into()),
+        };
+        let constraint = header_constraint(&event_type).unwrap();
+        assert_eq!(constraint.sql, "event_type = ?5 COLLATE NOCASE");
+        assert_eq!(
+            constraint.value,
+            rusqlite::types::Value::Text("KACS.Denied".into())
+        );
+        let origin = Expr::Compare {
+            field: "origin_class".into(),
+            operator: Operator::Equal,
+            value: Literal::String("kacs".into()),
+        };
+        assert_eq!(
+            header_constraint(&origin).unwrap().value,
+            rusqlite::types::Value::Integer(2)
         );
     }
 

@@ -1,7 +1,7 @@
 //! KMES ring discovery, restart reconciliation and drain loop.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +60,8 @@ pub struct DrainContext {
     pub coverage: Arc<Coverage>,
     pub stopping: Arc<AtomicBool>,
     pub startup: SyncSender<Result<u16, String>>,
+    pub ring_pressure: Arc<[AtomicU8]>,
+    pub pressure_slot: usize,
 }
 
 #[allow(
@@ -78,6 +80,11 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
 
     let mut final_cycle_complete = false;
     loop {
+        record_pressure(
+            &ring,
+            read_position,
+            &context.ring_pressure[context.pressure_slot],
+        );
         let final_write = if context.stopping.load(Ordering::Acquire) {
             if final_cycle_complete {
                 break;
@@ -128,6 +135,11 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
                 + observation.gaps.len() * core::mem::size_of::<eventd_core::Gap>()
                 + event.event_type.len()
                 + event.payload.len();
+            record_pressure(
+                &ring,
+                read_position,
+                &context.ring_pressure[context.pressure_slot],
+            );
             let permit = context.queues[shard]
                 .reserve(charged_bytes)
                 .map_err(KmesError::Queue)?;
@@ -193,7 +205,16 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             ring.wait(read_position, 1_000).map_err(KmesError::Peios)?;
         }
     }
+
+    context.ring_pressure[context.pressure_slot].store(0, Ordering::Release);
     Ok(Attachment { cpu_id, ring })
+}
+
+fn record_pressure(ring: &EventRing, read_position: u64, pressure: &AtomicU8) {
+    let capacity = ring.capacity().max(1);
+    let used = ring.write_pos().saturating_sub(read_position).min(capacity);
+    let percent = u8::try_from(used.saturating_mul(100) / capacity).unwrap_or(100);
+    pressure.store(percent, Ordering::Release);
 }
 
 fn commit_recovery_markers(context: &DrainContext) -> Result<(), KmesError> {
