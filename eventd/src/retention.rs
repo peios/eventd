@@ -35,6 +35,7 @@ pub struct Stores {
 
 #[allow(
     clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
     reason = "the retention thread deliberately owns every lifetime dependency"
 )]
 pub fn run(
@@ -45,14 +46,15 @@ pub fn run(
     metric_sender: Sender<MetricMaintenance>,
     boot_id: [u8; 16],
     stopping: Arc<AtomicBool>,
+    requested: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut historical_shards = stores
         .historical_event_paths
         .iter()
         .map(|path| Shard::open(path, config.checkpoint_pages).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    while wait_interval(&stopping, config.interval) {
-        pass(
+    while wait_interval(&stopping, &requested, config.interval) {
+        if let Err(error) = pass(
             &config,
             &stores,
             &event_queues,
@@ -61,19 +63,24 @@ pub fn run(
             &metric_sender,
             &boot_id,
             &stopping,
-        )?;
+        ) {
+            eprintln!("eventd: retention pass failed and will be retried: {error}");
+        }
     }
     Ok(())
 }
 
-fn wait_interval(stopping: &AtomicBool, interval: Duration) -> bool {
+fn wait_interval(stopping: &AtomicBool, requested: &AtomicBool, interval: Duration) -> bool {
     let mut remaining = interval;
-    while !stopping.load(Ordering::Acquire) && !remaining.is_zero() {
-        let sleep = remaining.min(Duration::from_secs(1));
+    while !stopping.load(Ordering::Acquire) {
+        if requested.swap(false, Ordering::AcqRel) || remaining.is_zero() {
+            return true;
+        }
+        let sleep = remaining.min(Duration::from_millis(100));
         std::thread::sleep(sleep);
         remaining = remaining.saturating_sub(sleep);
     }
-    !stopping.load(Ordering::Acquire)
+    false
 }
 
 #[allow(

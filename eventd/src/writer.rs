@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use eventd_core::{BoundedQueue, DesiredIndex, IngestItem, Pop, Shard, ShardError, SyntheticEvent};
+use eventd_core::{
+    BoundedQueue, DesiredIndex, Gap, Guid, IngestItem, Pop, Shard, ShardError, SyntheticEvent,
+};
 
 use crate::commit_signal::CommitSignal;
 
@@ -44,6 +46,7 @@ pub struct SheddingConfig {
 )]
 pub fn run(
     mut shard: Shard,
+    boot_id: Guid,
     queue: &BoundedQueue<WriterMessage>,
     max_batch_size: usize,
     max_batch_latency: Duration,
@@ -51,8 +54,10 @@ pub fn run(
     commits: &Arc<CommitSignal>,
     shedding: SheddingConfig,
     ring_pressure: &Arc<[AtomicU8]>,
+    retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), ShardError> {
     let mut batch = Vec::with_capacity(max_batch_size);
+    let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
     let mut batch_history = VecDeque::new();
     loop {
@@ -60,9 +65,14 @@ pub fn run(
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
-                if let Err(error) =
-                    handle_control(&mut shard, control, commits, queue, &mut desired)
-                {
+                if let Err(error) = handle_control(
+                    &mut shard,
+                    control,
+                    commits,
+                    queue,
+                    &mut desired,
+                    retention_requested,
+                ) {
                     stopping.store(true, Ordering::Release);
                     queue.close();
                     return Err(error);
@@ -85,6 +95,9 @@ pub fn run(
                         max_batch_size,
                         shedding,
                         ring_pressure,
+                        boot_id,
+                        &mut pending_gaps,
+                        retention_requested,
                         &desired,
                         &mut batch_history,
                     ) {
@@ -94,9 +107,14 @@ pub fn run(
                         return Err(error);
                     }
                     batch.clear();
-                    if let Err(error) =
-                        handle_control(&mut shard, control, commits, queue, &mut desired)
-                    {
+                    if let Err(error) = handle_control(
+                        &mut shard,
+                        control,
+                        commits,
+                        queue,
+                        &mut desired,
+                        retention_requested,
+                    ) {
                         stopping.store(true, Ordering::Release);
                         queue.close();
                         return Err(error);
@@ -117,6 +135,9 @@ pub fn run(
             max_batch_size,
             shedding,
             ring_pressure,
+            boot_id,
+            &mut pending_gaps,
+            retention_requested,
             &desired,
             &mut batch_history,
         ) {
@@ -142,12 +163,37 @@ fn commit_batch(
     max_batch_size: usize,
     shedding: SheddingConfig,
     ring_pressure: &[AtomicU8],
+    boot_id: Guid,
+    pending_gaps: &mut Vec<(u16, Gap)>,
+    retention_requested: &AtomicBool,
     desired: &[DesiredIndex],
     history: &mut VecDeque<(Instant, bool)>,
 ) -> Result<(), ShardError> {
-    shard.commit(batch)?;
     if batch.is_empty() {
         return Ok(());
+    }
+    if !pending_gaps.is_empty() {
+        match shard.commit_gaps(&boot_id, pending_gaps) {
+            Ok(_) => {
+                pending_gaps.clear();
+                commits.committed();
+            }
+            Err(error) if error.is_capacity() => {
+                record_lost(batch, pending_gaps);
+                request_retention(retention_requested, "event", &error);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match shard.commit(batch) {
+        Ok(_) => {}
+        Err(error) if error.is_capacity() => {
+            record_lost(batch, pending_gaps);
+            request_retention(retention_requested, "event", &error);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     }
     commits.committed();
     let now = Instant::now();
@@ -166,7 +212,9 @@ fn commit_batch(
             .iter()
             .any(|pressure| pressure.load(Ordering::Acquire) >= shedding.emergency_buffer_percent);
     if emergency {
-        shard.shed_all_indexes()?;
+        if let Err(error) = shard.shed_all_indexes() {
+            eprintln!("eventd: adaptive event-index shedding failed: {error}");
+        }
         return Ok(());
     }
     let overloaded = history.iter().filter(|(_, large)| *large).count();
@@ -174,10 +222,53 @@ fn commit_batch(
         > history
             .len()
             .saturating_mul(shedding.batch_percent as usize)
+        && let Err(error) = shard.shed_lowest_index(desired)
     {
-        let _ = shard.shed_lowest_index(desired)?;
+        eprintln!("eventd: adaptive event-index shedding failed: {error}");
     }
     Ok(())
+}
+
+fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
+    for item in batch {
+        pending.extend(item.gaps.iter().map(|gap| (item.event.cpu_id, *gap)));
+        if item.store_event {
+            pending.push((
+                item.event.cpu_id,
+                Gap {
+                    timestamp: item.event.timestamp,
+                    first_sequence: item.event.sequence,
+                    last_sequence: item.event.sequence,
+                    preceding_timestamp: None,
+                    revealing_timestamp: item.event.timestamp,
+                },
+            ));
+        }
+    }
+    pending.sort_unstable_by_key(|(cpu_id, gap)| (*cpu_id, gap.first_sequence));
+    let mut output = 0;
+    for input in 0..pending.len() {
+        let (cpu_id, gap) = pending[input];
+        if output > 0
+            && pending[output - 1].0 == cpu_id
+            && gap.first_sequence <= pending[output - 1].1.last_sequence.saturating_add(1)
+        {
+            let previous = &mut pending[output - 1].1;
+            previous.last_sequence = previous.last_sequence.max(gap.last_sequence);
+            previous.timestamp = previous.timestamp.max(gap.timestamp);
+            previous.revealing_timestamp =
+                previous.revealing_timestamp.max(gap.revealing_timestamp);
+        } else {
+            pending[output] = (cpu_id, gap);
+            output += 1;
+        }
+    }
+    pending.truncate(output);
+}
+
+fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
+    requested.store(true, Ordering::Release);
+    eprintln!("eventd: {store} store is full; batch discarded and retention requested: {error}");
 }
 
 fn handle_control(
@@ -186,6 +277,7 @@ fn handle_control(
     commits: &CommitSignal,
     queue: &BoundedQueue<WriterMessage>,
     current_desired: &mut Arc<[DesiredIndex]>,
+    retention_requested: &AtomicBool,
 ) -> Result<(), ShardError> {
     match message {
         WriterMessage::Event(_) => unreachable!("events are handled by the batch loop"),
@@ -200,8 +292,14 @@ fn handle_control(
                 Ok(())
             }
             Err(error) => {
-                let _ = sender.send(Err(error.to_string()));
-                Err(error)
+                if error.is_capacity() {
+                    request_retention(retention_requested, "event", &error);
+                    let _ = sender.send(Ok(()));
+                    Ok(())
+                } else {
+                    let _ = sender.send(Err(error.to_string()));
+                    Err(error)
+                }
             }
         },
         WriterMessage::Maintenance(command, sender) => {
@@ -221,7 +319,12 @@ fn handle_control(
                 }
                 Err(error) => {
                     let _ = sender.send(Err(error.to_string()));
-                    Err(error)
+                    if error.is_capacity() {
+                        request_retention(retention_requested, "event", &error);
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
                 }
             }
         }
@@ -249,5 +352,53 @@ fn fail_control(message: WriterMessage, error: &ShardError) {
         WriterMessage::Maintenance(_, sender) => {
             let _ = sender.send(Err(error.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventd_core::RealEvent;
+
+    #[test]
+    fn lost_batches_become_merged_per_cpu_gap_ranges() {
+        let item = IngestItem {
+            gaps: vec![Gap {
+                timestamp: 20,
+                first_sequence: 2,
+                last_sequence: 3,
+                preceding_timestamp: Some(10),
+                revealing_timestamp: 40,
+            }],
+            store_event: true,
+            event: RealEvent {
+                boot_id: [1; 16],
+                timestamp: 40,
+                cpu_id: 7,
+                sequence: 4,
+                origin_class: 0,
+                effective_token_guid: [0; 16],
+                true_token_guid: [0; 16],
+                process_guid: [0; 16],
+                event_type: "test.event".into(),
+                payload: [0x80].into(),
+            },
+        };
+        let mut pending = vec![(
+            7,
+            Gap {
+                timestamp: 10,
+                first_sequence: 1,
+                last_sequence: 1,
+                preceding_timestamp: None,
+                revealing_timestamp: 10,
+            },
+        )];
+        record_lost(&[item], &mut pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 7);
+        assert_eq!(pending[0].1.first_sequence, 1);
+        assert_eq!(pending[0].1.last_sequence, 4);
+        assert_eq!(pending[0].1.revealing_timestamp, 40);
     }
 }

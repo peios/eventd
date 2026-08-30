@@ -135,7 +135,10 @@ impl LogStore {
         }
         transaction.commit()?;
         self.known_origins.extend(pending);
-        self.checkpoint_if_needed()
+        match self.checkpoint_if_needed() {
+            Err(error) if error.is_capacity() => Ok(()),
+            result => result,
+        }
     }
 
     /// Delete at most `limit` oldest rows, optionally constrained by age.
@@ -242,6 +245,18 @@ pub enum LogStoreError {
     IntegerRange,
 }
 
+impl LogStoreError {
+    /// Whether retrying after retention may make this operation succeed.
+    #[must_use]
+    pub fn is_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
+}
+
 impl fmt::Display for LogStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -305,6 +320,15 @@ mod tests {
         assert_eq!(store.retain_oldest(Some(11), 10).unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn classifies_sqlite_full_as_capacity_failure() {
+        let error = LogStoreError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert!(error.is_capacity());
     }
 
     fn temporary_directory() -> PathBuf {

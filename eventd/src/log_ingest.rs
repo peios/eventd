@@ -36,6 +36,7 @@ pub fn run(
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
     maintenance: &Receiver<LogMaintenance>,
+    retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), LogIngestError> {
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
@@ -54,8 +55,7 @@ pub fn run(
                     if batch.len() == max_batch_size
                         || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
                     {
-                        store.commit(&batch)?;
-                        commits.committed();
+                        commit_batch(&mut store, &batch, commits, retention_requested)?;
                         batch.clear();
                         started = None;
                     }
@@ -64,13 +64,12 @@ pub fn run(
             Receive::Truncated => {}
             Receive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
             Receive::Empty => {
-                store.commit(&batch)?;
-                commits.committed();
+                commit_batch(&mut store, &batch, commits, retention_requested)?;
                 batch.clear();
                 started = None;
             }
         }
-        process_maintenance(&mut store, maintenance)?;
+        process_maintenance(&mut store, maintenance, retention_requested)?;
     }
     loop {
         match socket.receive(&mut buffer)? {
@@ -83,8 +82,7 @@ pub fn run(
                 for record in records {
                     batch.push(record);
                     if batch.len() == max_batch_size {
-                        store.commit(&batch)?;
-                        commits.committed();
+                        commit_batch(&mut store, &batch, commits, retention_requested)?;
                         batch.clear();
                     }
                 }
@@ -94,8 +92,7 @@ pub fn run(
         }
     }
     if !batch.is_empty() {
-        store.commit(&batch)?;
-        commits.committed();
+        commit_batch(&mut store, &batch, commits, retention_requested)?;
     }
     Ok(())
 }
@@ -103,6 +100,7 @@ pub fn run(
 fn process_maintenance(
     store: &mut LogStore,
     receiver: &Receiver<LogMaintenance>,
+    retention_requested: &AtomicBool,
 ) -> Result<(), LogIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) => command,
@@ -123,9 +121,40 @@ fn process_maintenance(
         }
         Err(error) => {
             let _ = response.send(Err(error.to_string()));
-            Err(error.into())
+            if error.is_capacity() {
+                request_retention(retention_requested, &error);
+                Ok(())
+            } else {
+                Err(error.into())
+            }
         }
     }
+}
+
+fn commit_batch(
+    store: &mut LogStore,
+    batch: &[LogRecord],
+    commits: &CommitSignal,
+    retention_requested: &AtomicBool,
+) -> Result<(), LogIngestError> {
+    match store.commit(batch) {
+        Ok(()) => {
+            if !batch.is_empty() {
+                commits.committed();
+            }
+            Ok(())
+        }
+        Err(error) if error.is_capacity() => {
+            request_retention(retention_requested, &error);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn request_retention(requested: &AtomicBool, error: &LogStoreError) {
+    requested.store(true, Ordering::Release);
+    eprintln!("eventd: log store is full; batch discarded and retention requested: {error}");
 }
 
 fn realtime_nanoseconds() -> Result<i64, LogIngestError> {

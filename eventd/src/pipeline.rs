@@ -138,6 +138,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into();
     let event_commits = Arc::new(CommitSignal::new());
     let log_commits = Arc::new(CommitSignal::new());
+    let retention_requested = Arc::new(AtomicBool::new(false));
     install_signal_handlers()?;
 
     let mut event_writers = Vec::with_capacity(shard_count);
@@ -148,6 +149,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let max_batch_latency = config.max_batch_latency;
         let writer_commits = Arc::clone(&event_commits);
         let writer_ring_pressure = Arc::clone(&ring_pressure);
+        let writer_retention_requested = Arc::clone(&retention_requested);
         let shedding = SheddingConfig {
             window: config.shedding_window,
             batch_percent: config.shedding_batch_percent,
@@ -159,6 +161,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .spawn(move || {
                     crate::writer::run(
                         shard,
+                        boot_id,
                         &queue,
                         max_batch_size,
                         max_batch_latency,
@@ -166,6 +169,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &writer_commits,
                         shedding,
                         &writer_ring_pressure,
+                        &writer_retention_requested,
                     )
                     .map_err(|error| error.to_string())
                 })?,
@@ -197,6 +201,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_batch_latency = config.log_max_batch_latency;
     let log_datagram_ceiling = config.max_log_datagram_bytes;
     let log_writer_commits = Arc::clone(&log_commits);
+    let log_retention_requested = Arc::clone(&retention_requested);
     let (log_maintenance_sender, log_maintenance_receiver) = channel();
     let log_thread_socket = Arc::clone(&log_socket);
     let log_handle = std::thread::Builder::new()
@@ -212,6 +217,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &log_stopping,
                 &log_writer_commits,
                 &log_maintenance_receiver,
+                &log_retention_requested,
             )
             .map_err(|error| error.to_string())
         })?;
@@ -219,6 +225,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_batch_size = config.metric_max_batch_size;
     let metric_batch_latency = config.metric_max_batch_latency;
     let metric_datagram_ceiling = config.max_metric_datagram_bytes;
+    let metric_retention_requested = Arc::clone(&retention_requested);
     let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
     let metric_thread_socket = Arc::clone(&metric_socket);
     let metric_handle = std::thread::Builder::new()
@@ -233,6 +240,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 metric_batch_latency,
                 &metric_stopping,
                 &metric_maintenance_receiver,
+                &metric_retention_requested,
             )
             .map_err(|error| error.to_string())
         })?;
@@ -349,6 +357,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let retention_queues = Arc::clone(&queues);
     let retention_stopping = Arc::clone(&stopping);
+    let retention_requested = Arc::clone(&retention_requested);
     let retention_handle = std::thread::Builder::new()
         .name("eventd-retention".to_owned())
         .spawn(move || {
@@ -360,6 +369,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 metric_maintenance_sender,
                 boot_id,
                 retention_stopping,
+                retention_requested,
             )
         })?;
     notify_ready()?;

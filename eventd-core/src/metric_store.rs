@@ -208,7 +208,11 @@ impl MetricStore {
                 self.cache.pop_front();
             }
         }
-        self.checkpoint_if_needed()?;
+        if let Err(error) = self.checkpoint_if_needed()
+            && !error.is_capacity()
+        {
+            return Err(error);
+        }
         Ok(MetricCommitStats {
             accepted,
             type_mismatches: records.len() - accepted,
@@ -492,6 +496,18 @@ pub enum MetricStoreError {
     IntegerRange,
 }
 
+impl MetricStoreError {
+    /// Whether retrying after retention may make this operation succeed.
+    #[must_use]
+    pub fn is_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
+}
+
 impl fmt::Display for MetricStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -572,6 +588,15 @@ mod tests {
         assert_eq!(series, 0);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn classifies_sqlite_full_as_capacity_failure() {
+        let error = MetricStoreError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert!(error.is_capacity());
     }
 
     #[test]

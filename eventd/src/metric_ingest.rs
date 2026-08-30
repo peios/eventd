@@ -36,6 +36,7 @@ pub fn run(
     max_batch_latency: Duration,
     stopping: &Arc<AtomicBool>,
     maintenance: &Receiver<MetricMaintenance>,
+    retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), MetricIngestError> {
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
@@ -54,7 +55,7 @@ pub fn run(
                     if batch.len() == max_batch_size
                         || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
                     {
-                        store.commit(&batch)?;
+                        commit_batch(&mut store, &batch, retention_requested)?;
                         batch.clear();
                         started = None;
                     }
@@ -63,12 +64,12 @@ pub fn run(
             Receive::Truncated => {}
             Receive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
             Receive::Empty => {
-                store.commit(&batch)?;
+                commit_batch(&mut store, &batch, retention_requested)?;
                 batch.clear();
                 started = None;
             }
         }
-        process_maintenance(&mut store, maintenance)?;
+        process_maintenance(&mut store, maintenance, retention_requested)?;
     }
     loop {
         match socket.receive(&mut buffer)? {
@@ -81,7 +82,7 @@ pub fn run(
                 for record in records {
                     batch.push(record);
                     if batch.len() == max_batch_size {
-                        store.commit(&batch)?;
+                        commit_batch(&mut store, &batch, retention_requested)?;
                         batch.clear();
                     }
                 }
@@ -91,7 +92,7 @@ pub fn run(
         }
     }
     if !batch.is_empty() {
-        store.commit(&batch)?;
+        commit_batch(&mut store, &batch, retention_requested)?;
     }
     Ok(())
 }
@@ -99,6 +100,7 @@ pub fn run(
 fn process_maintenance(
     store: &mut MetricStore,
     receiver: &Receiver<MetricMaintenance>,
+    retention_requested: &AtomicBool,
 ) -> Result<(), MetricIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) => command,
@@ -121,9 +123,34 @@ fn process_maintenance(
         }
         Err(error) => {
             let _ = response.send(Err(error.to_string()));
-            Err(error.into())
+            if error.is_capacity() {
+                request_retention(retention_requested, &error);
+                Ok(())
+            } else {
+                Err(error.into())
+            }
         }
     }
+}
+
+fn commit_batch(
+    store: &mut MetricStore,
+    batch: &[MetricRecord],
+    retention_requested: &AtomicBool,
+) -> Result<(), MetricIngestError> {
+    match store.commit(batch) {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_capacity() => {
+            request_retention(retention_requested, &error);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn request_retention(requested: &AtomicBool, error: &MetricStoreError) {
+    requested.store(true, Ordering::Release);
+    eprintln!("eventd: metric store is full; batch discarded and retention requested: {error}");
 }
 
 pub fn parse_datagram(

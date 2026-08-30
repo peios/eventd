@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
-use crate::{DesiredIndex, Guid, IngestItem, Interval, SyntheticEvent};
+use crate::{DesiredIndex, Gap, Guid, IngestItem, Interval, SyntheticEvent};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -203,12 +203,88 @@ impl Shard {
         transaction.commit()?;
         self.known_types.extend(pending_types);
 
-        self.checkpoint_if_needed()?;
+        if let Err(error) = self.checkpoint_if_needed()
+            && !error.is_capacity()
+        {
+            return Err(error);
+        }
         Ok(CommitStats {
             items: items.len(),
             event_rows: items.iter().filter(|item| item.store_event).count()
                 + items.iter().map(|item| item.gaps.len()).sum::<usize>(),
             receipt_rows: receipts.values().map(Vec::len).sum(),
+        })
+    }
+
+    /// Durably describe event ranges consumed while storage was unavailable.
+    ///
+    /// Gap rows and their receipt ranges share one transaction so restart
+    /// reconciliation never mistakes a deliberately reported loss for an
+    /// unreported one.
+    pub fn commit_gaps(
+        &mut self,
+        boot_id: &Guid,
+        gaps: &[(u16, Gap)],
+    ) -> Result<CommitStats, ShardError> {
+        if gaps.is_empty() {
+            return Ok(CommitStats::default());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
+            [],
+        )?;
+        let receipt_rows;
+        {
+            let mut insert_gap = transaction.prepare_cached(
+                "INSERT INTO events (boot_id, timestamp, cpu_id, event_type, payload) \
+                 VALUES (?1, ?2, ?3, 'synthetic.gap', ?4)",
+            )?;
+            let mut receipts: HashMap<u16, Vec<Interval>> = HashMap::new();
+            for (cpu_id, gap) in gaps {
+                insert_gap.execute(params![
+                    &boot_id[..],
+                    sqlite_integer(gap.timestamp, "gap timestamp")?,
+                    i64::from(*cpu_id),
+                    encode_gap_payload(*cpu_id, *gap),
+                ])?;
+                receipts.entry(*cpu_id).or_default().push(Interval {
+                    first: gap.first_sequence,
+                    last: gap.last_sequence,
+                });
+            }
+            drop(insert_gap);
+
+            let mut insert_receipt = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO receipt_ranges \
+                 (boot_id, cpu_id, first_sequence, last_sequence) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (cpu_id, intervals) in &mut receipts {
+                merge_intervals(intervals);
+                for interval in intervals.iter() {
+                    insert_receipt.execute(params![
+                        &boot_id[..],
+                        i64::from(*cpu_id),
+                        sqlite_integer(interval.first, "receipt first sequence")?,
+                        sqlite_integer(interval.last, "receipt last sequence")?,
+                    ])?;
+                }
+            }
+            receipt_rows = receipts.values().map(Vec::len).sum();
+        }
+        transaction.commit()?;
+        self.known_types.insert("synthetic.gap".into());
+        if let Err(error) = self.checkpoint_if_needed()
+            && !error.is_capacity()
+        {
+            return Err(error);
+        }
+        Ok(CommitStats {
+            items: gaps.len(),
+            event_rows: gaps.len(),
+            receipt_rows,
         })
     }
 
@@ -651,6 +727,18 @@ pub enum ShardError {
     InvalidSyntheticType,
 }
 
+impl ShardError {
+    /// Whether retrying after retention may make this operation succeed.
+    #[must_use]
+    pub fn is_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
+}
+
 impl fmt::Display for ShardError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -817,6 +905,53 @@ mod tests {
         assert_eq!(count, 1);
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn commits_recovery_gaps_and_receipts_atomically() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let gaps = [
+            (
+                2,
+                Gap {
+                    timestamp: 40,
+                    first_sequence: 4,
+                    last_sequence: 5,
+                    preceding_timestamp: Some(30),
+                    revealing_timestamp: 60,
+                },
+            ),
+            (
+                2,
+                Gap {
+                    timestamp: 60,
+                    first_sequence: 6,
+                    last_sequence: 6,
+                    preceding_timestamp: None,
+                    revealing_timestamp: 60,
+                },
+            ),
+        ];
+        let stats = shard.commit_gaps(&[1; 16], &gaps).unwrap();
+        assert_eq!(stats.event_rows, 2);
+        assert_eq!(stats.receipt_rows, 1);
+        assert_eq!(
+            shard.receipts().unwrap()[0].2,
+            Interval { first: 4, last: 6 }
+        );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn classifies_sqlite_full_as_capacity_failure() {
+        let error = ShardError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert!(error.is_capacity());
     }
 
     fn temporary_directory() -> PathBuf {
