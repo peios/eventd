@@ -16,6 +16,7 @@ use crate::config::{Config, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
 use crate::kmes::{self, DrainContext};
+use crate::query::{QueryServer, ServerConfig};
 use crate::writer::WriterMessage;
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
@@ -30,6 +31,7 @@ extern "C" fn stop_signal(_signal: libc::c_int) {
 )]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
+    validate_distinct_paths(&config)?;
     let event_directory = StoreDirectory::open(&config.event_store_path)?;
     let log_directory = StoreDirectory::open(&config.log_store_path)?;
     let metric_directory = StoreDirectory::open(&config.metric_store_path)?;
@@ -78,15 +80,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.metric_socket_path.display(),
     );
     let coverage = Arc::new(Coverage::from_receipts(receipts));
-    let log_store = LogStore::open(log_directory.child("logs.db"), config.wal_checkpoint_pages)?;
+    let log_path = log_directory.child("logs.db");
+    let log_store = LogStore::open(&log_path, config.wal_checkpoint_pages)?;
     let log_socket = IngestionSocket::bind(&config.log_socket_path, config.max_log_datagram_bytes)?;
+    let metric_path = metric_directory.child("metrics.db");
     let metric_store = MetricStore::open(
-        metric_directory.child("metrics.db"),
+        &metric_path,
         config.wal_checkpoint_pages,
         config.metric_series_cache_size,
     )?;
     let metric_socket =
         IngestionSocket::bind(&config.metric_socket_path, config.max_metric_datagram_bytes)?;
+    let query_server = QueryServer::bind(&config.query_socket_path)?;
 
     let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..shard_count)
         .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
@@ -211,7 +216,57 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )?;
 
+    let query_stores = Arc::new(crate::query::Stores {
+        event_paths: active_paths
+            .iter()
+            .chain(&historical_paths)
+            .cloned()
+            .collect(),
+        log_path,
+        metric_path,
+    });
+    let query_config = Arc::new(ServerConfig {
+        max_request_bytes: config.max_query_request_bytes,
+        response_target_bytes: config.query_response_target_bytes,
+        max_concurrent: config.max_concurrent_queries,
+        max_streaming: config.max_streaming_queries,
+        max_distinct_stream_values: config.max_distinct_stream_values,
+        timeout: config.query_timeout,
+    });
+    let query_stopping = Arc::clone(&stopping);
+    writers.push(
+        std::thread::Builder::new()
+            .name("eventd-query-listener".to_owned())
+            .spawn(move || {
+                query_server
+                    .run(&query_stores, &query_config, &query_stopping)
+                    .map_err(|error| error.to_string())
+            })?,
+    );
+    notify_ready()?;
+
     supervise(drains, writers, &queues, &stopping)
+}
+
+fn validate_distinct_paths(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = [
+        &config.query_socket_path,
+        &config.log_socket_path,
+        &config.metric_socket_path,
+    ];
+    if paths[0] == paths[1] || paths[0] == paths[2] || paths[1] == paths[2] {
+        return Err("query, log and metric socket paths must be distinct".into());
+    }
+    Ok(())
+}
+
+fn notify_ready() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.send_to(b"READY=1", path)?;
+    Ok(())
 }
 
 fn load_coverage(

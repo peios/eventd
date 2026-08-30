@@ -32,9 +32,19 @@ pub struct Config {
     pub metric_max_batch_latency: Duration,
     pub max_metric_datagram_bytes: usize,
     pub metric_series_cache_size: usize,
+    pub query_timeout: Duration,
+    pub max_concurrent_queries: usize,
+    pub max_streaming_queries: usize,
+    pub max_distinct_stream_values: usize,
+    pub max_query_request_bytes: usize,
+    pub query_response_target_bytes: usize,
 }
 
 impl Config {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the registry schema is intentionally visible as one literal configuration snapshot"
+    )]
     pub fn load() -> Result<Self, ConfigError> {
         let key = Key::open(
             None,
@@ -123,6 +133,53 @@ impl Config {
                 1_000_000,
             ))
             .expect("MetricSeriesCacheSize fits usize"),
+            query_timeout: Duration::from_millis(u64::from(dword(
+                &values,
+                b"QueryTimeoutMs",
+                30_000,
+                1_000,
+                300_000,
+            ))),
+            max_concurrent_queries: usize::try_from(dword(
+                &values,
+                b"MaxConcurrentQueries",
+                128,
+                1,
+                4_096,
+            ))
+            .expect("MaxConcurrentQueries fits usize"),
+            max_streaming_queries: usize::try_from(dword(
+                &values,
+                b"MaxStreamingQueries",
+                64,
+                1,
+                1_024,
+            ))
+            .expect("MaxStreamingQueries fits usize"),
+            max_distinct_stream_values: usize::try_from(dword(
+                &values,
+                b"MaxDistinctStreamValues",
+                100_000,
+                1_000,
+                10_000_000,
+            ))
+            .expect("MaxDistinctStreamValues fits usize"),
+            max_query_request_bytes: usize::try_from(dword(
+                &values,
+                b"MaxQueryRequestBytes",
+                65_536,
+                1_024,
+                16_777_216,
+            ))
+            .expect("MaxQueryRequestBytes fits usize"),
+            query_response_target_bytes: usize::try_from(dword(
+                &values,
+                b"QueryResponseTargetBytes",
+                65_536,
+                1_024,
+                16_777_216,
+            ))
+            .expect("QueryResponseTargetBytes fits usize"),
         })
     }
 }

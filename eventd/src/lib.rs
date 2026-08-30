@@ -9,6 +9,8 @@ mod kmes;
 mod log_ingest;
 mod metric_ingest;
 mod pipeline;
+mod query;
+mod query_language;
 mod synthetic;
 mod writer;
 

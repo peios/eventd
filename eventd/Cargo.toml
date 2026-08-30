@@ -15,6 +15,7 @@ eventd-core = { path = "../eventd-core" }
 libc = { workspace = true }
 peios = { workspace = true }
 peios-sys = { workspace = true }
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true
