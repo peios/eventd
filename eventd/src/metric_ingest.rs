@@ -54,7 +54,29 @@ pub fn run(
             }
         }
     }
-    store.commit(&batch)?;
+    loop {
+        match socket.receive(&mut buffer)? {
+            Receive::Datagram(length) => {
+                let receipt_timestamp = realtime_nanoseconds()?;
+                let Some(records) = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                else {
+                    continue;
+                };
+                for record in records {
+                    batch.push(record);
+                    if batch.len() == max_batch_size {
+                        store.commit(&batch)?;
+                        batch.clear();
+                    }
+                }
+            }
+            Receive::Truncated => {}
+            Receive::Empty => break,
+        }
+    }
+    if !batch.is_empty() {
+        store.commit(&batch)?;
+    }
     Ok(())
 }
 

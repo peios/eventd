@@ -72,7 +72,7 @@ impl QueryServer {
     }
 
     pub fn run(
-        self,
+        &self,
         stores: &Arc<Stores>,
         config: &Arc<ServerConfig>,
         stopping: &Arc<AtomicBool>,
@@ -123,17 +123,28 @@ impl QueryServer {
                 Err(error) => return Err(QuerySocketError::Io(error)),
             }
         }
+        while active.load(Ordering::Acquire) != 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
+    }
+
+    pub fn unlink(&self) {
+        unlink_if_owned(&self.path, self.identity);
     }
 }
 
 impl Drop for QueryServer {
     fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-            metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == self.identity
-        }) {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        self.unlink();
+    }
+}
+
+fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
+    }) {
+        let _ = std::fs::remove_file(path);
     }
 }
 

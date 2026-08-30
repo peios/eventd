@@ -38,6 +38,26 @@ pub fn startup(
     }
 }
 
+pub fn shutdown(boot_id: Guid, last_sequences: &[(u16, u64)], timestamp: u64) -> SyntheticEvent {
+    let mut payload = Vec::with_capacity(32 + last_sequences.len() * 32);
+    payload.push(0x81);
+    pack_str(&mut payload, "last_sequences");
+    pack_array_len(&mut payload, last_sequences.len());
+    for &(cpu_id, sequence) in last_sequences {
+        payload.push(0x82);
+        pack_str(&mut payload, "cpu_id");
+        pack_u64(&mut payload, u64::from(cpu_id));
+        pack_str(&mut payload, "sequence");
+        pack_u64(&mut payload, sequence);
+    }
+    SyntheticEvent {
+        boot_id,
+        timestamp,
+        event_type: "synthetic.shutdown".into(),
+        payload: payload.into_boxed_slice(),
+    }
+}
+
 fn pack_array_len(output: &mut Vec<u8>, length: usize) {
     if length <= 15 {
         output.push(0x90 | u8::try_from(length).expect("fixarray length"));
@@ -104,5 +124,12 @@ mod tests {
         );
         assert_eq!(event.event_type.as_ref(), "synthetic.startup");
         assert_eq!(event.payload[0], 0x84);
+    }
+
+    #[test]
+    fn shutdown_payload_has_stable_top_level_shape() {
+        let event = shutdown([1; 16], &[(0, 9), (2, 11)], 7);
+        assert_eq!(event.event_type.as_ref(), "synthetic.shutdown");
+        assert_eq!(event.payload[0], 0x81);
     }
 }

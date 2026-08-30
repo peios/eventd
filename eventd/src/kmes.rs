@@ -66,7 +66,7 @@ pub struct DrainContext {
     clippy::too_many_lines,
     reason = "the ring state machine stays linear so resize and recovery ordering remain auditable"
 )]
-pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), KmesError> {
+pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attachment, KmesError> {
     let cpu_id = attachment.cpu_id;
     let mut ring = attachment.ring;
     let mut read_position = ring.tail_pos();
@@ -76,14 +76,24 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), Km
     let mut reconciler = Reconciler::new(&context.coverage, context.boot_id, cpu_id);
     let mut last_sequence = None;
 
-    while !context.stopping.load(Ordering::Acquire) {
+    let mut final_cycle_complete = false;
+    loop {
+        let final_write = if context.stopping.load(Ordering::Acquire) {
+            if final_cycle_complete {
+                break;
+            }
+            final_cycle_complete = true;
+            Some(ring.write_pos())
+        } else {
+            None
+        };
         let mut progressed = false;
         loop {
             let tail = ring.tail_pos();
             if read_position < tail {
                 read_position = tail;
             }
-            let write = ring.write_pos();
+            let write = final_write.unwrap_or_else(|| ring.write_pos());
             if read_position >= write {
                 break;
             }
@@ -176,11 +186,14 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<(), Km
                 }
             }
         }
+        if final_cycle_complete {
+            break;
+        }
         if !progressed {
             ring.wait(read_position, 1_000).map_err(KmesError::Peios)?;
         }
     }
-    Ok(())
+    Ok(Attachment { cpu_id, ring })
 }
 
 fn commit_recovery_markers(context: &DrainContext) -> Result<(), KmesError> {
