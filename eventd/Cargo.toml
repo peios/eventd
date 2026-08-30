@@ -1,0 +1,20 @@
+[package]
+name = "eventd"
+description = "The Peios durable event, log and metric daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eventd"
+path = "src/main.rs"
+
+[dependencies]
+eventd-core = { path = "../eventd-core" }
+libc = { workspace = true }
+peios = { workspace = true }
+peios-sys = { workspace = true }
+
+[lints]
+workspace = true

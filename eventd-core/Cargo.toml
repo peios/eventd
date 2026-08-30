@@ -1,0 +1,19 @@
+[package]
+name = "eventd-core"
+description = "Performance-critical storage and handoff engine for eventd."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-utils = { workspace = true }
+hashlink = { workspace = true }
+rusqlite = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false

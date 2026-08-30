@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["eventd-core", "eventd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+crossbeam-utils = "0.8.21"
+hashlink = "0.10.0"
+libc = "0.2.175"
+peios = { path = "../peios-rs/peios" }
+peios-sys = { path = "../peios-rs/peios-sys" }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.bench]
+debug = true

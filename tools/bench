@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+cargo bench -p eventd-core --bench hot_path
