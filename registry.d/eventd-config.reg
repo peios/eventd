@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "The standard eventd deployment paths. All six values are required:",
+    "eventd intentionally has no compiled fallback that could write audit data",
+    "somewhere an operator did not choose.",
+    "",
+    "The package supplies the three empty /var/state directories. peinit",
+    "supplies /run/eventd through RuntimeDirectories in eventd-service.reg.",
+    "",
+    "This seed is inert until an image names eventd-config.reg in its",
+    "[registry] autoapply list. Tuning values are omitted because eventd's",
+    "compiled defaults are the canonical defaults documented by regman."
+  ],
+  "keys": [
+    { "path": "Machine\\System" },
+    {
+      "path": "Machine\\System\\eventd",
+      "values": [
+        { "name": "EventStorePath",  "type": "sz", "data": "/var/state/eventd/events/" },
+        { "name": "LogStorePath",    "type": "sz", "data": "/var/state/eventd/logs/" },
+        { "name": "MetricStorePath", "type": "sz", "data": "/var/state/eventd/metrics/" },
+        { "name": "QuerySocketPath", "type": "sz", "data": "/run/eventd/query.sock" },
+        { "name": "LogSocketPath",   "type": "sz", "data": "/run/eventd/log.sock" },
+        { "name": "MetricSocketPath","type": "sz", "data": "/run/eventd/metric.sock" }
+      ]
+    }
+  ]
+}

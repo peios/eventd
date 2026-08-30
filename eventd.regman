@@ -1,0 +1,382 @@
+--- machine\system\eventd
+canonical: Machine\System\eventd
+
+eventd's storage, ingestion and query policy. The six path values are required;
+all tuning values have compiled defaults. Invalid live changes are ignored and
+the last valid value remains effective. Unknown values are ignored.
+
+The standard deployment is offered by `eventd-config.reg`; installing the
+package does not apply it. Store paths and socket paths require a restart.
+Every tuning value below applies live.
+
+--- machine\system\eventd eventstorepath
+canonical: Machine\System\eventd EventStorePath
+type: REG_SZ
+default: (required; standard /var/state/eventd/events/)
+applies: restart
+
+Provisioned protected directory holding event shards and `eventd-meta.db`.
+Must be an absolute path with no symbolic-link component.
+
+--- machine\system\eventd logstorepath
+canonical: Machine\System\eventd LogStorePath
+type: REG_SZ
+default: (required; standard /var/state/eventd/logs/)
+applies: restart
+
+Provisioned protected directory holding `logs.db`.
+
+--- machine\system\eventd metricstorepath
+canonical: Machine\System\eventd MetricStorePath
+type: REG_SZ
+default: (required; standard /var/state/eventd/metrics/)
+applies: restart
+
+Provisioned protected directory holding `metrics.db`.
+
+--- machine\system\eventd querysocketpath
+canonical: Machine\System\eventd QuerySocketPath
+type: REG_SZ
+default: (required; standard /run/eventd/query.sock)
+applies: restart
+
+Unix stream socket serving authorized observability queries.
+
+--- machine\system\eventd logsocketpath
+canonical: Machine\System\eventd LogSocketPath
+type: REG_SZ
+default: (required; standard /run/eventd/log.sock)
+applies: restart
+
+Unix datagram socket receiving service log records, including peinit output.
+
+--- machine\system\eventd metricsocketpath
+canonical: Machine\System\eventd MetricSocketPath
+type: REG_SZ
+default: (required; standard /run/eventd/metric.sock)
+applies: restart
+
+Unix datagram socket receiving metric samples.
+
+--- machine\system\eventd walcheckpointpages
+canonical: Machine\System\eventd WalCheckpointPages
+type: REG_DWORD
+default: 1000
+valid: 100 to 100000
+applies: live
+
+WAL pages that trigger a passive checkpoint on event, log, metric and metadata
+databases. Lower values bound WAL size more tightly but checkpoint more often.
+
+--- machine\system\eventd storageshards
+canonical: Machine\System\eventd StorageShards
+type: REG_DWORD
+default: 0
+valid: 0 to 256
+applies: restart
+
+Active event shard count. Zero selects one shard per attached KMES buffer.
+
+--- machine\system\eventd maxbatchsize
+canonical: Machine\System\eventd MaxBatchSize
+type: REG_DWORD
+default: 10000
+valid: 100 to 100000
+applies: live
+
+Maximum event rows considered for one durability transaction.
+
+--- machine\system\eventd maxbatchlatencyms
+canonical: Machine\System\eventd MaxBatchLatencyMs
+type: REG_DWORD
+default: 100
+valid: 10 to 5000
+applies: live
+
+Maximum event batch age in milliseconds before commit.
+
+--- machine\system\eventd logmaxbatchsize
+canonical: Machine\System\eventd LogMaxBatchSize
+type: REG_DWORD
+default: 5000
+valid: 100 to 100000
+applies: live
+
+Maximum log records per transaction.
+
+--- machine\system\eventd logmaxbatchlatencyms
+canonical: Machine\System\eventd LogMaxBatchLatencyMs
+type: REG_DWORD
+default: 500
+valid: 10 to 5000
+applies: live
+
+Maximum log batch age in milliseconds before commit.
+
+--- machine\system\eventd maxlogdatagrambytes
+canonical: Machine\System\eventd MaxLogDatagramBytes
+type: REG_DWORD
+default: 262144
+valid: 4096 to 1048576
+applies: live
+
+Largest accepted log datagram. Oversized datagrams are discarded before
+decoding.
+
+--- machine\system\eventd metricmaxbatchsize
+canonical: Machine\System\eventd MetricMaxBatchSize
+type: REG_DWORD
+default: 5000
+valid: 100 to 100000
+applies: live
+
+Maximum metric samples per transaction.
+
+--- machine\system\eventd metricmaxbatchlatencyms
+canonical: Machine\System\eventd MetricMaxBatchLatencyMs
+type: REG_DWORD
+default: 1000
+valid: 10 to 5000
+applies: live
+
+Maximum metric batch age in milliseconds before commit.
+
+--- machine\system\eventd maxmetricdatagrambytes
+canonical: Machine\System\eventd MaxMetricDatagramBytes
+type: REG_DWORD
+default: 262144
+valid: 4096 to 1048576
+applies: live
+
+Largest accepted metric datagram.
+
+--- machine\system\eventd metricseriescachesize
+canonical: Machine\System\eventd MetricSeriesCacheSize
+type: REG_DWORD
+default: 50000
+valid: 1000 to 1000000
+applies: live
+
+Maximum resolved metric series retained in the in-memory LRU cache.
+
+--- machine\system\eventd adaptiveindexwindowhours
+canonical: Machine\System\eventd AdaptiveIndexWindowHours
+type: REG_DWORD
+default: 24
+valid: 1 to 168
+applies: live
+
+Rolling query-accounting window used by adaptive event indexes.
+
+--- machine\system\eventd adaptiveindexpolicyintervalminutes
+canonical: Machine\System\eventd AdaptiveIndexPolicyIntervalMinutes
+type: REG_DWORD
+default: 60
+valid: 60 to 1440
+applies: live
+
+Interval between adaptive-index policy recomputations. The one-hour floor
+prevents index churn.
+
+--- machine\system\eventd adaptiveindexcreatethreshold
+canonical: Machine\System\eventd AdaptiveIndexCreateThreshold
+type: REG_DWORD
+default: 100
+valid: 10 to 10000
+applies: live
+
+Queries on a field within the accounting window needed to request an index.
+
+--- machine\system\eventd adaptiveindexdropthreshold
+canonical: Machine\System\eventd AdaptiveIndexDropThreshold
+type: REG_DWORD
+default: 10
+valid: 1 to 1000 and below AdaptiveIndexCreateThreshold
+applies: live
+
+Queries below which a requested index is removed. The gap from the creation
+threshold supplies hysteresis.
+
+--- machine\system\eventd sheddingwindowseconds
+canonical: Machine\System\eventd SheddingWindowSeconds
+type: REG_DWORD
+default: 30
+valid: 10 to 300
+applies: live
+
+Sliding batch-pressure window used for graduated index shedding.
+
+--- machine\system\eventd sheddingbatchpercent
+canonical: Machine\System\eventd SheddingBatchPercent
+type: REG_DWORD
+default: 75
+valid: 50 to 100
+applies: live
+
+Percentage of batches above three quarters full that triggers shedding.
+
+--- machine\system\eventd emergencysheddingbufferpercent
+canonical: Machine\System\eventd EmergencySheddingBufferPercent
+type: REG_DWORD
+default: 75
+valid: 50 to 95
+applies: live
+
+KMES ring fill percentage that drops all adaptive indexes during a maximum-size
+batch. The mandatory timestamp index is never shed.
+
+--- machine\system\eventd eventretentiondays
+canonical: Machine\System\eventd EventRetentionDays
+type: REG_DWORD
+default: 30
+valid: 1 to 3650
+applies: live
+
+Maximum event age in days.
+
+--- machine\system\eventd eventretentionmaxbytes
+canonical: Machine\System\eventd EventRetentionMaxBytes
+type: REG_QWORD
+default: 0
+valid: 0 or more
+applies: live
+
+Maximum logical live bytes across event shards. Zero disables the size limit.
+
+--- machine\system\eventd logretentiondays
+canonical: Machine\System\eventd LogRetentionDays
+type: REG_DWORD
+default: 14
+valid: 1 to 3650
+applies: live
+
+Maximum log age in days.
+
+--- machine\system\eventd logretentionmaxbytes
+canonical: Machine\System\eventd LogRetentionMaxBytes
+type: REG_QWORD
+default: 0
+valid: 0 or more
+applies: live
+
+Maximum logical live bytes in the log store. Zero disables the size limit.
+
+--- machine\system\eventd metricretentiondays
+canonical: Machine\System\eventd MetricRetentionDays
+type: REG_DWORD
+default: 90
+valid: 1 to 3650
+applies: live
+
+Maximum metric sample age in days.
+
+--- machine\system\eventd metricretentionmaxbytes
+canonical: Machine\System\eventd MetricRetentionMaxBytes
+type: REG_QWORD
+default: 0
+valid: 0 or more
+applies: live
+
+Maximum logical live bytes in the metric store. Zero disables the size limit.
+
+--- machine\system\eventd retentioncheckintervalminutes
+canonical: Machine\System\eventd RetentionCheckIntervalMinutes
+type: REG_DWORD
+default: 60
+valid: 1 to 1440
+applies: live
+
+Normal interval between retention passes. Storage-full handling may request an
+immediate pass independently.
+
+--- machine\system\eventd retentiondeletebatchrows
+canonical: Machine\System\eventd RetentionDeleteBatchRows
+type: REG_DWORD
+default: 10000
+valid: 100 to 100000
+applies: live
+
+Maximum rows removed by one bounded retention transaction.
+
+--- machine\system\eventd querytimeoutms
+canonical: Machine\System\eventd QueryTimeoutMs
+type: REG_DWORD
+default: 30000
+valid: 1000 to 300000
+applies: live
+
+Maximum milliseconds for parsing through transmission of an initial query
+result. Streaming watch phases are not time-limited.
+
+--- machine\system\eventd maxconcurrentqueries
+canonical: Machine\System\eventd MaxConcurrentQueries
+type: REG_DWORD
+default: 128
+valid: 1 to 4096
+applies: live
+
+Global concurrent query limit. Excess requests are rejected, not queued.
+
+--- machine\system\eventd maxstreamingqueries
+canonical: Machine\System\eventd MaxStreamingQueries
+type: REG_DWORD
+default: 64
+valid: 1 to 1024
+applies: live
+
+Global streaming-query limit, enforced in addition to MaxConcurrentQueries.
+
+--- machine\system\eventd maxdistinctstreamvalues
+canonical: Machine\System\eventd MaxDistinctStreamValues
+type: REG_DWORD
+default: 100000
+valid: 1000 to 10000000
+applies: live
+
+Maximum remembered values for one DISTINCT stream before it is terminated.
+
+--- machine\system\eventd maxqueryrequestbytes
+canonical: Machine\System\eventd MaxQueryRequestBytes
+type: REG_DWORD
+default: 65536
+valid: 1024 to 16777216
+applies: live
+
+Hard inbound query frame limit, checked before allocating its payload.
+
+--- machine\system\eventd queryresponsetargetbytes
+canonical: Machine\System\eventd QueryResponseTargetBytes
+type: REG_DWORD
+default: 65536
+valid: 1024 to 16777216
+applies: live
+
+Soft result batching target. One complete record may exceed it and is never
+split or truncated.
+
+--- machine\system\eventd crosstypewindowms
+canonical: Machine\System\eventd CrossTypeWindowMs
+type: REG_DWORD
+default: 15000
+valid: 1000 to 300000
+applies: live
+
+Centred event/log existence window used by cross-type predicates.
+
+--- machine\system\eventd crosstypemaxlookbackseconds
+canonical: Machine\System\eventd CrossTypeMaxLookbackSeconds
+type: REG_DWORD
+default: 604800
+valid: 3600 to 2592000
+applies: live
+
+Largest historical range accepted for a cross-type query.
+
+--- machine\system\eventd\security
+canonical: Machine\System\eventd\Security
+
+Query access policy. `Events`, `Logs` and `Metrics` contain descriptor values
+under identifier patterns; the most specific dot-prefix match wins and `*` is
+the fallback. `Admin` governs the EVENTD_ADMINISTER right used by `INDEX`.
+eventd provisions defaults only when the corresponding entries do not exist.
+Descriptor changes apply to the next query.

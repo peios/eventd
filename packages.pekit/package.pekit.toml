@@ -1,0 +1,8 @@
+# Base package metadata for eventd.
+
+format = "peipkg"
+
+[package]
+version      = "{{version}}-1"
+architecture = "x86_64"
+license      = "MIT"

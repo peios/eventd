@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "The eventd service definition.",
+    "",
+    "eventd requires loregd for configuration and authd before opening its",
+    "KACS-backed query surface. KMES and KACS themselves are kernel facilities.",
+    "The dependency edges also stop eventd after ordinary services but before",
+    "the two authorities, preserving shutdown events for as long as possible.",
+    "",
+    "Readiness is Notify: READY=1 means all stores and sockets are open and the",
+    "synthetic.startup record is durably committed. RuntimeDirectories creates",
+    "/run/eventd before launch. The package separately supplies empty protected",
+    "/var/state/eventd/{events,logs,metrics} directories.",
+    "",
+    "ErrorControl is Critical because continuing a requested boot without the",
+    "system event sink silently destroys its audit history. RestartPolicy retries",
+    "ordinary crashes before peinit applies the Critical failure policy.",
+    "",
+    "This definition is inert until an image names eventd-service.reg in its",
+    "[registry] autoapply list. The image must also apply eventd-config.reg."
+  ],
+  "keys": [
+    { "path": "Machine\\System" },
+    { "path": "Machine\\System\\Services" },
+    {
+      "path": "Machine\\System\\Services\\eventd",
+      "values": [
+        { "name": "ImagePath",          "type": "sz",    "data": "/sbin/eventd" },
+        { "name": "Triggers",           "type": "multi", "data": ["boot"] },
+        { "name": "RuntimeDirectories", "type": "multi", "data": ["eventd"] },
+        { "name": "Requires",           "type": "multi", "data": ["loregd", "authd"] },
+        { "name": "Identity",           "type": "sz",    "data": "SYSTEM" },
+        { "name": "Readiness",          "type": "dword", "data": 0 },
+        { "name": "RestartPolicy",      "type": "dword", "data": 1 },
+        { "name": "ErrorControl",       "type": "dword", "data": 1 },
+        { "name": "DisplayName",        "type": "sz",    "data": "Event and observability store" },
+        { "name": "Description",        "type": "sz",    "data": "Persists KMES events, service logs and metrics and serves authorized queries" }
+      ]
+    }
+  ]
+}
