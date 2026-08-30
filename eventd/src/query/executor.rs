@@ -1155,10 +1155,38 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
                 _ => Value::String(value.clone()),
             }
         }
+        Literal::String(value)
+            if matches!(
+                field,
+                "effective_token_guid" | "true_token_guid" | "process_guid" | "boot_id" | "job_id"
+            ) =>
+        {
+            canonical_guid_literal(value)
+                .map_or_else(|| Value::String(value.clone()), Value::String)
+        }
         Literal::String(value) => Value::String(value.clone()),
         Literal::Binary(value) => Value::Binary(value.clone()),
         Literal::Bool(value) => Value::Bool(*value),
     }
+}
+
+fn canonical_guid_literal(value: &str) -> Option<String> {
+    let body = value
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .unwrap_or(value);
+    if body.len() != 36
+        || [8, 13, 18, 23]
+            .into_iter()
+            .any(|index| body.as_bytes()[index] != b'-')
+        || body
+            .bytes()
+            .enumerate()
+            .any(|(index, byte)| ![8, 13, 18, 23].contains(&index) && !byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(format!("{{{}}}", body.to_ascii_lowercase()))
 }
 
 fn numeric_order(left: &Value, right: &Value, wanted: Ordering) -> bool {
@@ -2506,6 +2534,19 @@ mod tests {
             header_constraint(&origin).unwrap().value,
             rusqlite::types::Value::Integer(2)
         );
+    }
+
+    #[test]
+    fn guid_literals_accept_documented_brace_free_form() {
+        assert_eq!(
+            canonical_guid_literal("550E8400-E29B-41D4-A716-446655440000").as_deref(),
+            Some("{550e8400-e29b-41d4-a716-446655440000}")
+        );
+        assert_eq!(
+            canonical_guid_literal("{550e8400-e29b-41d4-a716-446655440000}").as_deref(),
+            Some("{550e8400-e29b-41d4-a716-446655440000}")
+        );
+        assert!(canonical_guid_literal("not-a-guid").is_none());
     }
 
     fn test_row(timestamp: i64, value: Value) -> Row {
