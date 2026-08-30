@@ -78,7 +78,7 @@ pub fn start_stream(
 ) -> Result<(Vec<Record>, StreamState), QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
     let mut authorization = AuthorizationCache::new(authorizer);
-    let cursor = capture_cursor(stores, &query.source)?;
+    let cursor = capture_cursor(stores, &query.source, Some(limits.deadline))?;
     let lower = StoreCursor {
         event_ids: vec![0; stores.event_paths.len()],
         log_id: 0,
@@ -114,7 +114,7 @@ pub fn stream_next(
     stores: &Stores,
     authorizer: &Authorizer,
 ) -> Result<Vec<Record>, QueryError> {
-    let upper = capture_cursor(stores, &query.source)?;
+    let upper = capture_cursor(stores, &query.source, None)?;
     if upper.event_ids == state.cursor.event_ids && upper.log_id == state.cursor.log_id {
         return Ok(Vec::new());
     }
@@ -275,7 +275,11 @@ fn execute_at(
     Ok(records)
 }
 
-fn capture_cursor(stores: &Stores, source: &Source) -> Result<StoreCursor, QueryError> {
+fn capture_cursor(
+    stores: &Stores,
+    source: &Source,
+    deadline: Option<Instant>,
+) -> Result<StoreCursor, QueryError> {
     let mut cursor = StoreCursor {
         event_ids: vec![0; stores.event_paths.len()],
         log_id: 0,
@@ -283,7 +287,7 @@ fn capture_cursor(stores: &Stores, source: &Source) -> Result<StoreCursor, Query
     match source {
         Source::Events { .. } => {
             for (index, path) in stores.event_paths.iter().enumerate() {
-                cursor.event_ids[index] = open_read_only(path)?.query_row(
+                cursor.event_ids[index] = open_read_only(path, deadline)?.query_row(
                     "SELECT COALESCE(MAX(id), 0) FROM events",
                     [],
                     |row| row.get(0),
@@ -291,7 +295,7 @@ fn capture_cursor(stores: &Stores, source: &Source) -> Result<StoreCursor, Query
             }
         }
         Source::Logs { .. } => {
-            cursor.log_id = open_read_only(&stores.log_path)?.query_row(
+            cursor.log_id = open_read_only(&stores.log_path, deadline)?.query_row(
                 "SELECT COALESCE(MAX(id), 0) FROM logs",
                 [],
                 |row| row.get(0),
@@ -520,7 +524,7 @@ fn cross_event_timestamps(
     let mut scanned = 0_usize;
     for path in paths {
         check_deadline(deadline)?;
-        let connection = open_read_only(path)?;
+        let connection = open_read_only(path, deadline)?;
         let mut statement = connection.prepare(
             "SELECT event_type, timestamp FROM events \
              WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC, id ASC",
@@ -566,7 +570,7 @@ fn cross_log_timestamps(
     if containing.is_some() {
         fields.push("message".to_owned());
     }
-    let connection = open_read_only(path)?;
+    let connection = open_read_only(path, deadline)?;
     let mut statement = connection.prepare(
         "SELECT origin, timestamp, message FROM logs \
          WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC, id ASC",
@@ -684,7 +688,7 @@ fn metric_true_ranges(
     until: i64,
     deadline: Option<Instant>,
 ) -> Result<Vec<TimeRange>, QueryError> {
-    let connection = open_read_only(path)?;
+    let connection = open_read_only(path, deadline)?;
     let Some(series) =
         resolve_cross_metric(&connection, name_pattern, labels, authorizer, deadline)?
     else {
@@ -748,7 +752,7 @@ fn metric_condition_at(
     deadline: Option<Instant>,
 ) -> Result<bool, QueryError> {
     check_deadline(deadline)?;
-    let connection = open_read_only(path)?;
+    let connection = open_read_only(path, deadline)?;
     let Some(series) =
         resolve_cross_metric(&connection, name_pattern, labels, authorizer, deadline)?
     else {
@@ -812,7 +816,7 @@ fn read_events(
     let mut output = Vec::new();
     for (shard, path) in paths.iter().enumerate() {
         check_deadline(deadline)?;
-        let connection = open_read_only(path)?;
+        let connection = open_read_only(path, deadline)?;
         let mut sql = String::from(
             "SELECT id, boot_id, timestamp, cpu_id, sequence, origin_class, event_type, \
              effective_token_guid, true_token_guid, process_guid, payload \
@@ -942,7 +946,7 @@ fn read_logs(
     lower_id: i64,
     upper_id: i64,
 ) -> Result<Vec<Row>, QueryError> {
-    let connection = open_read_only(path)?;
+    let connection = open_read_only(path, deadline)?;
     let mut statement = connection.prepare(
         "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
          FROM logs WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4",
@@ -1528,7 +1532,7 @@ fn execute_metric(
     deadline: Option<Instant>,
     cross_ranges: Option<&[TimeRange]>,
 ) -> Result<Vec<Record>, QueryError> {
-    let connection = open_read_only(path)?;
+    let connection = open_read_only(path, deadline)?;
     let mut series_statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
     let mut series_rows = series_statement.query([])?;
     let mut series = Vec::new();
@@ -2254,12 +2258,16 @@ fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn open_read_only(path: &Path) -> Result<Connection, QueryError> {
-    Connection::open_with_flags(
+fn open_read_only(path: &Path, deadline: Option<Instant>) -> Result<Connection, QueryError> {
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(QueryError::Sql)
+    .map_err(QueryError::Sql)?;
+    if let Some(deadline) = deadline {
+        connection.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    }
+    Ok(connection)
 }
 
 fn option_unsigned(value: Option<u64>) -> Value {
@@ -2400,7 +2408,14 @@ impl std::error::Error for QueryError {
 
 impl From<rusqlite::Error> for QueryError {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Sql(error)
+        if matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        ) {
+            Self::Timeout
+        } else {
+            Self::Sql(error)
+        }
     }
 }
 
@@ -2547,6 +2562,22 @@ mod tests {
             Some("{550e8400-e29b-41d4-a716-446655440000}")
         );
         assert!(canonical_guid_literal("not-a-guid").is_none());
+    }
+
+    #[test]
+    fn sqlite_progress_interrupt_is_reported_as_query_timeout() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.progress_handler(1, Some(|| true));
+        let error = connection
+            .query_row(
+                "WITH RECURSIVE numbers(value) AS (\
+                 VALUES(1) UNION ALL SELECT value + 1 FROM numbers WHERE value < 1000000\
+                 ) SELECT SUM(value) FROM numbers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert!(matches!(QueryError::from(error), QueryError::Timeout));
     }
 
     fn test_row(timestamp: i64, value: Value) -> Row {
