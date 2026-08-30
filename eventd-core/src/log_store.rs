@@ -60,6 +60,23 @@ pub struct LogStore {
 }
 
 impl LogStore {
+    /// Open the required log store, quarantining only reported corruption.
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        checkpoint_pages: u32,
+    ) -> Result<(Self, Option<String>), LogStoreError> {
+        let path = path.as_ref();
+        match Self::open(path, checkpoint_pages) {
+            Ok(store) => Ok((store, None)),
+            Err(error) if error.is_corruption() => {
+                let reason = error.to_string();
+                crate::quarantine::database(path).map_err(LogStoreError::Io)?;
+                Ok((Self::open(path, checkpoint_pages)?, Some(reason)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Open or create `logs.db` and verify schema version one.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, LogStoreError> {
         let path = path.as_ref();
@@ -139,6 +156,18 @@ impl LogStore {
             Err(error) if error.is_capacity() => Ok(()),
             result => result,
         }
+    }
+
+    /// Replace this store after `SQLite` reports corruption during a write.
+    pub fn replace_corrupt(&mut self) -> Result<(), LogStoreError> {
+        let path = self.path.clone();
+        let checkpoint_pages = self.checkpoint_pages;
+        let placeholder = Connection::open_in_memory()?;
+        let connection = std::mem::replace(&mut self.connection, placeholder);
+        drop(connection);
+        crate::quarantine::database(&path).map_err(LogStoreError::Io)?;
+        *self = Self::open(path, checkpoint_pages)?;
+        Ok(())
     }
 
     /// Delete at most `limit` oldest rows, optionally constrained by age.
@@ -253,6 +282,19 @@ impl LogStoreError {
             self,
             Self::Sql(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
+
+    /// Whether `SQLite` has declared the database image corrupt.
+    #[must_use]
+    pub const fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
         )
     }
 }

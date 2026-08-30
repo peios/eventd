@@ -66,10 +66,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut active_paths = Vec::with_capacity(shard_count);
     let mut receipts = Vec::new();
+    let mut startup_storage_errors = Vec::new();
     let mut restart = false;
     for index in 0..shard_count {
         let path = event_directory.child(&format!("shard-{index:04}.db"));
-        let shard = Shard::open(&path, config.wal_checkpoint_pages)?;
+        let (shard, recovery) = Shard::open_recovering(&path, config.wal_checkpoint_pages)?;
+        if let Some(error) = recovery {
+            eprintln!("eventd: quarantined corrupt event shard {index}: {error}");
+            startup_storage_errors.push(("event", Some(index), error));
+        }
         restart |= shard.contains_boot(&boot_id)?;
         receipts.extend(shard.receipts()?);
         shards.push(shard);
@@ -98,22 +103,41 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let coverage = Arc::new(Coverage::from_receipts(receipts));
     let log_path = log_directory.child("logs.db");
-    let log_store = LogStore::open(&log_path, config.wal_checkpoint_pages)?;
+    let (log_store, log_recovery) =
+        LogStore::open_recovering(&log_path, config.wal_checkpoint_pages)?;
+    if let Some(error) = log_recovery {
+        eprintln!("eventd: quarantined corrupt log store: {error}");
+        startup_storage_errors.push(("log", None, error));
+    }
     let log_socket = Arc::new(IngestionSocket::bind(
         &config.log_socket_path,
         config.max_log_datagram_bytes,
     )?);
     let metric_path = metric_directory.child("metrics.db");
-    let metric_store = MetricStore::open(
+    let (metric_store, metric_recovery) = MetricStore::open_recovering(
         &metric_path,
         config.wal_checkpoint_pages,
         config.metric_series_cache_size,
     )?;
+    if let Some(error) = metric_recovery {
+        eprintln!("eventd: quarantined corrupt metric store: {error}");
+        startup_storage_errors.push(("metric", None, error));
+    }
     let metric_socket = Arc::new(IngestionSocket::bind(
         &config.metric_socket_path,
         config.max_metric_datagram_bytes,
     )?);
     let query_server = Arc::new(QueryServer::bind(&config.query_socket_path)?);
+
+    for (store, shard_index, error) in startup_storage_errors {
+        shards[0].commit_synthetic(&crate::synthetic::storage_error(
+            boot_id,
+            store,
+            shard_index,
+            &error,
+            realtime_nanoseconds()?,
+        ))?;
+    }
 
     let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..shard_count)
         .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
@@ -161,6 +185,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .spawn(move || {
                     crate::writer::run(
                         shard,
+                        index,
                         boot_id,
                         &queue,
                         max_batch_size,
@@ -204,6 +229,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_retention_requested = Arc::clone(&retention_requested);
     let (log_maintenance_sender, log_maintenance_receiver) = channel();
     let log_thread_socket = Arc::clone(&log_socket);
+    let log_error_events = queues[0].clone();
     let log_handle = std::thread::Builder::new()
         .name("eventd-log".to_owned())
         .spawn(move || {
@@ -211,6 +237,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &log_thread_socket,
                 log_store,
                 boot_id,
+                &log_error_events,
                 log_datagram_ceiling,
                 log_batch_size,
                 log_batch_latency,
@@ -228,6 +255,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_retention_requested = Arc::clone(&retention_requested);
     let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
     let metric_thread_socket = Arc::clone(&metric_socket);
+    let metric_error_events = queues[0].clone();
     let metric_handle = std::thread::Builder::new()
         .name("eventd-metric".to_owned())
         .spawn(move || {
@@ -235,6 +263,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &metric_thread_socket,
                 metric_store,
                 boot_id,
+                &metric_error_events,
                 metric_datagram_ceiling,
                 metric_batch_size,
                 metric_batch_latency,

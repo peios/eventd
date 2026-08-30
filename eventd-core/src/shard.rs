@@ -67,6 +67,23 @@ pub enum IndexAction {
 }
 
 impl Shard {
+    /// Open a required shard, quarantining only SQLite-reported corruption.
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        checkpoint_pages: u32,
+    ) -> Result<(Self, Option<String>), ShardError> {
+        let path = path.as_ref();
+        match Self::open(path, checkpoint_pages) {
+            Ok(shard) => Ok((shard, None)),
+            Err(error) if error.is_corruption() => {
+                let reason = error.to_string();
+                crate::quarantine::database(path).map_err(ShardError::Io)?;
+                Ok((Self::open(path, checkpoint_pages)?, Some(reason)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Open or create one active shard and verify its required schema.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, ShardError> {
         let path = path.as_ref();
@@ -286,6 +303,18 @@ impl Shard {
             event_rows: gaps.len(),
             receipt_rows,
         })
+    }
+
+    /// Replace this shard after `SQLite` reports corruption during a write.
+    pub fn replace_corrupt(&mut self) -> Result<(), ShardError> {
+        let path = self.path.clone();
+        let checkpoint_pages = self.checkpoint_pages;
+        let placeholder = Connection::open_in_memory()?;
+        let connection = std::mem::replace(&mut self.connection, placeholder);
+        drop(connection);
+        crate::quarantine::database(&path).map_err(ShardError::Io)?;
+        *self = Self::open(path, checkpoint_pages)?;
+        Ok(())
     }
 
     /// Commit one daemon-generated event in its own durability transaction.
@@ -737,6 +766,19 @@ impl ShardError {
                 if error.code == rusqlite::ErrorCode::DiskFull
         )
     }
+
+    /// Whether `SQLite` has declared the database image corrupt.
+    #[must_use]
+    pub const fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    }
 }
 
 impl fmt::Display for ShardError {
@@ -952,6 +994,25 @@ mod tests {
             None,
         ));
         assert!(error.is_capacity());
+    }
+
+    #[test]
+    fn quarantines_and_replaces_a_corrupt_required_shard() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        let (mut shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+        assert!(recovery.is_some());
+        shard.commit(&[event(1, "test.after-recovery")]).unwrap();
+        assert!(std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("shard-0000.db.corrupt.")
+        }));
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn temporary_directory() -> PathBuf {

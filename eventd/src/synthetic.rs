@@ -58,6 +58,36 @@ pub fn shutdown(boot_id: Guid, last_sequences: &[(u16, u64)], timestamp: u64) ->
     }
 }
 
+pub fn storage_error(
+    boot_id: Guid,
+    store: &str,
+    shard_index: Option<usize>,
+    error: &str,
+    timestamp: u64,
+) -> SyntheticEvent {
+    let mut payload = Vec::with_capacity(64 + error.len());
+    payload.push(0x83);
+    pack_str(&mut payload, "store");
+    pack_str(&mut payload, store);
+    pack_str(&mut payload, "shard_index");
+    if let Some(index) = shard_index {
+        pack_u64(
+            &mut payload,
+            u64::try_from(index).expect("shard index fits u64"),
+        );
+    } else {
+        payload.push(0xc0);
+    }
+    pack_str(&mut payload, "error");
+    pack_str(&mut payload, error);
+    SyntheticEvent {
+        boot_id,
+        timestamp,
+        event_type: "synthetic.storage_error".into(),
+        payload: payload.into_boxed_slice(),
+    }
+}
+
 fn pack_array_len(output: &mut Vec<u8>, length: usize) {
     if length <= 15 {
         output.push(0x90 | u8::try_from(length).expect("fixarray length"));
@@ -131,5 +161,12 @@ mod tests {
         let event = shutdown([1; 16], &[(0, 9), (2, 11)], 7);
         assert_eq!(event.event_type.as_ref(), "synthetic.shutdown");
         assert_eq!(event.payload[0], 0x81);
+    }
+
+    #[test]
+    fn storage_error_payload_has_stable_top_level_shape() {
+        let event = storage_error([1; 16], "event", Some(3), "corrupt", 7);
+        assert_eq!(event.event_type.as_ref(), "synthetic.storage_error");
+        assert_eq!(event.payload[0], 0x83);
     }
 }

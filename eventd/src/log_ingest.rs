@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use eventd_core::{LogRecord, LogStore, LogStoreError};
+use eventd_core::{BoundedQueue, LogRecord, LogStore, LogStoreError};
 use peios::msgpack::{Reader, Type};
 
 use crate::commit_signal::CommitSignal;
 use crate::datagram::{IngestionSocket, Receive, SocketError};
+use crate::writer::WriterMessage;
 
 pub enum LogMaintenance {
     DeleteOldest {
@@ -30,6 +31,7 @@ pub fn run(
     socket: &IngestionSocket,
     mut store: LogStore,
     boot_id: [u8; 16],
+    error_events: &BoundedQueue<WriterMessage>,
     datagram_ceiling: usize,
     max_batch_size: usize,
     max_batch_latency: Duration,
@@ -55,7 +57,14 @@ pub fn run(
                     if batch.len() == max_batch_size
                         || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
                     {
-                        commit_batch(&mut store, &batch, commits, retention_requested)?;
+                        commit_batch(
+                            &mut store,
+                            &batch,
+                            commits,
+                            retention_requested,
+                            boot_id,
+                            error_events,
+                        )?;
                         batch.clear();
                         started = None;
                     }
@@ -64,12 +73,25 @@ pub fn run(
             Receive::Truncated => {}
             Receive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
             Receive::Empty => {
-                commit_batch(&mut store, &batch, commits, retention_requested)?;
+                commit_batch(
+                    &mut store,
+                    &batch,
+                    commits,
+                    retention_requested,
+                    boot_id,
+                    error_events,
+                )?;
                 batch.clear();
                 started = None;
             }
         }
-        process_maintenance(&mut store, maintenance, retention_requested)?;
+        process_maintenance(
+            &mut store,
+            maintenance,
+            retention_requested,
+            boot_id,
+            error_events,
+        )?;
     }
     loop {
         match socket.receive(&mut buffer)? {
@@ -82,7 +104,14 @@ pub fn run(
                 for record in records {
                     batch.push(record);
                     if batch.len() == max_batch_size {
-                        commit_batch(&mut store, &batch, commits, retention_requested)?;
+                        commit_batch(
+                            &mut store,
+                            &batch,
+                            commits,
+                            retention_requested,
+                            boot_id,
+                            error_events,
+                        )?;
                         batch.clear();
                     }
                 }
@@ -92,7 +121,14 @@ pub fn run(
         }
     }
     if !batch.is_empty() {
-        commit_batch(&mut store, &batch, commits, retention_requested)?;
+        commit_batch(
+            &mut store,
+            &batch,
+            commits,
+            retention_requested,
+            boot_id,
+            error_events,
+        )?;
     }
     Ok(())
 }
@@ -101,6 +137,8 @@ fn process_maintenance(
     store: &mut LogStore,
     receiver: &Receiver<LogMaintenance>,
     retention_requested: &AtomicBool,
+    boot_id: [u8; 16],
+    error_events: &BoundedQueue<WriterMessage>,
 ) -> Result<(), LogIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) => command,
@@ -124,6 +162,8 @@ fn process_maintenance(
             if error.is_capacity() {
                 request_retention(retention_requested, &error);
                 Ok(())
+            } else if error.is_corruption() {
+                recover_corruption(store, boot_id, error_events, &error)
             } else {
                 Err(error.into())
             }
@@ -136,6 +176,8 @@ fn commit_batch(
     batch: &[LogRecord],
     commits: &CommitSignal,
     retention_requested: &AtomicBool,
+    boot_id: [u8; 16],
+    error_events: &BoundedQueue<WriterMessage>,
 ) -> Result<(), LogIngestError> {
     match store.commit(batch) {
         Ok(()) => {
@@ -148,6 +190,9 @@ fn commit_batch(
             request_retention(retention_requested, &error);
             Ok(())
         }
+        Err(error) if error.is_corruption() => {
+            recover_corruption(store, boot_id, error_events, &error)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -155,6 +200,43 @@ fn commit_batch(
 fn request_retention(requested: &AtomicBool, error: &LogStoreError) {
     requested.store(true, Ordering::Release);
     eprintln!("eventd: log store is full; batch discarded and retention requested: {error}");
+}
+
+fn recover_corruption(
+    store: &mut LogStore,
+    boot_id: [u8; 16],
+    error_events: &BoundedQueue<WriterMessage>,
+    error: &LogStoreError,
+) -> Result<(), LogIngestError> {
+    let description = error.to_string();
+    eprintln!("eventd: quarantining corrupt log store: {description}");
+    store.replace_corrupt()?;
+    emit_storage_error(error_events, boot_id, "log", &description);
+    Ok(())
+}
+
+fn emit_storage_error(
+    queue: &BoundedQueue<WriterMessage>,
+    boot_id: [u8; 16],
+    store: &str,
+    error: &str,
+) {
+    let Ok(timestamp) = realtime_nanoseconds()
+        .and_then(|value| u64::try_from(value).map_err(|_| LogIngestError::Clock))
+    else {
+        eprintln!("eventd: cannot timestamp {store} storage error");
+        return;
+    };
+    let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+    match queue.reserve(core::mem::size_of::<WriterMessage>()) {
+        Ok(permit) => permit.publish(WriterMessage::Synthetic(
+            crate::synthetic::storage_error(boot_id, store, None, error, timestamp),
+            sender,
+        )),
+        Err(queue_error) => {
+            eprintln!("eventd: cannot enqueue {store} storage error: {queue_error}");
+        }
+    }
 }
 
 fn realtime_nanoseconds() -> Result<i64, LogIngestError> {

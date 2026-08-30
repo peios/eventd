@@ -5,6 +5,7 @@ pub mod log_store;
 pub mod meta_store;
 pub mod metric_store;
 pub mod model;
+mod quarantine;
 pub mod queue;
 pub mod receipt;
 pub mod reconcile;

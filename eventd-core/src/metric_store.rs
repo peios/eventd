@@ -115,6 +115,27 @@ pub struct MetricStore {
 }
 
 impl MetricStore {
+    /// Open the required metric store, quarantining only reported corruption.
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        checkpoint_pages: u32,
+        cache_capacity: usize,
+    ) -> Result<(Self, Option<String>), MetricStoreError> {
+        let path = path.as_ref();
+        match Self::open(path, checkpoint_pages, cache_capacity) {
+            Ok(store) => Ok((store, None)),
+            Err(error) if error.is_corruption() => {
+                let reason = error.to_string();
+                crate::quarantine::database(path).map_err(MetricStoreError::Io)?;
+                Ok((
+                    Self::open(path, checkpoint_pages, cache_capacity)?,
+                    Some(reason),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Open or create `metrics.db` and start with an empty series cache.
     pub fn open(
         path: impl AsRef<Path>,
@@ -217,6 +238,19 @@ impl MetricStore {
             accepted,
             type_mismatches: records.len() - accepted,
         })
+    }
+
+    /// Replace this store after `SQLite` reports corruption during a write.
+    pub fn replace_corrupt(&mut self) -> Result<(), MetricStoreError> {
+        let path = self.path.clone();
+        let checkpoint_pages = self.checkpoint_pages;
+        let cache_capacity = self.cache_capacity;
+        let placeholder = Connection::open_in_memory()?;
+        let connection = std::mem::replace(&mut self.connection, placeholder);
+        drop(connection);
+        crate::quarantine::database(&path).map_err(MetricStoreError::Io)?;
+        *self = Self::open(path, checkpoint_pages, cache_capacity)?;
+        Ok(())
     }
 
     /// Delete at most `limit` oldest samples and prune now-empty series.
@@ -504,6 +538,19 @@ impl MetricStoreError {
             self,
             Self::Sql(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
+
+    /// Whether `SQLite` has declared the database image corrupt.
+    #[must_use]
+    pub const fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
         )
     }
 }

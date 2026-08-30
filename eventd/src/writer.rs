@@ -42,10 +42,12 @@ pub struct SheddingConfig {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the shard owner receives immutable batching and pressure policy explicitly"
 )]
 pub fn run(
     mut shard: Shard,
+    shard_index: usize,
     boot_id: Guid,
     queue: &BoundedQueue<WriterMessage>,
     max_batch_size: usize,
@@ -68,10 +70,14 @@ pub fn run(
                 if let Err(error) = handle_control(
                     &mut shard,
                     control,
-                    commits,
-                    queue,
                     &mut desired,
-                    retention_requested,
+                    &ControlContext {
+                        commits,
+                        queue,
+                        retention_requested,
+                        shard_index,
+                        boot_id,
+                    },
                 ) {
                     stopping.store(true, Ordering::Release);
                     queue.close();
@@ -95,6 +101,7 @@ pub fn run(
                         max_batch_size,
                         shedding,
                         ring_pressure,
+                        shard_index,
                         boot_id,
                         &mut pending_gaps,
                         retention_requested,
@@ -110,10 +117,14 @@ pub fn run(
                     if let Err(error) = handle_control(
                         &mut shard,
                         control,
-                        commits,
-                        queue,
                         &mut desired,
-                        retention_requested,
+                        &ControlContext {
+                            commits,
+                            queue,
+                            retention_requested,
+                            shard_index,
+                            boot_id,
+                        },
                     ) {
                         stopping.store(true, Ordering::Release);
                         queue.close();
@@ -135,6 +146,7 @@ pub fn run(
             max_batch_size,
             shedding,
             ring_pressure,
+            shard_index,
             boot_id,
             &mut pending_gaps,
             retention_requested,
@@ -163,6 +175,7 @@ fn commit_batch(
     max_batch_size: usize,
     shedding: SheddingConfig,
     ring_pressure: &[AtomicU8],
+    shard_index: usize,
     boot_id: Guid,
     pending_gaps: &mut Vec<(u16, Gap)>,
     retention_requested: &AtomicBool,
@@ -183,6 +196,28 @@ fn commit_batch(
                 request_retention(retention_requested, "event", &error);
                 return Ok(());
             }
+            Err(error) if error.is_corruption() => {
+                recover_corruption(
+                    shard,
+                    shard_index,
+                    boot_id,
+                    commits,
+                    retention_requested,
+                    &error,
+                )?;
+                match shard.commit_gaps(&boot_id, pending_gaps) {
+                    Ok(_) => {
+                        pending_gaps.clear();
+                        commits.committed();
+                    }
+                    Err(retry) if retry.is_capacity() => {
+                        record_lost(batch, pending_gaps);
+                        request_retention(retention_requested, "event", &retry);
+                        return Ok(());
+                    }
+                    Err(retry) => return Err(retry),
+                }
+            }
             Err(error) => return Err(error),
         }
     }
@@ -191,6 +226,18 @@ fn commit_batch(
         Err(error) if error.is_capacity() => {
             record_lost(batch, pending_gaps);
             request_retention(retention_requested, "event", &error);
+            return Ok(());
+        }
+        Err(error) if error.is_corruption() => {
+            record_lost(batch, pending_gaps);
+            recover_corruption(
+                shard,
+                shard_index,
+                boot_id,
+                commits,
+                retention_requested,
+                &error,
+            )?;
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -271,13 +318,54 @@ fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
     eprintln!("eventd: {store} store is full; batch discarded and retention requested: {error}");
 }
 
+fn recover_corruption(
+    shard: &mut Shard,
+    shard_index: usize,
+    boot_id: Guid,
+    commits: &CommitSignal,
+    retention_requested: &AtomicBool,
+    error: &ShardError,
+) -> Result<(), ShardError> {
+    let description = error.to_string();
+    eprintln!("eventd: quarantining corrupt event shard {shard_index}: {description}");
+    shard.replace_corrupt()?;
+    let event = crate::synthetic::storage_error(
+        boot_id,
+        "event",
+        Some(shard_index),
+        &description,
+        realtime_nanoseconds()?,
+    );
+    match shard.commit_synthetic(&event) {
+        Ok(()) => commits.committed(),
+        Err(write_error) if write_error.is_capacity() => {
+            request_retention(retention_requested, "event", &write_error);
+        }
+        Err(write_error) => return Err(write_error),
+    }
+    Ok(())
+}
+
+fn realtime_nanoseconds() -> Result<u64, ShardError> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| ShardError::Io(std::io::Error::other(error)))?;
+    u64::try_from(elapsed.as_nanos()).map_err(|_| ShardError::IntegerRange("realtime timestamp"))
+}
+
+struct ControlContext<'a> {
+    commits: &'a CommitSignal,
+    queue: &'a BoundedQueue<WriterMessage>,
+    retention_requested: &'a AtomicBool,
+    shard_index: usize,
+    boot_id: Guid,
+}
+
 fn handle_control(
     shard: &mut Shard,
     message: WriterMessage,
-    commits: &CommitSignal,
-    queue: &BoundedQueue<WriterMessage>,
     current_desired: &mut Arc<[DesiredIndex]>,
-    retention_requested: &AtomicBool,
+    context: &ControlContext<'_>,
 ) -> Result<(), ShardError> {
     match message {
         WriterMessage::Event(_) => unreachable!("events are handled by the batch loop"),
@@ -285,60 +373,119 @@ fn handle_control(
             let _ = sender.send(Ok(()));
             Ok(())
         }
-        WriterMessage::Synthetic(event, sender) => match shard.commit_synthetic(&event) {
-            Ok(()) => {
-                commits.committed();
-                let _ = sender.send(Ok(()));
-                Ok(())
-            }
-            Err(error) => {
-                if error.is_capacity() {
-                    request_retention(retention_requested, "event", &error);
-                    let _ = sender.send(Ok(()));
-                    Ok(())
-                } else {
-                    let _ = sender.send(Err(error.to_string()));
-                    Err(error)
-                }
-            }
-        },
+        WriterMessage::Synthetic(event, sender) => {
+            handle_synthetic(shard, &event, &sender, context)
+        }
         WriterMessage::Maintenance(command, sender) => {
-            let result = match command {
-                EventMaintenance::DeleteBefore { cutoff, limit } => {
-                    shard.retain_before(cutoff, limit)
-                }
-                EventMaintenance::DeleteBoot { boot_id, limit } => {
-                    shard.retain_boot(&boot_id, limit)
-                }
-                EventMaintenance::Checkpoint => shard.passive_checkpoint().map(|()| 0),
-            };
-            match result {
-                Ok(deleted) => {
-                    let _ = sender.send(Ok(deleted));
-                    Ok(())
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error.to_string()));
-                    if error.is_capacity() {
-                        request_retention(retention_requested, "event", &error);
-                        Ok(())
+            handle_maintenance(shard, &command, &sender, context)
+        }
+        WriterMessage::IndexPolicy(desired) => {
+            if context.queue.is_empty() {
+                let result = shard.converge_indexes(&desired, {
+                    let queue = context.queue.clone();
+                    move || !queue.is_empty()
+                });
+                if let Err(error) = result {
+                    if error.is_corruption() {
+                        recover_corruption(
+                            shard,
+                            context.shard_index,
+                            context.boot_id,
+                            context.commits,
+                            context.retention_requested,
+                            &error,
+                        )?;
                     } else {
-                        Err(error)
+                        eprintln!("eventd: adaptive index convergence failed: {error}");
                     }
                 }
             }
-        }
-        WriterMessage::IndexPolicy(desired) => {
-            if queue.is_empty()
-                && let Err(error) = shard.converge_indexes(&desired, {
-                    let queue = queue.clone();
-                    move || !queue.is_empty()
-                })
-            {
-                eprintln!("eventd: adaptive index convergence failed: {error}");
-            }
             *current_desired = desired;
             Ok(())
+        }
+    }
+}
+
+fn handle_synthetic(
+    shard: &mut Shard,
+    event: &SyntheticEvent,
+    sender: &SyncSender<Result<(), String>>,
+    context: &ControlContext<'_>,
+) -> Result<(), ShardError> {
+    match shard.commit_synthetic(event) {
+        Ok(()) => {
+            context.commits.committed();
+            let _ = sender.send(Ok(()));
+            Ok(())
+        }
+        Err(error) if error.is_capacity() => {
+            request_retention(context.retention_requested, "event", &error);
+            let _ = sender.send(Ok(()));
+            Ok(())
+        }
+        Err(error) if error.is_corruption() => {
+            recover_corruption(
+                shard,
+                context.shard_index,
+                context.boot_id,
+                context.commits,
+                context.retention_requested,
+                &error,
+            )?;
+            match shard.commit_synthetic(event) {
+                Ok(()) => {
+                    context.commits.committed();
+                    let _ = sender.send(Ok(()));
+                    Ok(())
+                }
+                Err(retry) => {
+                    let _ = sender.send(Err(retry.to_string()));
+                    Err(retry)
+                }
+            }
+        }
+        Err(error) => {
+            let _ = sender.send(Err(error.to_string()));
+            Err(error)
+        }
+    }
+}
+
+fn handle_maintenance(
+    shard: &mut Shard,
+    command: &EventMaintenance,
+    sender: &SyncSender<Result<usize, String>>,
+    context: &ControlContext<'_>,
+) -> Result<(), ShardError> {
+    let result = match command {
+        EventMaintenance::DeleteBefore { cutoff, limit } => shard.retain_before(*cutoff, *limit),
+        EventMaintenance::DeleteBoot { boot_id, limit } => shard.retain_boot(boot_id, *limit),
+        EventMaintenance::Checkpoint => shard.passive_checkpoint().map(|()| 0),
+    };
+    match result {
+        Ok(deleted) => {
+            let _ = sender.send(Ok(deleted));
+            Ok(())
+        }
+        Err(error) if error.is_capacity() => {
+            let _ = sender.send(Err(error.to_string()));
+            request_retention(context.retention_requested, "event", &error);
+            Ok(())
+        }
+        Err(error) if error.is_corruption() => {
+            let _ = sender.send(Err(error.to_string()));
+            recover_corruption(
+                shard,
+                context.shard_index,
+                context.boot_id,
+                context.commits,
+                context.retention_requested,
+                &error,
+            )
+        }
+        Err(error) => {
+            let _ = sender.send(Err(error.to_string()));
+            Err(error)
         }
     }
 }
