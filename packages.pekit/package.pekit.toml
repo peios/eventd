@@ -3,8 +3,7 @@
 format = "peipkg"
 
 [package]
-# Revision 3 authenticates metric publishers and makes the log socket a
-# peinit-only broker endpoint.
-version      = "{{version}}-3"
+# Revision 4 authorizes concrete identifiers before query execution.
+version      = "{{version}}-4"
 architecture = "x86_64"
 license      = "MIT"
