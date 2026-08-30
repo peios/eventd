@@ -2,7 +2,7 @@
 
 use core::cmp::Ordering;
 use core::fmt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -181,32 +181,54 @@ fn execute_at(
             deadline,
         )?)
     };
+    let referenced = referenced_fields(query);
     let rows = match &query.source {
-        Source::Events { pattern } => read_events(
-            &stores.event_paths,
-            pattern.as_deref(),
-            &query.predicates,
-            since,
-            until,
-            deadline,
-            &lower.event_ids,
-            &upper.event_ids,
-        )?,
+        Source::Events { pattern } => {
+            let identifiers =
+                discover_event_identifiers(&stores.event_paths, pattern.as_deref(), deadline)?;
+            let allowed = authorize_identifiers(
+                authorizer,
+                Namespace::Events,
+                identifiers,
+                &referenced,
+                authorization,
+            )?;
+            read_events(
+                &stores.event_paths,
+                &allowed,
+                &query.predicates,
+                since,
+                until,
+                deadline,
+                &lower.event_ids,
+                &upper.event_ids,
+            )?
+        }
         Source::Logs {
             origins,
             error_only,
             containing,
-        } => read_logs(
-            &stores.log_path,
-            origins,
-            *error_only,
-            containing.as_deref(),
-            since,
-            until,
-            deadline,
-            lower.log_id,
-            upper.log_id,
-        )?,
+        } => {
+            let identifiers = discover_log_identifiers(&stores.log_path, origins, deadline)?;
+            let allowed = authorize_identifiers(
+                authorizer,
+                Namespace::Logs,
+                identifiers,
+                &referenced,
+                authorization,
+            )?;
+            read_logs(
+                &stores.log_path,
+                &allowed,
+                *error_only,
+                containing.as_deref(),
+                since,
+                until,
+                deadline,
+                lower.log_id,
+                upper.log_id,
+            )?
+        }
         Source::Metric { name, labels } => {
             return execute_metric(
                 query,
@@ -218,6 +240,7 @@ fn execute_at(
                 authorizer,
                 deadline,
                 historical_ranges.as_deref(),
+                authorization,
             );
         }
     };
@@ -227,7 +250,6 @@ fn execute_at(
         Source::Logs { .. } => Namespace::Logs,
         Source::Metric { .. } => unreachable!(),
     };
-    let referenced = referenced_fields(query);
     let mut visible = Vec::with_capacity(rows.len());
     for mut row in rows {
         check_deadline(deadline)?;
@@ -314,6 +336,103 @@ struct TimeRange {
 
 fn duration_nanoseconds(duration: Duration) -> i64 {
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+fn discover_event_identifiers(
+    paths: &[PathBuf],
+    pattern: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>, QueryError> {
+    let mut identifiers = HashSet::new();
+    for path in paths {
+        check_deadline(deadline)?;
+        let connection = open_read_only(path, deadline)?;
+        let mut statement = connection.prepare("SELECT event_type FROM event_types")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if identifiers.len().is_multiple_of(1_024) {
+                check_deadline(deadline)?;
+            }
+            let identifier: String = row.get(0)?;
+            if pattern.is_none_or(|pattern| glob_matches(pattern, &identifier)) {
+                identifiers.insert(identifier);
+            }
+        }
+    }
+    Ok(identifiers)
+}
+
+fn discover_log_identifiers(
+    path: &Path,
+    origins: &[String],
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>, QueryError> {
+    check_deadline(deadline)?;
+    let connection = open_read_only(path, deadline)?;
+    let mut statement = connection.prepare("SELECT origin FROM log_origins")?;
+    let mut rows = statement.query([])?;
+    let mut identifiers = HashSet::new();
+    while let Some(row) = rows.next()? {
+        if identifiers.len().is_multiple_of(1_024) {
+            check_deadline(deadline)?;
+        }
+        let identifier: String = row.get(0)?;
+        if origins.is_empty()
+            || origins
+                .iter()
+                .any(|origin| ascii_equal(origin, &identifier))
+        {
+            identifiers.insert(identifier);
+        }
+    }
+    Ok(identifiers)
+}
+
+fn discover_metric_identifiers(
+    connection: &Connection,
+    pattern: &str,
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>, QueryError> {
+    let mut statement = connection.prepare("SELECT DISTINCT name FROM series")?;
+    let mut rows = statement.query([])?;
+    let mut identifiers = HashSet::new();
+    while let Some(row) = rows.next()? {
+        if identifiers.len().is_multiple_of(1_024) {
+            check_deadline(deadline)?;
+        }
+        let identifier: String = row.get(0)?;
+        if glob_matches(pattern, &identifier) {
+            identifiers.insert(identifier);
+        }
+    }
+    Ok(identifiers)
+}
+
+fn authorize_identifiers(
+    authorizer: &Authorizer,
+    namespace: Namespace,
+    identifiers: HashSet<String>,
+    fields: &[String],
+    cache: &mut AuthorizationCache,
+) -> Result<HashSet<String>, QueryError> {
+    let mut identifiers: Vec<_> = identifiers.into_iter().collect();
+    identifiers.sort_unstable();
+    loop {
+        cache.refresh(authorizer);
+        let generation = authorizer.descriptor_generation();
+        let mut allowed = HashSet::with_capacity(identifiers.len());
+        for identifier in &identifiers {
+            if cache
+                .check(authorizer, namespace, identifier, fields)?
+                .is_some_and(|visible| fields.iter().all(|field| visible.contains(field)))
+            {
+                allowed.insert(identifier.clone());
+            }
+        }
+        if authorizer.descriptor_generation() == generation {
+            return Ok(allowed);
+        }
+    }
 }
 
 fn cross_type_ranges(
@@ -519,7 +638,18 @@ fn cross_event_timestamps(
     deadline: Option<Instant>,
 ) -> Result<Vec<i64>, QueryError> {
     let fields = vec!["timestamp".to_owned()];
-    let mut access = HashMap::<String, bool>::new();
+    let identifiers = discover_event_identifiers(paths, Some(pattern), deadline)?;
+    let mut authorization = AuthorizationCache::new(authorizer);
+    let allowed = authorize_identifiers(
+        authorizer,
+        Namespace::Events,
+        identifiers,
+        &fields,
+        &mut authorization,
+    )?;
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut output = Vec::new();
     let mut scanned = 0_usize;
     for path in paths {
@@ -536,19 +666,7 @@ fn cross_event_timestamps(
                 check_deadline(deadline)?;
             }
             let identifier: String = row.get(0)?;
-            if !glob_matches(pattern, &identifier) {
-                continue;
-            }
-            let allowed = if let Some(allowed) = access.get(&identifier) {
-                *allowed
-            } else {
-                let allowed = authorizer
-                    .check(Namespace::Events, &identifier, &fields)?
-                    .is_some_and(|visible| visible.contains("timestamp"));
-                access.insert(identifier, allowed);
-                allowed
-            };
-            if allowed {
+            if allowed.contains(&identifier) {
                 output.push(row.get(1)?);
             }
         }
@@ -570,13 +688,24 @@ fn cross_log_timestamps(
     if containing.is_some() {
         fields.push("message".to_owned());
     }
+    let identifiers = discover_log_identifiers(path, &[origin.to_owned()], deadline)?;
+    let mut authorization = AuthorizationCache::new(authorizer);
+    let allowed = authorize_identifiers(
+        authorizer,
+        Namespace::Logs,
+        identifiers,
+        &fields,
+        &mut authorization,
+    )?;
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
     let connection = open_read_only(path, deadline)?;
     let mut statement = connection.prepare(
         "SELECT origin, timestamp, message FROM logs \
          WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC, id ASC",
     )?;
     let mut rows = statement.query(params![since, until])?;
-    let mut access = HashMap::<String, bool>::new();
     let mut output = Vec::new();
     let mut scanned = 0_usize;
     while let Some(row) = rows.next()? {
@@ -585,19 +714,7 @@ fn cross_log_timestamps(
             check_deadline(deadline)?;
         }
         let identifier: String = row.get(0)?;
-        if !ascii_equal(&identifier, origin) {
-            continue;
-        }
-        let allowed = if let Some(allowed) = access.get(&identifier) {
-            *allowed
-        } else {
-            let allowed = authorizer
-                .check(Namespace::Logs, &identifier, &fields)?
-                .is_some_and(|visible| fields.iter().all(|field| visible.contains(field)));
-            access.insert(identifier, allowed);
-            allowed
-        };
-        if !allowed {
+        if !allowed.contains(&identifier) {
             continue;
         }
         let message: String = row.get(2)?;
@@ -632,6 +749,18 @@ fn resolve_cross_metric(
     }
     required.sort_unstable();
     required.dedup();
+    let identifiers = discover_metric_identifiers(connection, name_pattern, deadline)?;
+    let mut authorization = AuthorizationCache::new(authorizer);
+    let allowed = authorize_identifiers(
+        authorizer,
+        Namespace::Metrics,
+        identifiers,
+        &required,
+        &mut authorization,
+    )?;
+    if allowed.is_empty() {
+        return Ok(None);
+    }
     let mut statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
     let mut rows = statement.query([])?;
     let mut resolved = None;
@@ -639,7 +768,7 @@ fn resolve_cross_metric(
         check_deadline(deadline)?;
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
-        if !glob_matches(name_pattern, &name) {
+        if !allowed.contains(&name) {
             continue;
         }
         let canonical_labels: String = row.get(2)?;
@@ -651,12 +780,6 @@ fn resolve_cross_metric(
             Value::String(metric_type_name(metric_type)?.into()),
         );
         if labels.is_some_and(|items| !items.iter().all(|item| evaluate(item, &selector))) {
-            continue;
-        }
-        let visible = authorizer
-            .check(Namespace::Metrics, &name, &required)?
-            .is_some_and(|fields| required.iter().all(|field| fields.contains(field)));
-        if !visible {
             continue;
         }
         if metric_type == 2 {
@@ -804,7 +927,7 @@ enum Tie {
 )]
 fn read_events(
     paths: &[PathBuf],
-    pattern: Option<&str>,
+    allowed: &HashSet<String>,
     predicates: &[Expr],
     since: i64,
     until: i64,
@@ -812,6 +935,9 @@ fn read_events(
     lower_ids: &[i64],
     upper_ids: &[i64],
 ) -> Result<Vec<Row>, QueryError> {
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
     let header_constraint = predicates.iter().find_map(sql_header_constraint);
     let mut output = Vec::new();
     for (shard, path) in paths.iter().enumerate() {
@@ -847,7 +973,7 @@ fn read_events(
                 check_deadline(deadline)?;
             }
             let identifier: String = row.get(6)?;
-            if pattern.is_some_and(|pattern| !glob_matches(pattern, &identifier)) {
+            if !allowed.contains(&identifier) {
                 continue;
             }
             let id: i64 = row.get(0)?;
@@ -1017,7 +1143,7 @@ fn first_payload_constraint(
 )]
 fn read_logs(
     path: &Path,
-    origins: &[String],
+    allowed: &HashSet<String>,
     error_only: bool,
     containing: Option<&str>,
     since: i64,
@@ -1026,6 +1152,9 @@ fn read_logs(
     lower_id: i64,
     upper_id: i64,
 ) -> Result<Vec<Row>, QueryError> {
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
     let connection = open_read_only(path, deadline)?;
     let mut statement = connection.prepare(
         "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
@@ -1038,11 +1167,7 @@ fn read_logs(
             check_deadline(deadline)?;
         }
         let identifier: String = row.get(3)?;
-        if !origins.is_empty()
-            && !origins
-                .iter()
-                .any(|origin| ascii_equal(origin, &identifier))
-        {
+        if !allowed.contains(&identifier) {
             continue;
         }
         let is_error: bool = row.get(4)?;
@@ -1081,18 +1206,11 @@ fn authorize_row(
     referenced: &[String],
     cache: &mut AuthorizationCache,
 ) -> Result<bool, QueryError> {
-    cache.refresh(authorizer);
     let mut fields: Vec<_> = row.record.keys().cloned().collect();
     fields.extend(referenced.iter().cloned());
     fields.sort_unstable();
-    let key = (row.identifier.clone(), fields.clone());
-    let allowed = if let Some(allowed) = cache.entries.get(&key) {
-        allowed.clone()
-    } else {
-        let allowed = authorizer.check(namespace, &row.identifier, &fields)?;
-        cache.entries.insert(key, allowed.clone());
-        allowed
-    };
+    fields.dedup();
+    let allowed = cache.check(authorizer, namespace, &row.identifier, &fields)?;
     let Some(allowed) = allowed else {
         return Ok(false);
     };
@@ -1125,10 +1243,50 @@ impl AuthorizationCache {
             self.entries.clear();
         }
     }
+
+    fn check(
+        &mut self,
+        authorizer: &Authorizer,
+        namespace: Namespace,
+        identifier: &str,
+        fields: &[String],
+    ) -> Result<Option<HashSet<String>>, QueryError> {
+        self.refresh(authorizer);
+        let key = (identifier.to_owned(), fields.to_vec());
+        if let Some(allowed) = self.entries.get(&key) {
+            return Ok(allowed.clone());
+        }
+        let allowed = authorizer.check(namespace, identifier, fields)?;
+        self.entries.insert(key, allowed.clone());
+        Ok(allowed)
+    }
 }
 
 fn referenced_fields(query: &Query) -> Vec<String> {
     let mut fields = Vec::new();
+    match &query.source {
+        Source::Logs {
+            error_only,
+            containing,
+            ..
+        } => {
+            if *error_only {
+                fields.push("is_error".into());
+            }
+            if containing.is_some() {
+                fields.push("message".into());
+            }
+        }
+        Source::Metric {
+            labels: Some(labels),
+            ..
+        } => {
+            for label in labels {
+                label.fields(&mut fields);
+            }
+        }
+        Source::Events { .. } | Source::Metric { labels: None, .. } => {}
+    }
     for predicate in &query.predicates {
         predicate.fields(&mut fields);
     }
@@ -1156,6 +1314,9 @@ fn referenced_fields(query: &Query) -> Vec<String> {
                 }
             }
         }
+    }
+    if query.transform.is_some() || query.metric_aggregate.is_some() {
+        fields.push("value".into());
     }
     fields.sort_unstable();
     fields.dedup();
@@ -1611,15 +1772,28 @@ fn execute_metric(
     authorizer: &Authorizer,
     deadline: Option<Instant>,
     cross_ranges: Option<&[TimeRange]>,
+    authorization: &mut AuthorizationCache,
 ) -> Result<Vec<Record>, QueryError> {
     let connection = open_read_only(path, deadline)?;
+    let referenced = referenced_fields(query);
+    let identifiers = discover_metric_identifiers(&connection, name_pattern, deadline)?;
+    let allowed = authorize_identifiers(
+        authorizer,
+        Namespace::Metrics,
+        identifiers,
+        &referenced,
+        authorization,
+    )?;
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut series_statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
     let mut series_rows = series_statement.query([])?;
     let mut series = Vec::new();
     while let Some(row) = series_rows.next()? {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
-        if !glob_matches(name_pattern, &name) {
+        if !allowed.contains(&name) {
             continue;
         }
         let canonical_labels: String = row.get(2)?;
@@ -1653,8 +1827,6 @@ fn execute_metric(
     {
         return Err(QueryError::MetricNeedsWindow);
     }
-    let referenced = referenced_fields(query);
-    let mut authorization_cache = AuthorizationCache::new(authorizer);
     let mut resolved = Vec::with_capacity(series_count);
     for (series_id, name, metric_type, label_map) in series {
         check_deadline(deadline)?;
@@ -1690,7 +1862,7 @@ fn execute_metric(
                 Namespace::Metrics,
                 &mut input.row,
                 &referenced,
-                &mut authorization_cache,
+                authorization,
             )? && query
                 .predicates
                 .iter()
@@ -2509,11 +2681,115 @@ impl From<super::security::SecurityError> for QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static TEST_DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn create(schema: &str) -> Self {
+            let sequence = TEST_DATABASE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("eventd-query-{}-{sequence}.db", std::process::id()));
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(schema).unwrap();
+            drop(connection);
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("db-shm"));
+            let _ = std::fs::remove_file(self.0.with_extension("db-wal"));
+        }
+    }
 
     #[test]
     fn glob_is_ascii_folded_and_star_only() {
         assert!(glob_matches("KACS.*.denied", "kacs.token.denied"));
         assert!(!glob_matches("kacs.?", "kacs.x"));
+    }
+
+    #[test]
+    fn planning_discovers_identifiers_from_compact_catalogues() {
+        let events = TestDatabase::create(
+            "CREATE TABLE event_types(event_type TEXT PRIMARY KEY) WITHOUT ROWID;\
+             INSERT INTO event_types VALUES ('kacs.denied'), ('service.started');",
+        );
+        let discovered =
+            discover_event_identifiers(std::slice::from_ref(&events.0), Some("KACS.*"), None)
+                .unwrap();
+        assert_eq!(discovered, HashSet::from(["kacs.denied".to_owned()]));
+
+        let logs = TestDatabase::create(
+            "CREATE TABLE log_origins(origin TEXT PRIMARY KEY) WITHOUT ROWID;\
+             INSERT INTO log_origins VALUES ('loregd'), ('peinit');",
+        );
+        let discovered = discover_log_identifiers(&logs.0, &["PEINIT".to_owned()], None).unwrap();
+        assert_eq!(discovered, HashSet::from(["peinit".to_owned()]));
+
+        let metrics = Connection::open_in_memory().unwrap();
+        metrics
+            .execute_batch(
+                "CREATE TABLE series(name TEXT NOT NULL);\
+                 INSERT INTO series VALUES ('cpu.time'), ('disk.bytes'), ('cpu.load');",
+            )
+            .unwrap();
+        let discovered = discover_metric_identifiers(&metrics, "CPU.*", None).unwrap();
+        assert_eq!(
+            discovered,
+            HashSet::from(["cpu.time".to_owned(), "cpu.load".to_owned()])
+        );
+    }
+
+    #[test]
+    fn denied_event_types_are_skipped_before_payload_decoding() {
+        let events = TestDatabase::create(
+            "CREATE TABLE events(\
+                 id INTEGER PRIMARY KEY, boot_id BLOB NOT NULL, timestamp INTEGER NOT NULL,\
+                 cpu_id INTEGER, sequence INTEGER, origin_class INTEGER, event_type TEXT NOT NULL,\
+                 effective_token_guid BLOB, true_token_guid BLOB, process_guid BLOB, payload BLOB\
+             );\
+             INSERT INTO events VALUES\
+                 (1, zeroblob(16), 1, NULL, NULL, NULL, 'denied.type', NULL, NULL, NULL, X'C1'),\
+                 (2, zeroblob(16), 2, NULL, NULL, NULL, 'allowed.type', NULL, NULL, NULL, NULL);",
+        );
+        let rows = read_events(
+            std::slice::from_ref(&events.0),
+            &HashSet::from(["allowed.type".to_owned()]),
+            &[],
+            i64::MIN,
+            i64::MAX,
+            None,
+            &[0],
+            &[i64::MAX],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identifier, "allowed.type");
+    }
+
+    #[test]
+    fn source_filters_and_metric_computation_are_authorized_fields() {
+        let logs =
+            crate::query_language::parse("LOGS FROM loregd ERROR ONLY CONTAINING \"failure\"")
+                .unwrap();
+        assert_eq!(
+            referenced_fields(&logs),
+            ["is_error".to_owned(), "message".to_owned()]
+        );
+
+        let metric = crate::query_language::parse(
+            "METRIC cpu.usage[core=\"0\"] RATE WHERE boot_id IS NOT NULL",
+        )
+        .unwrap();
+        assert_eq!(
+            referenced_fields(&metric),
+            ["boot_id".to_owned(), "core".to_owned(), "value".to_owned()]
+        );
     }
 
     #[test]
