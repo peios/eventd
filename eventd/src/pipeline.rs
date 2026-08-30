@@ -13,20 +13,25 @@ use eventd_core::{
 };
 
 use crate::commit_signal::CommitSignal;
-use crate::config::{Config, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
+use crate::config::{Config, ConfigWatch, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::IngestionSocket;
 use crate::directory::StoreDirectory;
-use crate::indexing::{PolicyConfig, PolicyMessage, Tracker};
+use crate::indexing::{PolicyMessage, Tracker};
 use crate::kmes::{self, DrainContext};
 use crate::query::{DescriptorCache, QueryServer, ServerConfig};
-use crate::writer::{SheddingConfig, WriterMessage};
+use crate::writer::WriterMessage;
 
 type ReceiptRow = ([u8; 16], u16, eventd_core::Interval);
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 static SIGNAL_QUIT: AtomicBool = AtomicBool::new(false);
+static SIGNAL_RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop_signal(signal: libc::c_int) {
+    if signal == libc::SIGHUP {
+        SIGNAL_RELOAD.store(true, Ordering::Release);
+        return;
+    }
     if signal == libc::SIGQUIT {
         SIGNAL_QUIT.store(true, Ordering::Release);
     }
@@ -39,6 +44,8 @@ extern "C" fn stop_signal(signal: libc::c_int) {
 )]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
+    let config_watch = ConfigWatch::arm()?;
+    let runtime = config.clone().shared();
     crate::query::provision_security_defaults()?;
     validate_distinct_paths(&config)?;
     let event_directory = StoreDirectory::open(&config.event_store_path)?;
@@ -62,8 +69,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (persisted_counters, persisted_desired) = meta_store.load_index_state()?;
     let index_tracker = Arc::new(Tracker::from_persisted(
         persisted_counters,
-        config.adaptive_index_window,
-        config.adaptive_index_create_threshold,
+        Arc::clone(&runtime),
     ));
     let desired_indexes = Arc::new(RwLock::new(persisted_desired));
     let (index_policy_sender, index_policy_receiver) = sync_channel(1);
@@ -175,16 +181,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (index, shard) in shards.into_iter().enumerate() {
         let queue = queues[index].clone();
         let writer_stopping = Arc::clone(&stopping);
-        let max_batch_size = config.max_batch_size;
-        let max_batch_latency = config.max_batch_latency;
         let writer_commits = Arc::clone(&event_commits);
         let writer_ring_pressure = Arc::clone(&ring_pressure);
         let writer_retention_requested = Arc::clone(&retention_requested);
-        let shedding = SheddingConfig {
-            window: config.shedding_window,
-            batch_percent: config.shedding_batch_percent,
-            emergency_buffer_percent: config.emergency_shedding_buffer_percent,
-        };
+        let writer_runtime = Arc::clone(&runtime);
         event_writers.push(
             std::thread::Builder::new()
                 .name(format!("eventd-writer-{index:04}"))
@@ -194,11 +194,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         index,
                         boot_id,
                         &queue,
-                        max_batch_size,
-                        max_batch_latency,
+                        &writer_runtime,
                         &writer_stopping,
                         &writer_commits,
-                        shedding,
                         &writer_ring_pressure,
                         &writer_retention_requested,
                     )
@@ -206,14 +204,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })?,
         );
     }
-    let index_policy_config = PolicyConfig {
-        interval: config.adaptive_index_policy_interval,
-        create_threshold: config.adaptive_index_create_threshold,
-        drop_threshold: config.adaptive_index_drop_threshold,
-    };
     let index_thread_tracker = Arc::clone(&index_tracker);
     let index_thread_desired = Arc::clone(&desired_indexes);
     let index_thread_queues = Arc::clone(&queues);
+    let index_runtime = Arc::clone(&runtime);
     let index_handle = std::thread::Builder::new()
         .name("eventd-index-policy".to_owned())
         .spawn(move || {
@@ -222,15 +216,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &index_thread_tracker,
                 &index_thread_desired,
                 &index_thread_queues,
-                index_policy_config,
+                &index_runtime,
                 &index_policy_receiver,
             )
             .map_err(|error| error.to_string())
         })?;
     let log_stopping = Arc::clone(&stopping);
-    let log_batch_size = config.log_max_batch_size;
-    let log_batch_latency = config.log_max_batch_latency;
-    let log_datagram_ceiling = config.max_log_datagram_bytes;
+    let log_runtime = Arc::clone(&runtime);
     let log_writer_commits = Arc::clone(&log_commits);
     let log_retention_requested = Arc::clone(&retention_requested);
     let (log_maintenance_sender, log_maintenance_receiver) = channel();
@@ -244,9 +236,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 log_store,
                 boot_id,
                 &log_error_events,
-                log_datagram_ceiling,
-                log_batch_size,
-                log_batch_latency,
+                &log_runtime,
                 &log_stopping,
                 &log_writer_commits,
                 &log_maintenance_receiver,
@@ -255,9 +245,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| error.to_string())
         })?;
     let metric_stopping = Arc::clone(&stopping);
-    let metric_batch_size = config.metric_max_batch_size;
-    let metric_batch_latency = config.metric_max_batch_latency;
-    let metric_datagram_ceiling = config.max_metric_datagram_bytes;
+    let metric_runtime = Arc::clone(&runtime);
     let metric_retention_requested = Arc::clone(&retention_requested);
     let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
     let metric_thread_socket = Arc::clone(&metric_socket);
@@ -270,9 +258,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 metric_store,
                 boot_id,
                 &metric_error_events,
-                metric_datagram_ceiling,
-                metric_batch_size,
-                metric_batch_latency,
+                &metric_runtime,
                 &metric_stopping,
                 &metric_maintenance_receiver,
                 &metric_retention_requested,
@@ -346,14 +332,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         metric_path: metric_path.clone(),
     });
     let query_config = Arc::new(ServerConfig {
-        max_request_bytes: config.max_query_request_bytes,
-        response_target_bytes: config.query_response_target_bytes,
-        max_concurrent: config.max_concurrent_queries,
-        max_streaming: config.max_streaming_queries,
-        max_distinct_stream_values: config.max_distinct_stream_values,
-        timeout: config.query_timeout,
-        cross_type_window: config.cross_type_window,
-        cross_type_max_lookback: config.cross_type_max_lookback,
+        runtime: Arc::clone(&runtime),
         index_tracker,
         index_policy: index_policy_sender.clone(),
         descriptors,
@@ -373,17 +352,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map_err(|error| error.to_string())
         })?;
-    let retention_config = crate::retention::RetentionConfig {
-        event_age: config.event_retention,
-        event_max_bytes: config.event_retention_max_bytes,
-        log_age: config.log_retention,
-        log_max_bytes: config.log_retention_max_bytes,
-        metric_age: config.metric_retention,
-        metric_max_bytes: config.metric_retention_max_bytes,
-        interval: config.retention_interval,
-        batch_rows: config.retention_delete_batch_rows,
-        checkpoint_pages: config.wal_checkpoint_pages,
-    };
     let retention_stores = crate::retention::Stores {
         event_paths: active_paths.clone(),
         historical_event_paths: historical_paths.clone(),
@@ -392,22 +360,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let retention_queues = Arc::clone(&queues);
     let retention_stopping = Arc::clone(&stopping);
-    let retention_requested = Arc::clone(&retention_requested);
+    let retention_thread_requested = Arc::clone(&retention_requested);
+    let retention_runtime = Arc::clone(&runtime);
     let retention_handle = std::thread::Builder::new()
         .name("eventd-retention".to_owned())
         .spawn(move || {
             crate::retention::run(
-                retention_config,
+                retention_runtime,
                 retention_stores,
                 retention_queues,
                 log_maintenance_sender,
                 metric_maintenance_sender,
                 boot_id,
                 retention_stopping,
-                retention_requested,
+                retention_thread_requested,
             )
         })?;
     notify_ready()?;
+    let config_stopping = Arc::clone(&stopping);
+    let config_runtime = Arc::clone(&runtime);
+    let config_event_queue = queues[0].clone();
+    let config_retention_requested = Arc::clone(&retention_requested);
+    let config_index_policy = index_policy_sender.clone();
+    let config_handle = std::thread::Builder::new()
+        .name("eventd-config-watch".to_owned())
+        .spawn(move || {
+            config_watch.run(
+                &config_runtime,
+                &config_stopping,
+                &SIGNAL_RELOAD,
+                boot_id,
+                &config_event_queue,
+                &config_retention_requested,
+                &config_index_policy,
+            );
+            Ok(())
+        })?;
 
     supervise(
         drains,
@@ -418,6 +406,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         retention_handle,
         index_handle,
         descriptor_handle,
+        config_handle,
         &queues,
         &stopping,
         query_server,
@@ -530,6 +519,7 @@ fn install_signal_handlers() -> Result<(), std::io::Error> {
     if unsafe { libc::signal(libc::SIGTERM, handler) } == libc::SIG_ERR
         || unsafe { libc::signal(libc::SIGINT, handler) } == libc::SIG_ERR
         || unsafe { libc::signal(libc::SIGQUIT, handler) } == libc::SIG_ERR
+        || unsafe { libc::signal(libc::SIGHUP, handler) } == libc::SIG_ERR
     {
         return Err(std::io::Error::last_os_error());
     }
@@ -550,6 +540,7 @@ fn supervise(
     retention_handle: JoinHandle<Result<(), String>>,
     index_handle: JoinHandle<Result<(), String>>,
     descriptor_handle: JoinHandle<Result<(), String>>,
+    config_handle: JoinHandle<Result<(), String>>,
     queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
     query_server: Arc<QueryServer>,
@@ -571,6 +562,7 @@ fn supervise(
         && !retention_handle.is_finished()
         && !index_handle.is_finished()
         && !descriptor_handle.is_finished()
+        && !config_handle.is_finished()
     {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -595,6 +587,7 @@ fn supervise(
     join_worker(retention_handle, &mut first_error);
     join_worker(query_handle, &mut first_error);
     join_worker(descriptor_handle, &mut first_error);
+    join_worker(config_handle, &mut first_error);
     join_worker(log_handle, &mut first_error);
     join_worker(metric_handle, &mut first_error);
     drop(query_server);

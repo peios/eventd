@@ -19,6 +19,7 @@ use peios::file::{File, SecInfo};
 use peios::msgpack::{Reader, Type, Writer};
 
 use crate::commit_signal::CommitSignal;
+use crate::config::{Config, SharedConfig};
 use crate::indexing::{PolicyMessage, Tracker};
 use crate::query_language::{RecordAggregate, Source};
 
@@ -34,17 +35,34 @@ pub fn provision_security_defaults() -> Result<(), security::SecurityError> {
 }
 
 pub struct ServerConfig {
-    pub max_request_bytes: usize,
-    pub response_target_bytes: usize,
-    pub max_concurrent: usize,
-    pub max_streaming: usize,
-    pub max_distinct_stream_values: usize,
-    pub timeout: Duration,
-    pub cross_type_window: Duration,
-    pub cross_type_max_lookback: Duration,
+    pub runtime: SharedConfig,
     pub index_tracker: Arc<Tracker>,
     pub index_policy: SyncSender<PolicyMessage>,
     pub descriptors: Arc<DescriptorCache>,
+}
+
+struct QueryTuning {
+    max_request_bytes: usize,
+    response_target_bytes: usize,
+    max_streaming: usize,
+    max_distinct_stream_values: usize,
+    timeout: Duration,
+    cross_type_window: Duration,
+    cross_type_max_lookback: Duration,
+}
+
+impl From<&Config> for QueryTuning {
+    fn from(config: &Config) -> Self {
+        Self {
+            max_request_bytes: config.max_query_request_bytes,
+            response_target_bytes: config.query_response_target_bytes,
+            max_streaming: config.max_streaming_queries,
+            max_distinct_stream_values: config.max_distinct_stream_values,
+            timeout: config.query_timeout,
+            cross_type_window: config.cross_type_window,
+            cross_type_max_lookback: config.cross_type_max_lookback,
+        }
+    }
 }
 
 pub struct QueryServer {
@@ -109,7 +127,10 @@ impl QueryServer {
         while !stopping.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    if !try_acquire(&self.active, config.max_concurrent) {
+                    let (max_concurrent, tuning) = Config::read(&config.runtime, |live| {
+                        (live.max_concurrent_queries, QueryTuning::from(live))
+                    });
+                    if !try_acquire(&self.active, max_concurrent) {
                         let _ = send_error(stream, "too many concurrent queries");
                         continue;
                     }
@@ -128,6 +149,7 @@ impl QueryServer {
                                 stream,
                                 &stores,
                                 &config,
+                                &tuning,
                                 &streaming,
                                 &stopping,
                                 &event_commits,
@@ -174,6 +196,7 @@ fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "connection ownership and its protocol state remain linear and auditable"
 )]
@@ -181,28 +204,29 @@ fn handle(
     mut stream: UnixStream,
     stores: &Stores,
     config: &ServerConfig,
+    tuning: &QueryTuning,
     streaming_count: &Arc<AtomicUsize>,
     stopping: &AtomicBool,
     event_commits: &CommitSignal,
     log_commits: &CommitSignal,
 ) -> Result<(), QuerySocketError> {
     stream
-        .set_read_timeout(Some(config.timeout))
+        .set_read_timeout(Some(tuning.timeout))
         .map_err(QuerySocketError::Io)?;
     stream
-        .set_write_timeout(Some(config.timeout))
+        .set_write_timeout(Some(tuning.timeout))
         .map_err(QuerySocketError::Io)?;
     let authorizer =
         security::Authorizer::from_peer(stream.as_fd(), Arc::clone(&config.descriptors))
             .map_err(QuerySocketError::Security)?;
-    let query_text = match read_request(&mut stream, config.max_request_bytes) {
+    let query_text = match read_request(&mut stream, tuning.max_request_bytes) {
         Ok(query) => query,
         Err(error) => {
             send_error(&mut stream, &error.to_string())?;
             return Ok(());
         }
     };
-    let deadline = Instant::now() + config.timeout;
+    let deadline = Instant::now() + tuning.timeout;
     let query = match crate::query_language::parse(&query_text) {
         Ok(query) => query,
         Err(error) => {
@@ -233,7 +257,7 @@ fn handle(
     }
     config.index_tracker.record_query(&query);
     let stream_guard = if query.stream {
-        if !try_acquire(streaming_count, config.max_streaming) {
+        if !try_acquire(streaming_count, tuning.max_streaming) {
             send_error(&mut stream, "too many concurrent streaming queries")?;
             return Ok(());
         }
@@ -253,8 +277,8 @@ fn handle(
             &authorizer,
             &Limits {
                 deadline,
-                cross_type_window: config.cross_type_window,
-                cross_type_max_lookback: config.cross_type_max_lookback,
+                cross_type_window: tuning.cross_type_window,
+                cross_type_max_lookback: tuning.cross_type_max_lookback,
             },
         )
         .map(|(records, state)| (records, Some(state)))
@@ -265,8 +289,8 @@ fn handle(
             &authorizer,
             &Limits {
                 deadline,
-                cross_type_window: config.cross_type_window,
-                cross_type_max_lookback: config.cross_type_max_lookback,
+                cross_type_window: tuning.cross_type_window,
+                cross_type_max_lookback: tuning.cross_type_max_lookback,
             },
         )
         .map(|records| (records, None))
@@ -282,7 +306,7 @@ fn handle(
             query.aggregate,
             Some(crate::query_language::RecordAggregate::Distinct(_))
         )
-        && records.len() > config.max_distinct_stream_values
+        && records.len() > tuning.max_distinct_stream_values
     {
         send_error(&mut stream, "DISTINCT stream exceeds its seen-value limit")?;
         return Ok(());
@@ -290,7 +314,7 @@ fn handle(
     send_records(
         &mut stream,
         &records,
-        config.response_target_bytes,
+        tuning.response_target_bytes,
         Some(deadline),
     )?;
     if query.stream {
@@ -331,7 +355,7 @@ fn handle(
                                 true
                             }
                         });
-                        if values.len() > config.max_distinct_stream_values {
+                        if values.len() > tuning.max_distinct_stream_values {
                             let _ = send_error(
                                 &mut stream,
                                 "DISTINCT stream exceeds its seen-value limit",
@@ -340,7 +364,7 @@ fn handle(
                         }
                     }
                     if !records.is_empty() {
-                        send_records(&mut stream, &records, config.response_target_bytes, None)?;
+                        send_records(&mut stream, &records, tuning.response_target_bytes, None)?;
                     }
                 }
                 Err(error) => return Err(QuerySocketError::Io(error)),

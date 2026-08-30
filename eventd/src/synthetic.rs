@@ -2,6 +2,8 @@
 
 use eventd_core::{Guid, SyntheticEvent};
 
+use crate::config::AppliedChange;
+
 pub fn startup(
     boot_id: Guid,
     canonical_boot_id: &str,
@@ -88,6 +90,38 @@ pub fn storage_error(
     }
 }
 
+pub fn config_change(boot_id: Guid, change: &AppliedChange, timestamp: u64) -> SyntheticEvent {
+    let mut payload = Vec::with_capacity(
+        96 + change.old_value.as_ref().map_or(0, String::len)
+            + change.new_value.as_ref().map_or(0, String::len),
+    );
+    payload.push(0x85);
+    pack_str(&mut payload, "key");
+    pack_str(&mut payload, change.key);
+    pack_str(&mut payload, "old_value_type");
+    pack_str(&mut payload, change.old_value_type);
+    pack_str(&mut payload, "old_value");
+    if let Some(value) = &change.old_value {
+        pack_str(&mut payload, value);
+    } else {
+        payload.push(0xc0);
+    }
+    pack_str(&mut payload, "new_value_type");
+    pack_str(&mut payload, change.new_value_type);
+    pack_str(&mut payload, "new_value");
+    if let Some(value) = &change.new_value {
+        pack_str(&mut payload, value);
+    } else {
+        payload.push(0xc0);
+    }
+    SyntheticEvent {
+        boot_id,
+        timestamp,
+        event_type: "synthetic.config_change".into(),
+        payload: payload.into_boxed_slice(),
+    }
+}
+
 fn pack_array_len(output: &mut Vec<u8>, length: usize) {
     if length <= 15 {
         output.push(0x90 | u8::try_from(length).expect("fixarray length"));
@@ -168,5 +202,22 @@ mod tests {
         let event = storage_error([1; 16], "event", Some(3), "corrupt", 7);
         assert_eq!(event.event_type.as_ref(), "synthetic.storage_error");
         assert_eq!(event.payload[0], 0x83);
+    }
+
+    #[test]
+    fn config_change_payload_has_stable_top_level_shape() {
+        let event = config_change(
+            [1; 16],
+            &AppliedChange {
+                key: "MaxBatchSize",
+                old_value_type: "REG_DWORD",
+                old_value: Some("10000".into()),
+                new_value_type: "REG_DWORD",
+                new_value: Some("20000".into()),
+            },
+            7,
+        );
+        assert_eq!(event.event_type.as_ref(), "synthetic.config_change");
+        assert_eq!(event.payload[0], 0x85);
     }
 }

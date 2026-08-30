@@ -67,6 +67,11 @@ pub enum IndexAction {
 }
 
 impl Shard {
+    /// Apply the next passive-checkpoint threshold at a transaction boundary.
+    pub const fn set_checkpoint_pages(&mut self, pages: u32) {
+        self.checkpoint_pages = pages;
+    }
+
     /// Open a required shard, quarantining only SQLite-reported corruption.
     pub fn open_recovering(
         path: impl AsRef<Path>,

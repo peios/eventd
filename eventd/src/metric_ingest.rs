@@ -5,13 +5,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
     BoundedQueue, Histogram, MetricRecord, MetricStore, MetricStoreError, MetricType, MetricValue,
 };
 use peios::msgpack::{Reader, Type};
 
+use crate::config::{Config, SharedConfig};
 use crate::datagram::{IngestionSocket, Receive, SocketError};
 use crate::writer::WriterMessage;
 
@@ -26,6 +27,7 @@ pub enum MetricMaintenance {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the sole metric owner receives its fixed batching and maintenance dependencies explicitly"
 )]
 pub fn run(
@@ -33,18 +35,38 @@ pub fn run(
     mut store: MetricStore,
     boot_id: [u8; 16],
     error_events: &BoundedQueue<WriterMessage>,
-    datagram_ceiling: usize,
-    max_batch_size: usize,
-    max_batch_latency: Duration,
+    runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     maintenance: &Receiver<MetricMaintenance>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), MetricIngestError> {
     crate::diagnostics::metric_series(store.cache_len());
+    let (initial_batch_size, mut datagram_ceiling) = Config::read(runtime, |config| {
+        (
+            config.metric_max_batch_size,
+            config.max_metric_datagram_bytes,
+        )
+    });
     let mut buffer = vec![0_u8; datagram_ceiling];
-    let mut batch = Vec::with_capacity(max_batch_size);
+    let mut batch = Vec::with_capacity(initial_batch_size);
     let mut started = None;
     while !stopping.load(Ordering::Acquire) {
+        let (max_batch_size, max_batch_latency, checkpoint_pages, cache_size, next_ceiling) =
+            Config::read(runtime, |config| {
+                (
+                    config.metric_max_batch_size,
+                    config.metric_max_batch_latency,
+                    config.wal_checkpoint_pages,
+                    config.metric_series_cache_size,
+                    config.max_metric_datagram_bytes,
+                )
+            });
+        store.configure(checkpoint_pages, cache_size);
+        if datagram_ceiling != next_ceiling {
+            datagram_ceiling = next_ceiling;
+            buffer.resize(datagram_ceiling, 0);
+            socket.configure_receive_buffer(datagram_ceiling)?;
+        }
         match socket.receive(&mut buffer)? {
             Receive::Datagram(length) => {
                 let receipt_timestamp = realtime_nanoseconds()?;
@@ -93,6 +115,7 @@ pub fn run(
         )?;
     }
     loop {
+        let max_batch_size = Config::read(runtime, |config| config.metric_max_batch_size);
         match socket.receive(&mut buffer)? {
             Receive::Datagram(length) => {
                 let receipt_timestamp = realtime_nanoseconds()?;

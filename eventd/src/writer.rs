@@ -11,6 +11,7 @@ use eventd_core::{
 };
 
 use crate::commit_signal::CommitSignal;
+use crate::config::{Config, SharedConfig};
 
 /// Ordered data and control messages consumed by a shard's sole owner.
 pub enum WriterMessage {
@@ -50,19 +51,31 @@ pub fn run(
     shard_index: usize,
     boot_id: Guid,
     queue: &BoundedQueue<WriterMessage>,
-    max_batch_size: usize,
-    max_batch_latency: Duration,
+    runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
-    shedding: SheddingConfig,
     ring_pressure: &Arc<[AtomicU8]>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), ShardError> {
-    let mut batch = Vec::with_capacity(max_batch_size);
+    let mut batch = Vec::with_capacity(Config::read(runtime, |config| config.max_batch_size));
     let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
     let mut batch_history = VecDeque::new();
     loop {
+        let (max_batch_size, max_batch_latency, checkpoint_pages, shedding) =
+            Config::read(runtime, |config| {
+                (
+                    config.max_batch_size,
+                    config.max_batch_latency,
+                    config.wal_checkpoint_pages,
+                    SheddingConfig {
+                        window: config.shedding_window,
+                        batch_percent: config.shedding_batch_percent,
+                        emergency_buffer_percent: config.emergency_shedding_buffer_percent,
+                    },
+                )
+            });
+        shard.set_checkpoint_pages(checkpoint_pages);
         let first = queue.pop_wait();
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),

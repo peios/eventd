@@ -121,6 +121,15 @@ impl MetricStore {
         self.cache.len()
     }
 
+    /// Apply live writer-maintenance bounds at a transaction boundary.
+    pub fn configure(&mut self, checkpoint_pages: u32, cache_capacity: usize) {
+        self.checkpoint_pages = checkpoint_pages;
+        self.cache_capacity = cache_capacity;
+        while self.cache.len() > self.cache_capacity {
+            self.cache.pop_front();
+        }
+    }
+
     /// Open the required metric store, quarantining only reported corruption.
     pub fn open_recovering(
         path: impl AsRef<Path>,

@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{BoundedQueue, DesiredIndex, IndexCounter, MetaStore};
 
+use crate::config::{Config, SharedConfig};
 use crate::query_language::{CrossFilter, Query, Source};
 use crate::writer::WriterMessage;
 
@@ -36,16 +37,11 @@ struct Counter {
 
 pub struct Tracker {
     counters: Mutex<HashMap<String, Counter>>,
-    window_ns: u64,
-    create_threshold: u64,
+    runtime: SharedConfig,
 }
 
 impl Tracker {
-    pub fn from_persisted(
-        counters: Vec<IndexCounter>,
-        window: Duration,
-        create_threshold: u64,
-    ) -> Self {
+    pub fn from_persisted(counters: Vec<IndexCounter>, runtime: SharedConfig) -> Self {
         Self {
             counters: Mutex::new(
                 counters
@@ -61,8 +57,7 @@ impl Tracker {
                     })
                     .collect(),
             ),
-            window_ns: duration_ns(window),
-            create_threshold,
+            runtime,
         }
     }
 
@@ -97,11 +92,17 @@ impl Tracker {
     }
 
     pub fn prioritize(&self, field: &str) {
-        self.record_fields([field.to_owned()], self.create_threshold);
+        let create_threshold = Config::read(&self.runtime, |config| {
+            config.adaptive_index_create_threshold
+        });
+        self.record_fields([field.to_owned()], create_threshold);
     }
 
     fn record_fields(&self, fields: impl IntoIterator<Item = String>, increment: u64) {
         let now = realtime_ns().unwrap_or(0);
+        let window_ns = duration_ns(Config::read(&self.runtime, |config| {
+            config.adaptive_index_window
+        }));
         let mut counters = self
             .counters
             .lock()
@@ -114,7 +115,7 @@ impl Tracker {
                 count: 0,
                 window_start: now,
             });
-            rotate(counter, now, self.window_ns);
+            rotate(counter, now, window_ns);
             counter.count = counter.count.saturating_add(increment);
         }
         drop(counters);
@@ -122,6 +123,9 @@ impl Tracker {
 
     fn snapshot(&self) -> Vec<IndexCounter> {
         let now = realtime_ns().unwrap_or(0);
+        let window_ns = duration_ns(Config::read(&self.runtime, |config| {
+            config.adaptive_index_window
+        }));
         let mut counters = self
             .counters
             .lock()
@@ -129,7 +133,7 @@ impl Tracker {
         let snapshot = counters
             .iter_mut()
             .map(|(field_path, counter)| {
-                rotate(counter, now, self.window_ns);
+                rotate(counter, now, window_ns);
                 IndexCounter {
                     field_path: field_path.clone(),
                     query_count: counter.count,
@@ -165,10 +169,21 @@ pub fn run(
     tracker: &Arc<Tracker>,
     desired: &Arc<RwLock<Vec<DesiredIndex>>>,
     queues: &Arc<[BoundedQueue<WriterMessage>]>,
-    config: PolicyConfig,
+    runtime: &SharedConfig,
     receiver: &Receiver<PolicyMessage>,
 ) -> Result<(), IndexError> {
     loop {
+        let (config, checkpoint_pages) = Config::read(runtime, |live| {
+            (
+                PolicyConfig {
+                    interval: live.adaptive_index_policy_interval,
+                    create_threshold: live.adaptive_index_create_threshold,
+                    drop_threshold: live.adaptive_index_drop_threshold,
+                },
+                live.wal_checkpoint_pages,
+            )
+        });
+        store.set_checkpoint_pages(checkpoint_pages);
         match receiver.recv_timeout(config.interval) {
             Ok(PolicyMessage::Recompute) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(error) = recompute(&mut store, tracker, desired, queues, config) {
@@ -300,7 +315,10 @@ mod tests {
 
     #[test]
     fn event_queries_account_once_per_referenced_predicate_field() {
-        let tracker = Tracker::from_persisted(Vec::new(), Duration::from_mins(1), 10);
+        let mut config = Config::test_defaults();
+        config.adaptive_index_window = Duration::from_mins(1);
+        config.adaptive_index_create_threshold = 10;
+        let tracker = Tracker::from_persisted(Vec::new(), config.shared());
         let query = crate::query_language::parse(
             "EVENTS SINCE 1h ago WHERE event_type == kacs.denied \
              WHERE payload.subject == alice",

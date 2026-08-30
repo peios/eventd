@@ -60,6 +60,11 @@ pub struct LogStore {
 }
 
 impl LogStore {
+    /// Apply the next passive-checkpoint threshold at a transaction boundary.
+    pub const fn set_checkpoint_pages(&mut self, pages: u32) {
+        self.checkpoint_pages = pages;
+    }
+
     /// Open the required log store, quarantining only reported corruption.
     pub fn open_recovering(
         path: impl AsRef<Path>,

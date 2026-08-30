@@ -80,6 +80,10 @@ impl IngestionSocket {
         }
     }
 
+    pub fn configure_receive_buffer(&self, datagram_ceiling: usize) -> Result<(), SocketError> {
+        set_receive_buffer(&self.socket, datagram_ceiling)
+    }
+
     pub fn wait_readable(&self, timeout_milliseconds: i32) -> Result<(), SocketError> {
         let mut descriptor = libc::pollfd {
             fd: self.socket.as_raw_fd(),

@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventd_core::{BoundedQueue, Shard};
 use rusqlite::{Connection, OpenFlags};
 
+use crate::config::{Config, SharedConfig};
 use crate::log_ingest::LogMaintenance;
 use crate::metric_ingest::MetricMaintenance;
 use crate::writer::{EventMaintenance, WriterMessage};
@@ -21,7 +22,6 @@ pub struct RetentionConfig {
     pub log_max_bytes: u64,
     pub metric_age: Duration,
     pub metric_max_bytes: u64,
-    pub interval: Duration,
     pub batch_rows: usize,
     pub checkpoint_pages: u32,
 }
@@ -39,7 +39,7 @@ pub struct Stores {
     reason = "the retention thread deliberately owns every lifetime dependency"
 )]
 pub fn run(
-    config: RetentionConfig,
+    runtime: SharedConfig,
     stores: Stores,
     event_queues: Arc<[BoundedQueue<WriterMessage>]>,
     log_sender: Sender<LogMaintenance>,
@@ -48,12 +48,21 @@ pub fn run(
     stopping: Arc<AtomicBool>,
     requested: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let initial = Config::read(&runtime, retention_config);
     let mut historical_shards = stores
         .historical_event_paths
         .iter()
-        .map(|path| Shard::open(path, config.checkpoint_pages).map_err(|error| error.to_string()))
+        .map(|path| Shard::open(path, initial.checkpoint_pages).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    while wait_interval(&stopping, &requested, config.interval) {
+    while wait_interval(
+        &stopping,
+        &requested,
+        Config::read(&runtime, |config| config.retention_interval),
+    ) {
+        let config = Config::read(&runtime, retention_config);
+        for shard in &mut historical_shards {
+            shard.set_checkpoint_pages(config.checkpoint_pages);
+        }
         if let Err(error) = pass(
             &config,
             &stores,
@@ -68,6 +77,19 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+const fn retention_config(config: &Config) -> RetentionConfig {
+    RetentionConfig {
+        event_age: config.event_retention,
+        event_max_bytes: config.event_retention_max_bytes,
+        log_age: config.log_retention,
+        log_max_bytes: config.log_retention_max_bytes,
+        metric_age: config.metric_retention,
+        metric_max_bytes: config.metric_retention_max_bytes,
+        batch_rows: config.retention_delete_batch_rows,
+        checkpoint_pages: config.wal_checkpoint_pages,
+    }
 }
 
 fn wait_interval(stopping: &AtomicBool, requested: &AtomicBool, interval: Duration) -> bool {

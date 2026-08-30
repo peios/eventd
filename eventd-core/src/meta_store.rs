@@ -65,6 +65,11 @@ pub struct DesiredIndex {
 }
 
 impl MetaStore {
+    /// Apply the next passive-checkpoint threshold at a policy boundary.
+    pub const fn set_checkpoint_pages(&mut self, pages: u32) {
+        self.checkpoint_pages = pages;
+    }
+
     /// Open the reconstructible database, replacing malformed state with defaults.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, MetaStoreError> {
         let path = path.as_ref();
