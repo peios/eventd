@@ -171,7 +171,10 @@ pub fn run(
     loop {
         match receiver.recv_timeout(config.interval) {
             Ok(PolicyMessage::Recompute) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                recompute(&mut store, tracker, desired, queues, config)?;
+                if let Err(error) = recompute(&mut store, tracker, desired, queues, config) {
+                    crate::diagnostics::metadata_error(&error);
+                    return Err(error);
+                }
             }
             Ok(PolicyMessage::Checkpoint {
                 boot_id,
@@ -185,7 +188,9 @@ pub fn run(
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
-                    return Err(IndexError::Metadata("checkpoint write failed".into()));
+                    let error = IndexError::Metadata("checkpoint write failed".into());
+                    crate::diagnostics::metadata_error(&error);
+                    return Err(error);
                 }
             }
             Ok(PolicyMessage::Stop(reply)) => {
@@ -194,7 +199,9 @@ pub fn run(
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
-                    return Err(IndexError::Metadata("final policy flush failed".into()));
+                    let error = IndexError::Metadata("final policy flush failed".into());
+                    crate::diagnostics::metadata_error(&error);
+                    return Err(error);
                 }
                 return Ok(());
             }

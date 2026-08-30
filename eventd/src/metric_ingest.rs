@@ -40,6 +40,7 @@ pub fn run(
     maintenance: &Receiver<MetricMaintenance>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), MetricIngestError> {
+    crate::diagnostics::metric_series(store.cache_len());
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(max_batch_size);
     let mut started = None;
@@ -163,6 +164,7 @@ fn process_maintenance(
             } else if error.is_corruption() {
                 recover_corruption(store, boot_id, error_events, &error)
             } else {
+                crate::diagnostics::metric_error(&error);
                 Err(error.into())
             }
         }
@@ -177,7 +179,10 @@ fn commit_batch(
     error_events: &BoundedQueue<WriterMessage>,
 ) -> Result<(), MetricIngestError> {
     match store.commit(batch) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            crate::diagnostics::metric_series(store.cache_len());
+            Ok(())
+        }
         Err(error) if error.is_capacity() => {
             request_retention(retention_requested, &error);
             Ok(())
@@ -185,11 +190,15 @@ fn commit_batch(
         Err(error) if error.is_corruption() => {
             recover_corruption(store, boot_id, error_events, &error)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            crate::diagnostics::metric_error(&error);
+            Err(error.into())
+        }
     }
 }
 
 fn request_retention(requested: &AtomicBool, error: &MetricStoreError) {
+    crate::diagnostics::metric_error(error);
     requested.store(true, Ordering::Release);
     eprintln!("eventd: metric store is full; batch discarded and retention requested: {error}");
 }
@@ -201,8 +210,10 @@ fn recover_corruption(
     error: &MetricStoreError,
 ) -> Result<(), MetricIngestError> {
     let description = error.to_string();
+    crate::diagnostics::metric_error(error);
     eprintln!("eventd: quarantining corrupt metric store: {description}");
     store.replace_corrupt()?;
+    crate::diagnostics::metric_series(store.cache_len());
     emit_storage_error(error_events, boot_id, "metric", &description);
     Ok(())
 }

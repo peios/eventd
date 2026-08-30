@@ -5,6 +5,7 @@ use std::error::Error;
 mod commit_signal;
 mod config;
 mod datagram;
+mod diagnostics;
 mod directory;
 mod indexing;
 mod kmes;

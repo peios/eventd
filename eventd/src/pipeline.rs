@@ -21,9 +21,15 @@ use crate::kmes::{self, DrainContext};
 use crate::query::{DescriptorCache, QueryServer, ServerConfig};
 use crate::writer::{SheddingConfig, WriterMessage};
 
-static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+type ReceiptRow = ([u8; 16], u16, eventd_core::Interval);
 
-extern "C" fn stop_signal(_signal: libc::c_int) {
+static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+static SIGNAL_QUIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop_signal(signal: libc::c_int) {
+    if signal == libc::SIGQUIT {
+        SIGNAL_QUIT.store(true, Ordering::Release);
+    }
     SIGNAL_STOP.store(true, Ordering::Release);
 }
 
@@ -420,6 +426,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &active_paths,
         &historical_paths,
         boot_id,
+        &canonical_boot_id,
         &cpu_ids,
         &index_policy_sender,
     )
@@ -450,11 +457,21 @@ fn load_coverage(
     active_paths: &[PathBuf],
     historical_paths: &[PathBuf],
 ) -> Result<Coverage, Box<dyn std::error::Error>> {
+    Ok(Coverage::from_receipts(load_receipts(
+        active_paths,
+        historical_paths,
+    )?))
+}
+
+fn load_receipts(
+    active_paths: &[PathBuf],
+    historical_paths: &[PathBuf],
+) -> Result<Vec<ReceiptRow>, Box<dyn std::error::Error>> {
     let mut receipts = Vec::new();
     for path in active_paths.iter().chain(historical_paths) {
         receipts.extend(Shard::historical_receipts(path)?);
     }
-    Ok(Coverage::from_receipts(receipts))
+    Ok(receipts)
 }
 
 fn commit_synthetic(
@@ -512,6 +529,7 @@ fn install_signal_handlers() -> Result<(), std::io::Error> {
     let handler = stop_signal as *const () as libc::sighandler_t;
     if unsafe { libc::signal(libc::SIGTERM, handler) } == libc::SIG_ERR
         || unsafe { libc::signal(libc::SIGINT, handler) } == libc::SIG_ERR
+        || unsafe { libc::signal(libc::SIGQUIT, handler) } == libc::SIG_ERR
     {
         return Err(std::io::Error::last_os_error());
     }
@@ -520,6 +538,7 @@ fn install_signal_handlers() -> Result<(), std::io::Error> {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "shutdown owns each resource explicitly in its mandated close order"
 )]
 fn supervise(
@@ -539,6 +558,7 @@ fn supervise(
     active_paths: &[PathBuf],
     historical_paths: &[PathBuf],
     boot_id: [u8; 16],
+    canonical_boot_id: &str,
     cpu_ids: &[u16],
     index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -553,6 +573,17 @@ fn supervise(
         && !descriptor_handle.is_finished()
     {
         std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if SIGNAL_QUIT.swap(false, Ordering::AcqRel) {
+        diagnostic_dump(
+            canonical_boot_id,
+            active_paths,
+            historical_paths,
+            boot_id,
+            cpu_ids,
+            &query_server,
+        );
     }
 
     query_server.unlink();
@@ -643,6 +674,50 @@ fn supervise(
     join_worker(index_handle, &mut first_error);
     drop(mapped_rings);
     first_error.map_or_else(|| Ok(()), |error| Err(error.into()))
+}
+
+fn diagnostic_dump(
+    canonical_boot_id: &str,
+    active_paths: &[PathBuf],
+    historical_paths: &[PathBuf],
+    boot_id: [u8; 16],
+    cpu_ids: &[u16],
+    query_server: &QueryServer,
+) {
+    let (active_queries, streaming_queries) = query_server.counts();
+    let (metric_series, errors) = crate::diagnostics::snapshot();
+    eprintln!("eventd diagnostic dump:");
+    eprintln!("  boot_id: {canonical_boot_id}");
+    eprintln!(
+        "  shards: active={} historical_readable={}",
+        active_paths.len(),
+        historical_paths.len()
+    );
+    eprintln!("  queries: active={active_queries} streaming={streaming_queries}");
+    eprintln!("  metric_series_cache: {metric_series}");
+    match load_receipts(active_paths, historical_paths) {
+        Ok(receipts) => {
+            let mut range_counts = std::collections::HashMap::<u16, usize>::new();
+            for (receipt_boot, cpu_id, _) in &receipts {
+                if receipt_boot == &boot_id {
+                    *range_counts.entry(*cpu_id).or_default() += 1;
+                }
+            }
+            let coverage = Coverage::from_receipts(receipts);
+            for cpu_id in cpu_ids {
+                eprintln!(
+                    "  cpu[{cpu_id}]: receipt_ranges={} highest_contiguous={}",
+                    range_counts.get(cpu_id).copied().unwrap_or(0),
+                    coverage.highest_contiguous(&boot_id, *cpu_id)
+                );
+            }
+        }
+        Err(error) => eprintln!("  receipt_coverage: unavailable: {error}"),
+    }
+    eprintln!(
+        "  last_write_errors: event={:?} log={:?} metric={:?} metadata={:?}",
+        errors.event, errors.log, errors.metric, errors.metadata
+    );
 }
 
 fn flush_event_queues(queues: &[BoundedQueue<WriterMessage>]) -> Result<(), String> {

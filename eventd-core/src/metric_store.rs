@@ -115,6 +115,12 @@ pub struct MetricStore {
 }
 
 impl MetricStore {
+    /// Current number of entries in the bounded series-resolution cache.
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Open the required metric store, quarantining only reported corruption.
     pub fn open_recovering(
         path: impl AsRef<Path>,

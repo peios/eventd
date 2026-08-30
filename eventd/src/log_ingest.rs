@@ -165,6 +165,7 @@ fn process_maintenance(
             } else if error.is_corruption() {
                 recover_corruption(store, boot_id, error_events, &error)
             } else {
+                crate::diagnostics::log_error(&error);
                 Err(error.into())
             }
         }
@@ -193,11 +194,15 @@ fn commit_batch(
         Err(error) if error.is_corruption() => {
             recover_corruption(store, boot_id, error_events, &error)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            crate::diagnostics::log_error(&error);
+            Err(error.into())
+        }
     }
 }
 
 fn request_retention(requested: &AtomicBool, error: &LogStoreError) {
+    crate::diagnostics::log_error(error);
     requested.store(true, Ordering::Release);
     eprintln!("eventd: log store is full; batch discarded and retention requested: {error}");
 }
@@ -209,6 +214,7 @@ fn recover_corruption(
     error: &LogStoreError,
 ) -> Result<(), LogIngestError> {
     let description = error.to_string();
+    crate::diagnostics::log_error(error);
     eprintln!("eventd: quarantining corrupt log store: {description}");
     store.replace_corrupt()?;
     emit_storage_error(error_events, boot_id, "log", &description);

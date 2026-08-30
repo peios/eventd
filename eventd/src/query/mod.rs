@@ -51,6 +51,8 @@ pub struct QueryServer {
     listener: UnixListener,
     path: PathBuf,
     identity: (u64, u64),
+    active: Arc<AtomicUsize>,
+    streaming: Arc<AtomicUsize>,
 }
 
 impl QueryServer {
@@ -84,7 +86,16 @@ impl QueryServer {
             listener,
             path: path.to_owned(),
             identity: (metadata.dev(), metadata.ino()),
+            active: Arc::new(AtomicUsize::new(0)),
+            streaming: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.active.load(Ordering::Acquire),
+            self.streaming.load(Ordering::Acquire),
+        )
     }
 
     pub fn run(
@@ -95,17 +106,15 @@ impl QueryServer {
         event_commits: &Arc<CommitSignal>,
         log_commits: &Arc<CommitSignal>,
     ) -> Result<(), QuerySocketError> {
-        let active = Arc::new(AtomicUsize::new(0));
-        let streaming = Arc::new(AtomicUsize::new(0));
         while !stopping.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    if !try_acquire(&active, config.max_concurrent) {
+                    if !try_acquire(&self.active, config.max_concurrent) {
                         let _ = send_error(stream, "too many concurrent queries");
                         continue;
                     }
-                    let worker_active = Arc::clone(&active);
-                    let streaming = Arc::clone(&streaming);
+                    let worker_active = Arc::clone(&self.active);
+                    let streaming = Arc::clone(&self.streaming);
                     let stores = Arc::clone(stores);
                     let config = Arc::clone(config);
                     let stopping = Arc::clone(stopping);
@@ -128,7 +137,7 @@ impl QueryServer {
                             }
                         });
                     if let Err(error) = spawned {
-                        active.fetch_sub(1, Ordering::Release);
+                        self.active.fetch_sub(1, Ordering::Release);
                         return Err(QuerySocketError::Io(error));
                     }
                 }
@@ -139,7 +148,7 @@ impl QueryServer {
                 Err(error) => return Err(QuerySocketError::Io(error)),
             }
         }
-        while active.load(Ordering::Acquire) != 0 {
+        while self.active.load(Ordering::Acquire) != 0 {
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())

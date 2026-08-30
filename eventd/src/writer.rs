@@ -79,6 +79,7 @@ pub fn run(
                         boot_id,
                     },
                 ) {
+                    crate::diagnostics::event_error(&error);
                     stopping.store(true, Ordering::Release);
                     queue.close();
                     return Err(error);
@@ -108,6 +109,7 @@ pub fn run(
                         &desired,
                         &mut batch_history,
                     ) {
+                        crate::diagnostics::event_error(&error);
                         fail_control(control, &error);
                         stopping.store(true, Ordering::Release);
                         queue.close();
@@ -126,6 +128,7 @@ pub fn run(
                             boot_id,
                         },
                     ) {
+                        crate::diagnostics::event_error(&error);
                         stopping.store(true, Ordering::Release);
                         queue.close();
                         return Err(error);
@@ -153,6 +156,7 @@ pub fn run(
             &desired,
             &mut batch_history,
         ) {
+            crate::diagnostics::event_error(&error);
             stopping.store(true, Ordering::Release);
             queue.close();
             return Err(error);
@@ -314,6 +318,7 @@ fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
 }
 
 fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
+    crate::diagnostics::event_error(error);
     requested.store(true, Ordering::Release);
     eprintln!("eventd: {store} store is full; batch discarded and retention requested: {error}");
 }
@@ -327,6 +332,7 @@ fn recover_corruption(
     error: &ShardError,
 ) -> Result<(), ShardError> {
     let description = error.to_string();
+    crate::diagnostics::event_error(error);
     eprintln!("eventd: quarantining corrupt event shard {shard_index}: {description}");
     shard.replace_corrupt()?;
     let event = crate::synthetic::storage_error(
