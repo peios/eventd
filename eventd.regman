@@ -117,11 +117,12 @@ Maximum log batch age in milliseconds before commit.
 canonical: Machine\System\eventd MaxLogDatagramBytes
 type: REG_DWORD
 default: 262144
-valid: 4096 to 1048576
+valid: 262144 to 1048576
 applies: live
 
 Largest accepted log datagram. Oversized datagrams are discarded before
-decoding.
+decoding. The 262144-byte minimum is the portable PSPU producer contract and
+cannot be lowered.
 
 --- machine\system\eventd metricmaxbatchsize
 canonical: Machine\System\eventd MetricMaxBatchSize
@@ -145,10 +146,11 @@ Maximum metric batch age in milliseconds before commit.
 canonical: Machine\System\eventd MaxMetricDatagramBytes
 type: REG_DWORD
 default: 262144
-valid: 4096 to 1048576
+valid: 262144 to 1048576
 applies: live
 
-Largest accepted metric datagram.
+Largest accepted metric datagram. The 262144-byte minimum is the portable PSPU
+producer contract and cannot be lowered.
 
 --- machine\system\eventd metricseriescachesize
 canonical: Machine\System\eventd MetricSeriesCacheSize

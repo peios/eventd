@@ -20,6 +20,8 @@ pub const HANDOFF_SLOTS: usize = 4_096;
 pub const HANDOFF_BYTES: usize = 16 * 1024 * 1024;
 pub const STRIPE_LENGTH: usize = 1_024;
 pub const DEFAULT_METRIC_RETENTION_MAX_BYTES: u64 = 1 << 30;
+pub const PORTABLE_INGEST_DATAGRAM_BYTES: u32 = 256 * 1024;
+const MAX_INGEST_DATAGRAM_BYTES: u32 = 1024 * 1024;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 
@@ -173,9 +175,9 @@ impl Config {
             max_log_datagram_bytes: usize::try_from(dword(
                 values,
                 b"MaxLogDatagramBytes",
-                262_144,
-                4_096,
-                1_048_576,
+                PORTABLE_INGEST_DATAGRAM_BYTES,
+                PORTABLE_INGEST_DATAGRAM_BYTES,
+                MAX_INGEST_DATAGRAM_BYTES,
             ))
             .expect("MaxLogDatagramBytes fits usize"),
             metric_max_batch_size: usize::try_from(dword(
@@ -196,9 +198,9 @@ impl Config {
             max_metric_datagram_bytes: usize::try_from(dword(
                 values,
                 b"MaxMetricDatagramBytes",
-                262_144,
-                4_096,
-                1_048_576,
+                PORTABLE_INGEST_DATAGRAM_BYTES,
+                PORTABLE_INGEST_DATAGRAM_BYTES,
+                MAX_INGEST_DATAGRAM_BYTES,
             ))
             .expect("MaxMetricDatagramBytes fits usize"),
             metric_series_cache_size: usize::try_from(dword(
@@ -406,8 +408,8 @@ impl Config {
         retain_invalid_dword!(
             max_log_datagram_bytes,
             b"MaxLogDatagramBytes",
-            4_096,
-            1_048_576
+            PORTABLE_INGEST_DATAGRAM_BYTES,
+            MAX_INGEST_DATAGRAM_BYTES
         );
         retain_invalid_dword!(metric_max_batch_size, b"MetricMaxBatchSize", 100, 100_000);
         retain_invalid_dword!(
@@ -419,8 +421,8 @@ impl Config {
         retain_invalid_dword!(
             max_metric_datagram_bytes,
             b"MaxMetricDatagramBytes",
-            4_096,
-            1_048_576
+            PORTABLE_INGEST_DATAGRAM_BYTES,
+            MAX_INGEST_DATAGRAM_BYTES
         );
         retain_invalid_dword!(
             metric_series_cache_size,
@@ -1136,6 +1138,29 @@ mod tests {
         )]);
         assert_eq!(dword(&values, b"MaxBatchSize", 1, 100, 100_000), 10_000);
         assert_eq!(dword(&values, b"MaxBatchSize", 1, 20_000, 100_000), 1);
+    }
+
+    #[test]
+    fn ingestion_ceiling_cannot_fall_below_the_portable_contract() {
+        let mut values = Config::test_defaults().raw_values;
+        values.insert(
+            b"MaxLogDatagramBytes".to_vec(),
+            dword_record(b"MaxLogDatagramBytes", 64 * 1024),
+        );
+        values.insert(
+            b"MaxMetricDatagramBytes".to_vec(),
+            dword_record(b"MaxMetricDatagramBytes", 128 * 1024),
+        );
+
+        let config = Config::from_values(&values).expect("configuration");
+        assert_eq!(
+            config.max_log_datagram_bytes,
+            PORTABLE_INGEST_DATAGRAM_BYTES as usize
+        );
+        assert_eq!(
+            config.max_metric_datagram_bytes,
+            PORTABLE_INGEST_DATAGRAM_BYTES as usize
+        );
     }
 
     #[test]
