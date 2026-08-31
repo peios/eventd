@@ -669,7 +669,11 @@ fn valid_identifier(value: &str) -> bool {
 }
 
 fn valid_label_key(value: &str) -> bool {
-    valid_identifier(value) && !matches!(value, "timestamp" | "boot_id" | "name" | "type" | "value")
+    valid_identifier(value)
+        && !matches!(
+            value,
+            "timestamp" | "boot_id" | "name" | "type" | "value" | "overflow"
+        )
 }
 
 fn realtime_nanoseconds() -> Result<i64, MetricIngestError> {
@@ -762,6 +766,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn overflow_is_reserved_for_percentile_results() {
+        assert!(!valid_label_key("overflow"));
+        assert!(valid_label_key("overflow_count"));
     }
 
     #[test]

@@ -1989,17 +1989,20 @@ fn transform_metric_inputs(
                         .ok_or(QueryError::InvalidHistogram)?,
                     percentile,
                 )?;
-                if let Some(value) = value {
-                    input
-                        .row
-                        .record
-                        .insert("value".into(), finite_value(value)?);
-                    output.push(MetricPoint {
-                        row: input.row,
-                        adjusted_delta: None,
-                        elapsed_ns: None,
-                    });
+                match value {
+                    PercentileValue::Empty => continue,
+                    PercentileValue::Finite(value) => {
+                        set_metric_result(&mut input.row.record, finite_value(value)?, false);
+                    }
+                    PercentileValue::Overflow => {
+                        set_metric_result(&mut input.row.record, Value::Null, true);
+                    }
                 }
+                output.push(MetricPoint {
+                    row: input.row,
+                    adjusted_delta: None,
+                    elapsed_ns: None,
+                });
             }
             Ok(output)
         }
@@ -2048,7 +2051,14 @@ const fn finite_value(value: f64) -> Result<Value, QueryError> {
     }
 }
 
-fn histogram_percentile(bytes: &[u8], percentile: u8) -> Result<Option<f64>, QueryError> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PercentileValue {
+    Empty,
+    Finite(f64),
+    Overflow,
+}
+
+fn histogram_percentile(bytes: &[u8], percentile: u8) -> Result<PercentileValue, QueryError> {
     let Value::Map(entries) = super::value::decode(bytes).map_err(QueryError::Peios)? else {
         return Err(QueryError::InvalidHistogram);
     };
@@ -2065,7 +2075,7 @@ fn histogram_percentile(bytes: &[u8], percentile: u8) -> Result<Option<f64>, Que
         _ => return Err(QueryError::InvalidHistogram),
     };
     if total == 0 {
-        return Ok(None);
+        return Ok(PercentileValue::Empty);
     }
     let rank = total
         .checked_mul(u64::from(percentile))
@@ -2087,12 +2097,12 @@ fn histogram_percentile(bytes: &[u8], percentile: u8) -> Result<Option<f64>, Que
         };
         if count >= rank {
             return match boundary {
-                Value::Float(value) => Ok(Some(*value)),
+                Value::Float(value) => Ok(PercentileValue::Finite(*value)),
                 _ => Err(QueryError::InvalidHistogram),
             };
         }
     }
-    Ok(None)
+    Ok(PercentileValue::Overflow)
 }
 
 type ResolvedMetricSeries = (i64, String, Vec<MetricPoint>);
@@ -2268,7 +2278,7 @@ fn aggregate_points(
         return Ok(None);
     }
     let rows: Vec<_> = points.iter().map(|point| point.row.clone()).collect();
-    let value = numeric_aggregate(&rows, "value", function)?;
+    let value = metric_numeric_aggregate(&rows, function)?;
     let name = output_name.unwrap_or(&points[0].row.identifier);
     Ok(Some(metric_aggregate_row(
         &points[0].row,
@@ -2306,7 +2316,8 @@ fn metric_aggregate_row(
         "type".into(),
         Value::String(metric_type_name(metric_type)?.into()),
     );
-    record.insert("value".into(), value);
+    let overflow = matches!(value, Value::Null);
+    set_metric_result(&mut record, value, overflow);
     Ok(Row {
         record,
         identifier: output_name.to_owned(),
@@ -2355,7 +2366,7 @@ fn window_points(
             }
         } else {
             let rows: Vec<_> = points.iter().map(|point| point.row.clone()).collect();
-            numeric_aggregate(&rows, "value", function)?
+            metric_numeric_aggregate(&rows, function)?
         };
         let name = output_name.unwrap_or(&points[0].row.identifier);
         output.push(metric_aggregate_row(
@@ -2384,7 +2395,7 @@ fn combine_window_rows(
     }
     let mut output = Vec::with_capacity(windows.len());
     for (start, rows) in windows {
-        let value = numeric_aggregate(&rows, "value", function)?;
+        let value = metric_numeric_aggregate(&rows, function)?;
         output.push(metric_aggregate_row(
             &rows[0],
             value,
@@ -2396,6 +2407,29 @@ fn combine_window_rows(
         )?);
     }
     Ok(output)
+}
+
+fn metric_numeric_aggregate(
+    rows: &[Row],
+    function: AggregateFunction,
+) -> Result<Value, QueryError> {
+    if rows
+        .iter()
+        .any(|row| matches!(row.record.get("overflow"), Some(Value::Bool(true))))
+    {
+        Ok(Value::Null)
+    } else {
+        numeric_aggregate(rows, "value", function)
+    }
+}
+
+fn set_metric_result(record: &mut Record, value: Value, overflow: bool) {
+    record.insert("value".into(), value);
+    if overflow {
+        record.insert("overflow".into(), Value::Bool(true));
+    } else {
+        record.remove("overflow");
+    }
 }
 
 fn sort_metric_rows(rows: &mut [Row], query: &Query) {
@@ -2681,6 +2715,7 @@ impl From<super::security::SecurityError> for QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peios::msgpack::Writer;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static TEST_DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2863,6 +2898,96 @@ mod tests {
     }
 
     #[test]
+    fn histogram_percentile_distinguishes_empty_finite_and_overflow() {
+        assert_eq!(
+            histogram_percentile(&test_histogram(0, 0), 99).unwrap(),
+            PercentileValue::Empty
+        );
+        assert_eq!(
+            histogram_percentile(&test_histogram(100, 100), 99).unwrap(),
+            PercentileValue::Finite(1.0)
+        );
+        assert_eq!(
+            histogram_percentile(&test_histogram(100, 98), 99).unwrap(),
+            PercentileValue::Overflow
+        );
+    }
+
+    #[test]
+    fn percentile_overflow_emits_an_explicit_result() {
+        let points = transform_metric_inputs(
+            vec![
+                test_histogram_input(10, 100, 100),
+                test_histogram_input(20, 100, 98),
+            ],
+            Some(Transform::Percentile(99)),
+            0,
+        )
+        .unwrap();
+        assert_eq!(points.len(), 2);
+        assert!(matches!(
+            points[0].row.record.get("value"),
+            Some(Value::Float(1.0))
+        ));
+        assert!(!points[0].row.record.contains_key("overflow"));
+        assert!(matches!(
+            points[1].row.record.get("value"),
+            Some(Value::Null)
+        ));
+        assert!(matches!(
+            points[1].row.record.get("overflow"),
+            Some(Value::Bool(true))
+        ));
+
+        let empty = transform_metric_inputs(
+            vec![test_histogram_input(10, 0, 0)],
+            Some(Transform::Percentile(99)),
+            0,
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn percentile_overflow_propagates_through_aggregations() {
+        let points = transform_metric_inputs(
+            vec![
+                test_histogram_input(10, 100, 100),
+                test_histogram_input(20, 100, 98),
+            ],
+            Some(Transform::Percentile(99)),
+            0,
+        )
+        .unwrap();
+        let scalar = aggregate_points(&points, AggregateFunction::Avg, 20, true, None, 2, 0)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(scalar.record.get("value"), Some(Value::Null)));
+        assert!(matches!(
+            scalar.record.get("overflow"),
+            Some(Value::Bool(true))
+        ));
+
+        let windows = window_points(
+            points,
+            AggregateFunction::Avg,
+            100,
+            Some(Transform::Percentile(99)),
+            true,
+            None,
+            2,
+            0,
+        )
+        .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert!(matches!(windows[0].record.get("value"), Some(Value::Null)));
+        assert!(matches!(
+            windows[0].record.get("overflow"),
+            Some(Value::Bool(true))
+        ));
+    }
+
+    #[test]
     fn existence_ranges_are_half_open_merged_and_intersectable() {
         let ranges = existence_ranges(&[10, 15, 30], 0, 40, 5, 5);
         assert_eq!(
@@ -2996,5 +3121,30 @@ mod tests {
             number,
             histogram: None,
         }
+    }
+
+    fn test_histogram_input(timestamp: i64, total_count: u64, final_count: u64) -> MetricInput {
+        MetricInput {
+            row: test_row(timestamp, Value::Null),
+            number: 0.0,
+            histogram: Some(test_histogram(total_count, final_count)),
+        }
+    }
+
+    fn test_histogram(total_count: u64, final_count: u64) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer
+            .write_map(4)
+            .write_str("boundaries")
+            .write_array(1)
+            .write_float(1.0)
+            .write_str("counts")
+            .write_array(1)
+            .write_uint(final_count)
+            .write_str("total_count")
+            .write_uint(total_count)
+            .write_str("sum")
+            .write_float(0.0);
+        writer.to_bytes().unwrap()
     }
 }
