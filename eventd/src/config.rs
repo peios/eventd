@@ -60,6 +60,9 @@ pub struct Config {
     pub max_distinct_stream_values: usize,
     pub max_query_request_bytes: usize,
     pub query_response_target_bytes: usize,
+    pub adaptive_rollup_min_samples: usize,
+    pub adaptive_rollup_batch_rows: usize,
+    pub adaptive_rollup_max_rows: usize,
     pub cross_type_window: Duration,
     pub cross_type_max_lookback: Duration,
     pub adaptive_index_window: Duration,
@@ -266,6 +269,30 @@ impl Config {
                 16_777_216,
             ))
             .expect("QueryResponseTargetBytes fits usize"),
+            adaptive_rollup_min_samples: usize::try_from(dword(
+                values,
+                b"AdaptiveRollupMinSamples",
+                1_000,
+                100,
+                1_000_000,
+            ))
+            .expect("AdaptiveRollupMinSamples fits usize"),
+            adaptive_rollup_batch_rows: usize::try_from(dword(
+                values,
+                b"AdaptiveRollupBatchRows",
+                512,
+                16,
+                4_096,
+            ))
+            .expect("AdaptiveRollupBatchRows fits usize"),
+            adaptive_rollup_max_rows: usize::try_from(dword(
+                values,
+                b"AdaptiveRollupMaxRows",
+                100_000,
+                0,
+                10_000_000,
+            ))
+            .expect("AdaptiveRollupMaxRows fits usize"),
             cross_type_window: Duration::from_millis(u64::from(dword(
                 values,
                 b"CrossTypeWindowMs",
@@ -456,6 +483,24 @@ impl Config {
             b"QueryResponseTargetBytes",
             1_024,
             16_777_216
+        );
+        retain_invalid_dword!(
+            adaptive_rollup_min_samples,
+            b"AdaptiveRollupMinSamples",
+            100,
+            1_000_000
+        );
+        retain_invalid_dword!(
+            adaptive_rollup_batch_rows,
+            b"AdaptiveRollupBatchRows",
+            16,
+            4_096
+        );
+        retain_invalid_dword!(
+            adaptive_rollup_max_rows,
+            b"AdaptiveRollupMaxRows",
+            0,
+            10_000_000
         );
         retain_invalid_dword!(cross_type_window, b"CrossTypeWindowMs", 1_000, 300_000);
         retain_invalid_dword!(
@@ -707,6 +752,21 @@ impl Config {
         value!(
             query_response_target_bytes,
             "QueryResponseTargetBytes",
+            "REG_DWORD"
+        );
+        value!(
+            adaptive_rollup_min_samples,
+            "AdaptiveRollupMinSamples",
+            "REG_DWORD"
+        );
+        value!(
+            adaptive_rollup_batch_rows,
+            "AdaptiveRollupBatchRows",
+            "REG_DWORD"
+        );
+        value!(
+            adaptive_rollup_max_rows,
+            "AdaptiveRollupMaxRows",
             "REG_DWORD"
         );
         milliseconds!(cross_type_window, "CrossTypeWindowMs");
@@ -1185,6 +1245,27 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn adaptive_rollup_defaults_are_bounded_and_zero_disables_the_cache() {
+        let defaults = Config::test_defaults();
+        assert_eq!(defaults.adaptive_rollup_min_samples, 1_000);
+        assert_eq!(defaults.adaptive_rollup_batch_rows, 512);
+        assert_eq!(defaults.adaptive_rollup_max_rows, 100_000);
+
+        let mut values = defaults.raw_values;
+        values.insert(
+            b"AdaptiveRollupMaxRows".to_vec(),
+            dword_record(b"AdaptiveRollupMaxRows", 0),
+        );
+        values.insert(
+            b"AdaptiveRollupBatchRows".to_vec(),
+            dword_record(b"AdaptiveRollupBatchRows", 4_097),
+        );
+        let config = Config::from_values(&values).expect("configuration");
+        assert_eq!(config.adaptive_rollup_max_rows, 0);
+        assert_eq!(config.adaptive_rollup_batch_rows, 512);
     }
 
     #[test]

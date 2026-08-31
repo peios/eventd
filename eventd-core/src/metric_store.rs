@@ -35,7 +35,21 @@ CREATE TABLE metadata (
 CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);
 CREATE INDEX idx_series_name ON series(name);
 CREATE INDEX idx_series_label_hash ON series(label_hash);
-INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
+CREATE TABLE rollups (
+    series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    window_start INTEGER NOT NULL,
+    window_width INTEGER NOT NULL CHECK (window_width > 0),
+    transform INTEGER NOT NULL CHECK (transform IN (0, 1, 2, 50, 95, 99)),
+    function INTEGER NOT NULL CHECK (function BETWEEN 0 AND 3),
+    value REAL,
+    overflow INTEGER NOT NULL CHECK (overflow IN (0, 1)),
+    source_max_sample_id INTEGER NOT NULL CHECK (source_max_sample_id >= 0),
+    source_baseline_sample_id INTEGER CHECK (source_baseline_sample_id > 0),
+    CHECK (overflow = 0 OR value IS NULL),
+    PRIMARY KEY (series_id, window_start, window_width, transform, function)
+) WITHOUT ROWID;
+CREATE INDEX idx_rollups_window ON rollups(window_start);
+INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
 ";
@@ -101,6 +115,29 @@ pub struct MetricRecord {
     pub metric_type: MetricType,
     /// Measurement.
     pub value: MetricValue,
+}
+
+/// One query-computed, writer-committed metric window cache row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricRollup {
+    /// Owning metric series.
+    pub series_id: i64,
+    /// Epoch-aligned inclusive window start in nanoseconds.
+    pub window_start: i64,
+    /// Positive window width in nanoseconds.
+    pub window_width: i64,
+    /// Stable query-transform discriminator.
+    pub transform: i64,
+    /// Stable terminal-aggregation discriminator.
+    pub function: i64,
+    /// Finite result, or absent for an empty or overflowing window.
+    pub value: Option<f64>,
+    /// Whether the absent value represents percentile overflow.
+    pub overflow: bool,
+    /// Greatest in-window raw sample identifier observed by the query.
+    pub source_max_sample_id: i64,
+    /// Immediately preceding sample for pair transforms, with absence explicit.
+    pub source_baseline_sample_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -299,6 +336,26 @@ impl MetricStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let limit = i64::try_from(limit).map_err(|_| MetricStoreError::IntegerRange)?;
+        let selection = if older_than.is_some() {
+            "SELECT id FROM samples WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2"
+        } else {
+            "SELECT id FROM samples ORDER BY timestamp, id LIMIT ?1"
+        };
+        if let Some(cutoff) = older_than {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM rollups WHERE series_id IN (SELECT DISTINCT series_id FROM samples WHERE id IN ({selection}))"
+                ),
+                params![cutoff, limit],
+            )?;
+        } else {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM rollups WHERE series_id IN (SELECT DISTINCT series_id FROM samples WHERE id IN ({selection}))"
+                ),
+                [limit],
+            )?;
+        }
         let deleted = if let Some(cutoff) = older_than {
             transaction.execute(
                 "DELETE FROM samples WHERE id IN (SELECT id FROM samples WHERE timestamp < ?1 \
@@ -324,6 +381,61 @@ impl MetricStore {
         }
         self.checkpoint_if_needed()?;
         Ok(deleted)
+    }
+
+    /// Commit a bounded set of query-computed rollups and prune the oldest cache rows.
+    pub fn commit_rollups(
+        &mut self,
+        rows: &[MetricRollup],
+        max_rows: usize,
+    ) -> Result<usize, MetricStoreError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        if max_rows == 0 {
+            self.prune_rollups(0)?;
+            return Ok(0);
+        }
+        for row in rows {
+            validate_rollup(row)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut upsert = transaction.prepare_cached(
+                "INSERT INTO rollups (series_id, window_start, window_width, transform, function, value, overflow, source_max_sample_id, source_baseline_sample_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(series_id, window_start, window_width, transform, function) DO UPDATE SET \
+                 value=excluded.value, overflow=excluded.overflow, source_max_sample_id=excluded.source_max_sample_id, source_baseline_sample_id=excluded.source_baseline_sample_id",
+            )?;
+            for row in rows {
+                upsert.execute(params![
+                    row.series_id,
+                    row.window_start,
+                    row.window_width,
+                    row.transform,
+                    row.function,
+                    row.value,
+                    row.overflow,
+                    row.source_max_sample_id,
+                    row.source_baseline_sample_id,
+                ])?;
+            }
+        }
+        prune_rollups(&transaction, max_rows)?;
+        transaction.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Apply a live cache bound without adding or recomputing any rollup.
+    pub fn prune_rollups(&mut self, max_rows: usize) -> Result<(), MetricStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_rollups(&transaction, max_rows)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Ask the sole writer connection to perform a passive checkpoint.
@@ -505,7 +617,7 @@ const fn metric_type_from_sql(value: i64) -> Result<MetricType, MetricStoreError
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
-    let version: String = connection
+    let mut version: String = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'schema_version'",
             [],
@@ -517,7 +629,29 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
             }
             other => MetricStoreError::Sql(other),
         })?;
-    if version != "1" {
+    if version == "1" {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;\
+             CREATE TABLE rollups (\
+                 series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,\
+                 window_start INTEGER NOT NULL,\
+                 window_width INTEGER NOT NULL CHECK (window_width > 0),\
+                 transform INTEGER NOT NULL CHECK (transform IN (0, 1, 2, 50, 95, 99)),\
+                 function INTEGER NOT NULL CHECK (function BETWEEN 0 AND 3),\
+                 value REAL,\
+                 overflow INTEGER NOT NULL CHECK (overflow IN (0, 1)),\
+                 source_max_sample_id INTEGER NOT NULL CHECK (source_max_sample_id >= 0),\
+                 source_baseline_sample_id INTEGER CHECK (source_baseline_sample_id > 0),\
+                 CHECK (overflow = 0 OR value IS NULL),\
+                 PRIMARY KEY (series_id, window_start, window_width, transform, function)\
+             ) WITHOUT ROWID;\
+             CREATE INDEX idx_rollups_window ON rollups(window_start);\
+             UPDATE metadata SET value = '2' WHERE key = 'schema_version';\
+             COMMIT;",
+        )?;
+        "2".clone_into(&mut version);
+    }
+    if version != "2" {
         return Err(MetricStoreError::UnknownVersion(version));
     }
     for (kind, name) in [
@@ -527,6 +661,8 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
         ("index", "idx_samples_series_timestamp"),
         ("index", "idx_series_name"),
         ("index", "idx_series_label_hash"),
+        ("table", "rollups"),
+        ("index", "idx_rollups_window"),
     ] {
         let exists: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
@@ -538,6 +674,42 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
                 "required schema object is missing",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_rollup(row: &MetricRollup) -> Result<(), MetricStoreError> {
+    if row.series_id <= 0
+        || row.window_width <= 0
+        || row.window_start.rem_euclid(row.window_width) != 0
+        || !matches!(row.transform, 0 | 1 | 2 | 50 | 95 | 99)
+        || !(0..=3).contains(&row.function)
+        || row.source_max_sample_id < 0
+        || row.source_baseline_sample_id.is_some_and(|id| id <= 0)
+        || row.value.is_some_and(|value| !value.is_finite())
+        || (row.overflow && row.value.is_some())
+        || (row.overflow && !matches!(row.transform, 50 | 95 | 99))
+        || (!matches!(row.transform, 1 | 2) && row.source_baseline_sample_id.is_some())
+    {
+        return Err(MetricStoreError::InvalidRollup);
+    }
+    Ok(())
+}
+
+fn prune_rollups(transaction: &Transaction<'_>, max_rows: usize) -> Result<(), MetricStoreError> {
+    let max_rows = i64::try_from(max_rows).map_err(|_| MetricStoreError::IntegerRange)?;
+    if max_rows == 0 {
+        transaction.execute("DELETE FROM rollups", [])?;
+        return Ok(());
+    }
+    let count: i64 = transaction.query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))?;
+    let excess = count.saturating_sub(max_rows);
+    if excess != 0 {
+        transaction.execute(
+            "DELETE FROM rollups WHERE (series_id, window_start, window_width, transform, function) IN \
+             (SELECT series_id, window_start, window_width, transform, function FROM rollups ORDER BY window_start LIMIT ?1)",
+            [excess],
+        )?;
     }
     Ok(())
 }
@@ -577,6 +749,8 @@ pub enum MetricStoreError {
     UnknownVersion(String),
     /// Retention batch size exceeds `SQLite`'s integer range.
     IntegerRange,
+    /// A query submitted an internally inconsistent adaptive-rollup row.
+    InvalidRollup,
 }
 
 impl MetricStoreError {
@@ -618,6 +792,7 @@ impl fmt::Display for MetricStoreError {
             Self::IntegerRange => {
                 formatter.write_str("metric retention batch size exceeds SQLite range")
             }
+            Self::InvalidRollup => formatter.write_str("query submitted an invalid metric rollup"),
         }
     }
 }
@@ -627,7 +802,10 @@ impl std::error::Error for MetricStoreError {
         match self {
             Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSchema(_) | Self::UnknownVersion(_) | Self::IntegerRange => None,
+            Self::InvalidSchema(_)
+            | Self::UnknownVersion(_)
+            | Self::IntegerRange
+            | Self::InvalidRollup => None,
         }
     }
 }
@@ -725,6 +903,119 @@ mod tests {
             .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollups_are_bounded_and_retention_invalidates_their_series() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        let rollup = |window_start, value| MetricRollup {
+            series_id: 1,
+            window_start,
+            window_width: 10,
+            transform: 0,
+            function: 0,
+            value: Some(value),
+            overflow: false,
+            source_max_sample_id: 1,
+            source_baseline_sample_id: None,
+        };
+        store
+            .commit_rollups(&[rollup(0, 1.0), rollup(10, 2.0)], 1)
+            .unwrap();
+        let retained: (u32, i64) = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*), MIN(window_start) FROM rollups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (1, 10));
+
+        assert_eq!(store.retain_oldest(Some(11), 10).unwrap(), 1);
+        let remaining: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_rollup_state_before_writing() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        let invalid = MetricRollup {
+            series_id: 1,
+            window_start: 1,
+            window_width: 10,
+            transform: 0,
+            function: 0,
+            value: Some(f64::INFINITY),
+            overflow: true,
+            source_max_sample_id: 1,
+            source_baseline_sample_id: Some(1),
+        };
+        assert!(matches!(
+            store.commit_rollups(&[invalid], 10),
+            Err(MetricStoreError::InvalidRollup)
+        ));
+        let remaining: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn opens_and_migrates_a_version_one_store() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE series(id INTEGER PRIMARY KEY, name TEXT, labels TEXT, type INTEGER, label_hash INTEGER, boundaries_hash INTEGER, boundaries BLOB);\
+                 CREATE TABLE samples(id INTEGER PRIMARY KEY, series_id INTEGER, boot_id BLOB, timestamp INTEGER, value REAL, histogram_data BLOB);\
+                 CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;\
+                 CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);\
+                 CREATE INDEX idx_series_name ON series(name);\
+                 CREATE INDEX idx_series_label_hash ON series(label_hash);\
+                 INSERT INTO metadata VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = MetricStore::open(&path, 1_000, 10).unwrap();
+        let version: String = store
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        let exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='rollups')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

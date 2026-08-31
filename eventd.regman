@@ -369,6 +369,35 @@ applies: live
 Soft result batching target. One complete record may exceed it and is never
 split or truncated.
 
+--- machine\system\eventd adaptiverollupminsamples
+canonical: Machine\System\eventd AdaptiveRollupMinSamples
+type: REG_DWORD
+default: 1000
+valid: 100 to 1000000
+applies: live
+
+Minimum raw samples an eligible window query must scan before it may seed the
+adaptive rollup cache.
+
+--- machine\system\eventd adaptiverollupbatchrows
+canonical: Machine\System\eventd AdaptiveRollupBatchRows
+type: REG_DWORD
+default: 512
+valid: 16 to 4096
+applies: live
+
+Maximum query-computed rollup rows submitted in one bounded writer command.
+
+--- machine\system\eventd adaptiverollupmaxrows
+canonical: Machine\System\eventd AdaptiveRollupMaxRows
+type: REG_DWORD
+default: 100000
+valid: 0 to 10000000
+applies: live
+
+Maximum rows retained in the adaptive rollup cache. Zero disables rollup reads
+and writes without changing metric-query results.
+
 --- machine\system\eventd crosstypewindowms
 canonical: Machine\System\eventd CrossTypeWindowMs
 type: REG_DWORD

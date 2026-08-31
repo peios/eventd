@@ -19,8 +19,8 @@ pub use field::{field_guid, payload_index_name, valid_field_path};
 pub use log_store::{LogRecord, LogStore, LogStoreError};
 pub use meta_store::{DesiredIndex, IndexCounter, MetaStore, MetaStoreError};
 pub use metric_store::{
-    Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError, MetricType,
-    MetricTypeMismatch, MetricValue,
+    Histogram, MetricCommitStats, MetricRecord, MetricRollup, MetricStore, MetricStoreError,
+    MetricType, MetricTypeMismatch, MetricValue,
 };
 pub use model::{Gap, Guid, IngestItem, RealEvent, SyntheticEvent};
 pub use payload_index::{PayloadIndexValue, query_key as payload_query_key};

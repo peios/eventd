@@ -21,6 +21,7 @@ use peios::msgpack::{Reader, Type, Writer};
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
 use crate::indexing::{PolicyMessage, Tracker};
+use crate::metric_ingest::RollupMaintenance;
 use crate::query_language::{RecordAggregate, Source};
 
 pub use executor::{Limits, Stores};
@@ -38,6 +39,7 @@ pub struct ServerConfig {
     pub runtime: SharedConfig,
     pub index_tracker: Arc<Tracker>,
     pub index_policy: SyncSender<PolicyMessage>,
+    pub rollups: SyncSender<RollupMaintenance>,
     pub descriptors: Arc<DescriptorCache>,
 }
 
@@ -49,6 +51,9 @@ struct QueryTuning {
     timeout: Duration,
     cross_type_window: Duration,
     cross_type_max_lookback: Duration,
+    adaptive_rollup_min_samples: usize,
+    adaptive_rollup_batch_rows: usize,
+    adaptive_rollup_max_rows: usize,
 }
 
 impl From<&Config> for QueryTuning {
@@ -61,6 +66,9 @@ impl From<&Config> for QueryTuning {
             timeout: config.query_timeout,
             cross_type_window: config.cross_type_window,
             cross_type_max_lookback: config.cross_type_max_lookback,
+            adaptive_rollup_min_samples: config.adaptive_rollup_min_samples,
+            adaptive_rollup_batch_rows: config.adaptive_rollup_batch_rows,
+            adaptive_rollup_max_rows: config.adaptive_rollup_max_rows,
         }
     }
 }
@@ -273,6 +281,10 @@ fn handle(
                 deadline,
                 cross_type_window: tuning.cross_type_window,
                 cross_type_max_lookback: tuning.cross_type_max_lookback,
+                rollups: Some(config.rollups.clone()),
+                adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
+                adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
+                adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
             },
         )
         .map(|(records, state)| (records, Some(state)))
@@ -285,6 +297,10 @@ fn handle(
                 deadline,
                 cross_type_window: tuning.cross_type_window,
                 cross_type_max_lookback: tuning.cross_type_max_lookback,
+                rollups: Some(config.rollups.clone()),
+                adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
+                adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
+                adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
             },
         )
         .map(|records| (records, None))

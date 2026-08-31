@@ -4,12 +4,15 @@ use core::cmp::Ordering;
 use core::fmt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use eventd_core::MetricRollup;
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::security::{Authorizer, Namespace};
 use super::value::{Record, Value, ascii_equal, flatten_event_payload, guid_string, language_cmp};
+use crate::metric_ingest::RollupMaintenance;
 use crate::query_language::{
     AggregateFunction, CrossFilter, Expr, GroupFunction, Literal, MetricAggregate, Operator, Query,
     RecordAggregate, Source, TimeExpr, Transform,
@@ -25,6 +28,10 @@ pub struct Limits {
     pub deadline: Instant,
     pub cross_type_window: Duration,
     pub cross_type_max_lookback: Duration,
+    pub rollups: Option<SyncSender<RollupMaintenance>>,
+    pub adaptive_rollup_min_samples: usize,
+    pub adaptive_rollup_batch_rows: usize,
+    pub adaptive_rollup_max_rows: usize,
 }
 
 pub struct StreamState {
@@ -67,6 +74,7 @@ pub fn execute(
         limits.cross_type_window,
         limits.cross_type_max_lookback,
         &mut authorization,
+        Some(limits),
     )
 }
 
@@ -95,6 +103,7 @@ pub fn start_stream(
         limits.cross_type_window,
         limits.cross_type_max_lookback,
         &mut authorization,
+        Some(limits),
     )?;
     Ok((
         records,
@@ -134,6 +143,7 @@ pub fn stream_next(
         state.cross_type_window,
         state.cross_type_max_lookback,
         &mut state.authorization,
+        None,
     )?;
     state.cursor = upper;
     Ok(records)
@@ -156,6 +166,7 @@ fn execute_at(
     cross_type_window: Duration,
     cross_type_max_lookback: Duration,
     authorization: &mut AuthorizationCache,
+    rollup_limits: Option<&Limits>,
 ) -> Result<Vec<Record>, QueryError> {
     let (since, mut until) = time_range(query, evaluation_time)?;
     if watch {
@@ -241,6 +252,7 @@ fn execute_at(
                 deadline,
                 historical_ranges.as_deref(),
                 authorization,
+                rollup_limits,
             );
         }
     };
@@ -1773,6 +1785,7 @@ fn execute_metric(
     deadline: Option<Instant>,
     cross_ranges: Option<&[TimeRange]>,
     authorization: &mut AuthorizationCache,
+    rollup_limits: Option<&Limits>,
 ) -> Result<Vec<Record>, QueryError> {
     let connection = open_read_only(path, deadline)?;
     let referenced = referenced_fields(query);
@@ -1826,6 +1839,24 @@ fn execute_metric(
         && !matches!(query.metric_aggregate, Some(MetricAggregate::Window(_, _)))
     {
         return Err(QueryError::MetricNeedsWindow);
+    }
+    if let Some(mut output) = execute_rollup_window_query(
+        &connection,
+        &series,
+        query,
+        name_pattern,
+        first_type,
+        bracketed,
+        since,
+        until,
+        authorizer,
+        &referenced,
+        authorization,
+        rollup_limits,
+    )? {
+        sort_metric_rows(&mut output, query);
+        apply_pagination(&mut output, query);
+        return Ok(output.into_iter().map(|row| row.record).collect());
     }
     let mut resolved = Vec::with_capacity(series_count);
     for (series_id, name, metric_type, label_map) in series {
@@ -1885,6 +1916,386 @@ fn execute_metric(
     sort_metric_rows(&mut output, query);
     apply_pagination(&mut output, query);
     Ok(output.into_iter().map(|row| row.record).collect())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the rollup fast path keeps query, authorization and cache policy explicit"
+)]
+fn execute_rollup_window_query(
+    connection: &Connection,
+    series: &[(i64, String, i64, Record)],
+    query: &Query,
+    output_name: &str,
+    metric_type: i64,
+    bracketed: bool,
+    since: i64,
+    until: i64,
+    authorizer: &Authorizer,
+    referenced: &[String],
+    authorization: &mut AuthorizationCache,
+    limits: Option<&Limits>,
+) -> Result<Option<Vec<Row>>, QueryError> {
+    let Some(limits) = limits else {
+        return Ok(None);
+    };
+    let Some(MetricAggregate::Window(function, width)) = query.metric_aggregate else {
+        return Ok(None);
+    };
+    if limits.adaptive_rollup_max_rows == 0
+        || query.since.is_none()
+        || !query.predicates.is_empty()
+        || !query.cross_filters.is_empty()
+        || (!bracketed && series.len() != 1)
+    {
+        return Ok(None);
+    }
+    let width = i64::try_from(width).map_err(|_| QueryError::InvalidTime)?;
+    let first_full = if since.rem_euclid(width) == 0 {
+        since
+    } else {
+        since
+            .div_euclid(width)
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(width))
+            .ok_or(QueryError::InvalidTime)?
+    };
+    let full_end = until
+        .div_euclid(width)
+        .checked_mul(width)
+        .ok_or(QueryError::InvalidTime)?;
+    if first_full >= full_end {
+        return Ok(None);
+    }
+    let transform = transform_code(query.transform);
+    let function_code = aggregate_code(function);
+    let expected = usize::try_from(
+        full_end
+            .checked_sub(first_full)
+            .ok_or(QueryError::InvalidTime)?
+            / width,
+    )
+    .map_err(|_| QueryError::InvalidTime)?;
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    for (series_id, name, _, labels) in series {
+        check_deadline(Some(limits.deadline))?;
+        let cached = read_valid_rollups(
+            connection,
+            *series_id,
+            first_full,
+            full_end,
+            width,
+            transform,
+            function_code,
+        )?;
+        let complete = cached.len() == expected;
+        let mut template = metric_template(name, metric_type, labels)?;
+        if !authorize_row(
+            authorizer,
+            Namespace::Metrics,
+            &mut template,
+            referenced,
+            authorization,
+        )? {
+            continue;
+        }
+        if complete {
+            for cached in cached.values() {
+                if let Some(value) = cached.value {
+                    output.push(metric_aggregate_row(
+                        &template,
+                        Value::Float(value),
+                        cached.window_start,
+                        true,
+                        if bracketed { name } else { output_name },
+                        metric_type,
+                        *series_id,
+                    )?);
+                } else if cached.overflow {
+                    output.push(metric_aggregate_row(
+                        &template,
+                        Value::Null,
+                        cached.window_start,
+                        true,
+                        if bracketed { name } else { output_name },
+                        metric_type,
+                        *series_id,
+                    )?);
+                }
+            }
+            for (lower, upper) in [(since, first_full), (full_end, until)] {
+                if lower < upper {
+                    let inputs = read_metric_range(
+                        connection,
+                        *series_id,
+                        name,
+                        metric_type,
+                        labels,
+                        lower,
+                        upper,
+                        query.transform,
+                        authorizer,
+                        referenced,
+                        authorization,
+                    )?;
+                    let points = transform_metric_inputs(inputs, query.transform, lower)?;
+                    output.extend(window_points(
+                        points,
+                        function,
+                        u64::try_from(width).map_err(|_| QueryError::InvalidTime)?,
+                        query.transform,
+                        true,
+                        Some(if bracketed { name } else { output_name }),
+                        metric_type,
+                        *series_id,
+                    )?);
+                }
+            }
+            continue;
+        }
+
+        let inputs = read_metric_range(
+            connection,
+            *series_id,
+            name,
+            metric_type,
+            labels,
+            since,
+            until,
+            query.transform,
+            authorizer,
+            referenced,
+            authorization,
+        )?;
+        let rollup_sources = inputs
+            .iter()
+            .map(|input| (timestamp(&input.row), row_id(&input.row)))
+            .collect::<Vec<_>>();
+        let points = transform_metric_inputs(inputs, query.transform, since)?;
+        let rows = window_points(
+            points,
+            function,
+            u64::try_from(width).map_err(|_| QueryError::InvalidTime)?,
+            query.transform,
+            true,
+            Some(if bracketed { name } else { output_name }),
+            metric_type,
+            *series_id,
+        )?;
+        if rollup_sources.len() >= limits.adaptive_rollup_min_samples {
+            let by_start: HashMap<_, _> = rows.iter().map(|row| (timestamp(row), row)).collect();
+            let mut start = first_full;
+            let mut source_index = 0;
+            let mut preceding_id = None;
+            while start < full_end && pending.len() < limits.adaptive_rollup_batch_rows {
+                let end = start.checked_add(width).ok_or(QueryError::InvalidTime)?;
+                let (source_max_sample_id, baseline_id) = advance_rollup_sources(
+                    &rollup_sources,
+                    &mut source_index,
+                    &mut preceding_id,
+                    start,
+                    end,
+                );
+                if !cached.contains_key(&start) {
+                    let source_baseline_sample_id =
+                        if matches!(query.transform, Some(Transform::Rate | Transform::Delta)) {
+                            baseline_id
+                        } else {
+                            None
+                        };
+                    let row = by_start.get(&start).copied();
+                    let overflow = row.is_some_and(|row| {
+                        matches!(row.record.get("overflow"), Some(Value::Bool(true)))
+                    });
+                    let value = row.and_then(|row| match row.record.get("value") {
+                        Some(Value::Float(value)) => Some(*value),
+                        _ => None,
+                    });
+                    pending.push(MetricRollup {
+                        series_id: *series_id,
+                        window_start: start,
+                        window_width: width,
+                        transform,
+                        function: function_code,
+                        value,
+                        overflow,
+                        source_max_sample_id,
+                        source_baseline_sample_id,
+                    });
+                }
+                start = start.checked_add(width).ok_or(QueryError::InvalidTime)?;
+            }
+        }
+        output.extend(rows);
+    }
+    if !pending.is_empty()
+        && let Some(sender) = &limits.rollups
+    {
+        let _ = sender.try_send(RollupMaintenance { rows: pending });
+    }
+    Ok(Some(output))
+}
+
+fn advance_rollup_sources(
+    sources: &[(i64, i64)],
+    index: &mut usize,
+    preceding_id: &mut Option<i64>,
+    start: i64,
+    end: i64,
+) -> (i64, Option<i64>) {
+    while *index < sources.len() && sources[*index].0 < start {
+        *preceding_id = Some(sources[*index].1);
+        *index += 1;
+    }
+    let baseline_id = *preceding_id;
+    let mut source_max_sample_id = 0;
+    while *index < sources.len() && sources[*index].0 < end {
+        source_max_sample_id = source_max_sample_id.max(sources[*index].1);
+        *preceding_id = Some(sources[*index].1);
+        *index += 1;
+    }
+    (source_max_sample_id, baseline_id)
+}
+
+#[derive(Debug)]
+struct CachedRollup {
+    window_start: i64,
+    value: Option<f64>,
+    overflow: bool,
+}
+
+fn read_valid_rollups(
+    connection: &Connection,
+    series_id: i64,
+    first: i64,
+    end: i64,
+    width: i64,
+    transform: i64,
+    function: i64,
+) -> Result<HashMap<i64, CachedRollup>, QueryError> {
+    let pair = matches!(transform, 1 | 2);
+    let mut statement = connection.prepare(
+        "SELECT r.window_start, r.value, r.overflow FROM rollups r \
+         WHERE r.series_id=?1 AND r.window_start>=?2 AND r.window_start<?3 \
+         AND r.window_width=?4 AND r.transform=?5 AND r.function=?6 \
+         AND NOT EXISTS (SELECT 1 FROM samples s WHERE s.series_id=r.series_id \
+             AND s.timestamp>=r.window_start AND s.timestamp<r.window_start+r.window_width \
+             AND s.id>r.source_max_sample_id) \
+         AND (?7=0 OR r.source_baseline_sample_id IS \
+             (SELECT s.id FROM samples s WHERE s.series_id=r.series_id \
+              AND s.timestamp<r.window_start ORDER BY s.timestamp DESC, s.id DESC LIMIT 1))",
+    )?;
+    let mut rows = statement.query(params![
+        series_id, first, end, width, transform, function, pair
+    ])?;
+    let mut output = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let cached = CachedRollup {
+            window_start: row.get(0)?,
+            value: row.get(1)?,
+            overflow: row.get(2)?,
+        };
+        if cached.value.is_some_and(|value| !value.is_finite()) {
+            continue;
+        }
+        output.insert(cached.window_start, cached);
+    }
+    Ok(output)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "metric range reads preserve the authorized query context"
+)]
+fn read_metric_range(
+    connection: &Connection,
+    series_id: i64,
+    name: &str,
+    metric_type: i64,
+    labels: &Record,
+    since: i64,
+    until: i64,
+    transform: Option<Transform>,
+    authorizer: &Authorizer,
+    referenced: &[String],
+    authorization: &mut AuthorizationCache,
+) -> Result<Vec<MetricInput>, QueryError> {
+    let mut inputs = Vec::new();
+    if matches!(transform, Some(Transform::Rate | Transform::Delta)) && since > i64::MIN {
+        let mut preceding = connection.prepare(
+            "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
+             WHERE series_id=?1 AND timestamp<?2 ORDER BY timestamp DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = preceding.query(params![series_id, since])?;
+        if let Some(sample) = rows.next()? {
+            inputs.push(read_metric_input(sample, name, metric_type, labels)?);
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
+         WHERE series_id=?1 AND timestamp>=?2 AND timestamp<?3 ORDER BY timestamp ASC, id ASC",
+    )?;
+    let mut rows = statement.query(params![series_id, since, until])?;
+    while let Some(sample) = rows.next()? {
+        inputs.push(read_metric_input(sample, name, metric_type, labels)?);
+    }
+    let mut visible = Vec::with_capacity(inputs.len());
+    for mut input in inputs {
+        if authorize_row(
+            authorizer,
+            Namespace::Metrics,
+            &mut input.row,
+            referenced,
+            authorization,
+        )? {
+            visible.push(input);
+        }
+    }
+    Ok(visible)
+}
+
+fn metric_template(name: &str, metric_type: i64, labels: &Record) -> Result<Row, QueryError> {
+    let mut record = labels.clone();
+    record.insert("timestamp".into(), Value::Signed(0));
+    record.insert("boot_id".into(), Value::Null);
+    record.insert("name".into(), Value::String(name.to_owned()));
+    record.insert(
+        "type".into(),
+        Value::String(metric_type_name(metric_type)?.into()),
+    );
+    record.insert("value".into(), Value::Null);
+    Ok(Row {
+        record,
+        identifier: name.to_owned(),
+        tie: Tie::Single(0),
+    })
+}
+
+const fn transform_code(transform: Option<Transform>) -> i64 {
+    match transform {
+        None => 0,
+        Some(Transform::Rate) => 1,
+        Some(Transform::Delta) => 2,
+        Some(Transform::Percentile(value)) => value as i64,
+    }
+}
+
+const fn aggregate_code(function: AggregateFunction) -> i64 {
+    match function {
+        AggregateFunction::Avg => 0,
+        AggregateFunction::Min => 1,
+        AggregateFunction::Max => 2,
+        AggregateFunction::Sum => 3,
+    }
+}
+
+const fn row_id(row: &Row) -> i64 {
+    match row.tie {
+        Tie::Single(id) => id,
+        Tie::Event { .. } => unreachable!(),
+    }
 }
 
 #[derive(Debug)]
@@ -2895,6 +3306,93 @@ mod tests {
             rows[0].record.get("value"),
             Some(Value::Float(value)) if (*value - 10.0).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn rollup_validation_detects_new_inputs_and_changed_baselines() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE samples(id INTEGER PRIMARY KEY, series_id INTEGER, timestamp INTEGER);\
+                 CREATE TABLE rollups(\
+                    series_id INTEGER, window_start INTEGER, window_width INTEGER,\
+                    transform INTEGER, function INTEGER, value REAL, overflow INTEGER,\
+                    source_max_sample_id INTEGER, source_baseline_sample_id INTEGER);\
+                 INSERT INTO samples VALUES (1, 1, 5), (2, 1, 12);\
+                 INSERT INTO rollups VALUES (1, 10, 10, 0, 0, 4.0, 0, 2, NULL);\
+                 INSERT INTO rollups VALUES (1, 10, 10, 1, 0, 2.0, 0, 2, 1);",
+            )
+            .unwrap();
+        assert_eq!(
+            read_valid_rollups(&connection, 1, 10, 20, 10, 0, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read_valid_rollups(&connection, 1, 10, 20, 10, 1, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        connection
+            .execute("INSERT INTO samples VALUES (3, 1, 7)", [])
+            .unwrap();
+        assert!(
+            read_valid_rollups(&connection, 1, 10, 20, 10, 1, 0)
+                .unwrap()
+                .is_empty()
+        );
+        connection
+            .execute("INSERT INTO samples VALUES (4, 1, 15)", [])
+            .unwrap();
+        assert!(
+            read_valid_rollups(&connection, 1, 10, 20, 10, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rollup_source_proofs_advance_once_and_keep_the_pre_window_baseline() {
+        let sources = [(5, 8), (10, 10), (10, 11), (18, 9), (25, 12)];
+        let mut index = 0;
+        let mut preceding = None;
+        assert_eq!(
+            advance_rollup_sources(&sources, &mut index, &mut preceding, 10, 20),
+            (11, Some(8))
+        );
+        assert_eq!(index, 4);
+        assert_eq!(
+            advance_rollup_sources(&sources, &mut index, &mut preceding, 20, 30),
+            (12, Some(9))
+        );
+        assert_eq!(index, sources.len());
+    }
+
+    #[test]
+    fn rollup_validation_preserves_empty_and_overflow_windows_but_rejects_nonfinite_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE samples(id INTEGER PRIMARY KEY, series_id INTEGER, timestamp INTEGER);\
+                 CREATE TABLE rollups(\
+                    series_id INTEGER, window_start INTEGER, window_width INTEGER,\
+                    transform INTEGER, function INTEGER, value REAL, overflow INTEGER,\
+                    source_max_sample_id INTEGER, source_baseline_sample_id INTEGER);\
+                 INSERT INTO rollups VALUES (1, 0, 10, 0, 0, NULL, 0, 0, NULL);\
+                 INSERT INTO rollups VALUES (1, 10, 10, 99, 0, NULL, 1, 0, NULL);\
+                 INSERT INTO rollups VALUES (1, 20, 10, 0, 0, 1e999, 0, 0, NULL);",
+            )
+            .unwrap();
+
+        let ordinary = read_valid_rollups(&connection, 1, 0, 30, 10, 0, 0).unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(ordinary.contains_key(&0));
+        let percentile = read_valid_rollups(&connection, 1, 0, 30, 10, 99, 0).unwrap();
+        assert_eq!(percentile.len(), 1);
+        assert!(percentile.get(&10).is_some_and(|row| row.overflow));
     }
 
     #[test]

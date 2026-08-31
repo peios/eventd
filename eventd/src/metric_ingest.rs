@@ -8,8 +8,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
-    BoundedQueue, Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError,
-    MetricType, MetricValue,
+    BoundedQueue, Histogram, MetricCommitStats, MetricRecord, MetricRollup, MetricStore,
+    MetricStoreError, MetricType, MetricValue,
 };
 use peios::msgpack::{Reader, Type};
 
@@ -26,6 +26,10 @@ pub enum MetricMaintenance {
         response: SyncSender<Result<usize, String>>,
     },
     Checkpoint(SyncSender<Result<usize, String>>),
+}
+
+pub struct RollupMaintenance {
+    pub rows: Vec<MetricRollup>,
 }
 
 #[derive(Default)]
@@ -85,6 +89,7 @@ pub fn run(
     runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     maintenance: &Receiver<MetricMaintenance>,
+    rollups: &Receiver<RollupMaintenance>,
     retention_requested: &Arc<AtomicBool>,
     descriptors: Arc<DescriptorCache>,
 ) -> Result<(), MetricIngestError> {
@@ -103,6 +108,7 @@ pub fn run(
     let mut started = None;
     let mut last_authorization_error = None;
     let mut type_mismatch_reporter = TypeMismatchReporter::default();
+    let mut applied_rollup_max_rows = None;
     while !stopping.load(Ordering::Acquire) {
         let (
             max_batch_size,
@@ -111,6 +117,7 @@ pub fn run(
             cache_size,
             next_ceiling,
             next_authorization_cache_size,
+            rollup_max_rows,
         ) = Config::read(runtime, |config| {
             (
                 config.metric_max_batch_size,
@@ -119,6 +126,7 @@ pub fn run(
                 config.metric_series_cache_size,
                 config.max_metric_datagram_bytes,
                 config.metric_authorization_cache_size,
+                config.adaptive_rollup_max_rows,
             )
         });
         store.configure(checkpoint_pages, cache_size);
@@ -128,7 +136,7 @@ pub fn run(
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
-        match socket.receive_token(&mut buffer)? {
+        let idle = match socket.receive_token(&mut buffer)? {
             TokenReceive::Datagram {
                 length,
                 token: Some(token),
@@ -170,12 +178,20 @@ pub fn run(
                         started = None;
                     }
                 }
+                false
             }
             TokenReceive::Datagram { token: None, .. } => {
                 crate::diagnostics::metric_missing_identity();
+                false
             }
-            TokenReceive::Truncated => crate::diagnostics::metric_truncated(),
-            TokenReceive::Empty if batch.is_empty() => socket.wait_readable(1_000)?,
+            TokenReceive::Truncated => {
+                crate::diagnostics::metric_truncated();
+                false
+            }
+            TokenReceive::Empty if batch.is_empty() => {
+                socket.wait_readable(1_000)?;
+                true
+            }
             TokenReceive::Empty => {
                 commit_batch(
                     &mut store,
@@ -187,8 +203,9 @@ pub fn run(
                 )?;
                 batch.clear();
                 started = None;
+                true
             }
-        }
+        };
         process_maintenance(
             &mut store,
             maintenance,
@@ -196,6 +213,19 @@ pub fn run(
             boot_id,
             error_events,
         )?;
+        if idle
+            && process_rollups(
+                &mut store,
+                rollups,
+                rollup_max_rows,
+                applied_rollup_max_rows != Some(rollup_max_rows),
+                retention_requested,
+                boot_id,
+                error_events,
+            )?
+        {
+            applied_rollup_max_rows = Some(rollup_max_rows);
+        }
     }
     loop {
         let max_batch_size = Config::read(runtime, |config| config.metric_max_batch_size);
@@ -249,6 +279,43 @@ pub fn run(
         )?;
     }
     Ok(())
+}
+
+fn process_rollups(
+    store: &mut MetricStore,
+    receiver: &Receiver<RollupMaintenance>,
+    max_rows: usize,
+    limit_changed: bool,
+    retention_requested: &AtomicBool,
+    boot_id: [u8; 16],
+    error_events: &BoundedQueue<WriterMessage>,
+) -> Result<bool, MetricIngestError> {
+    let command = match receiver.try_recv() {
+        Ok(command) if max_rows != 0 => Some(command),
+        Ok(_) | Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+    };
+    let result = if let Some(command) = command {
+        store.commit_rollups(&command.rows, max_rows).map(|_| ())
+    } else if limit_changed {
+        store.prune_rollups(max_rows)
+    } else {
+        return Ok(true);
+    };
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_capacity() => {
+            request_retention(retention_requested, &error);
+            Ok(false)
+        }
+        Err(error) if error.is_corruption() => {
+            recover_corruption(store, boot_id, error_events, &error)?;
+            Ok(false)
+        }
+        Err(error) => {
+            eprintln!("eventd: adaptive rollup cache write failed: {error}");
+            Ok(false)
+        }
+    }
 }
 
 fn process_maintenance(

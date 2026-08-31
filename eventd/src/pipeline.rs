@@ -250,6 +250,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_runtime = Arc::clone(&runtime);
     let metric_retention_requested = Arc::clone(&retention_requested);
     let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
+    let (rollup_sender, rollup_receiver) = sync_channel(8);
     let metric_thread_socket = Arc::clone(&metric_socket);
     let metric_error_events = queues[0].clone();
     let metric_descriptors = Arc::clone(&descriptors);
@@ -264,6 +265,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &metric_runtime,
                 &metric_stopping,
                 &metric_maintenance_receiver,
+                &rollup_receiver,
                 &metric_retention_requested,
                 metric_descriptors,
             )
@@ -339,6 +341,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime: Arc::clone(&runtime),
         index_tracker,
         index_policy: index_policy_sender.clone(),
+        rollups: rollup_sender,
         descriptors,
     });
     let query_stopping = Arc::clone(&stopping);
