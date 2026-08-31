@@ -3,7 +3,7 @@
 format = "peipkg"
 
 [package]
-# Revision 6 diagnoses immutable metric type conflicts.
-version      = "{{version}}-6"
+# Revision 7 guarantees the PSPU portable ingestion datagram floor.
+version      = "{{version}}-7"
 architecture = "x86_64"
 license      = "MIT"
