@@ -3,7 +3,7 @@
 format = "peipkg"
 
 [package]
-# Revision 7 guarantees the PSPU portable ingestion datagram floor.
-version      = "{{version}}-7"
+# Revision 8 exposes histogram percentile overflow as an explicit result.
+version      = "{{version}}-8"
 architecture = "x86_64"
 license      = "MIT"
