@@ -52,6 +52,18 @@ pub enum MetricType {
     Histogram = 2,
 }
 
+impl MetricType {
+    /// Stable PSPU wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+        }
+    }
+}
+
 /// A validated histogram sample.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Histogram {
@@ -197,6 +209,8 @@ impl MetricStore {
             return Ok(MetricCommitStats::default());
         }
         let mut accepted = 0;
+        let mut type_mismatches = 0;
+        let mut last_type_mismatch = None;
         let mut pending = HashMap::<SeriesKey, SeriesInfo>::new();
         let mut cache_after_commit = Vec::new();
         let transaction = self
@@ -221,6 +235,8 @@ impl MetricStore {
                     info
                 };
                 if info.metric_type != record.metric_type {
+                    type_mismatches += 1;
+                    last_type_mismatch = Some((record, info.metric_type));
                     continue;
                 }
                 let (number, histogram_data) = match &record.value {
@@ -251,7 +267,12 @@ impl MetricStore {
         }
         Ok(MetricCommitStats {
             accepted,
-            type_mismatches: records.len() - accepted,
+            type_mismatches,
+            last_type_mismatch: last_type_mismatch.map(|(record, expected)| MetricTypeMismatch {
+                name: record.name.clone(),
+                expected,
+                received: record.metric_type,
+            }),
         })
     }
 
@@ -522,12 +543,25 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
 }
 
 /// Outcome of one metric transaction.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricCommitStats {
     /// Samples inserted.
     pub accepted: usize,
     /// Samples silently discarded for immutable-type disagreement.
     pub type_mismatches: usize,
+    /// Most recently encountered disagreement in this transaction.
+    pub last_type_mismatch: Option<MetricTypeMismatch>,
+}
+
+/// Actionable detail for one immutable-series-type disagreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricTypeMismatch {
+    /// Concrete metric name.
+    pub name: Box<str>,
+    /// Type fixed when the series was created.
+    pub expected: MetricType,
+    /// Type declared by the discarded sample.
+    pub received: MetricType,
 }
 
 /// Metric-store failure.
@@ -633,6 +667,14 @@ mod tests {
             .unwrap();
         assert_eq!(stats.accepted, 2);
         assert_eq!(stats.type_mismatches, 1);
+        assert_eq!(
+            stats.last_type_mismatch,
+            Some(MetricTypeMismatch {
+                name: "test.metric".into(),
+                expected: MetricType::Gauge,
+                received: MetricType::Counter,
+            })
+        );
         let counts: (u32, u32) = store
             .connection
             .query_row(

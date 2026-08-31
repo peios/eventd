@@ -3,6 +3,8 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 
+use eventd_core::MetricTypeMismatch;
+
 #[derive(Debug, Clone, Default)]
 pub struct WriteErrors {
     pub event: Option<String>,
@@ -11,12 +13,20 @@ pub struct WriteErrors {
     pub metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricIngress {
     pub missing_identity: u64,
     pub truncated: u64,
     pub unauthorized_records: u64,
     pub authorization_errors: u64,
+    pub type_mismatches: u64,
+    pub last_type_mismatch: Option<MetricTypeMismatch>,
+}
+
+#[derive(Default)]
+struct MetricTypeDiagnostics {
+    total: u64,
+    last: Option<MetricTypeMismatch>,
 }
 
 struct State {
@@ -26,6 +36,7 @@ struct State {
     metric_truncated: AtomicU64,
     metric_unauthorized_records: AtomicU64,
     metric_authorization_errors: AtomicU64,
+    metric_type_mismatches: RwLock<MetricTypeDiagnostics>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -38,6 +49,7 @@ fn state() -> &'static State {
         metric_truncated: AtomicU64::new(0),
         metric_unauthorized_records: AtomicU64::new(0),
         metric_authorization_errors: AtomicU64::new(0),
+        metric_type_mismatches: RwLock::new(MetricTypeDiagnostics::default()),
     })
 }
 
@@ -102,16 +114,42 @@ pub fn metric_authorization_error() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn metric_type_mismatches(count: usize, last: Option<&MetricTypeMismatch>) {
+    if count == 0 {
+        return;
+    }
+    let mut diagnostics = state()
+        .metric_type_mismatches
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    diagnostics.total = diagnostics
+        .total
+        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    if let Some(last) = last {
+        diagnostics.last = Some(last.clone());
+    }
+}
+
 pub fn snapshot() -> (usize, MetricIngress, WriteErrors) {
+    let state = state();
+    let (type_mismatches, last_type_mismatch) = {
+        let diagnostics = state
+            .metric_type_mismatches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (diagnostics.total, diagnostics.last.clone())
+    };
     (
-        state().metric_series.load(Ordering::Acquire),
+        state.metric_series.load(Ordering::Acquire),
         MetricIngress {
-            missing_identity: state().metric_missing_identity.load(Ordering::Relaxed),
-            truncated: state().metric_truncated.load(Ordering::Relaxed),
-            unauthorized_records: state().metric_unauthorized_records.load(Ordering::Relaxed),
-            authorization_errors: state().metric_authorization_errors.load(Ordering::Relaxed),
+            missing_identity: state.metric_missing_identity.load(Ordering::Relaxed),
+            truncated: state.metric_truncated.load(Ordering::Relaxed),
+            unauthorized_records: state.metric_unauthorized_records.load(Ordering::Relaxed),
+            authorization_errors: state.metric_authorization_errors.load(Ordering::Relaxed),
+            type_mismatches,
+            last_type_mismatch,
         },
-        state()
+        state
             .errors
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

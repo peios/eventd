@@ -20,7 +20,7 @@ pub use log_store::{LogRecord, LogStore, LogStoreError};
 pub use meta_store::{DesiredIndex, IndexCounter, MetaStore, MetaStoreError};
 pub use metric_store::{
     Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError, MetricType,
-    MetricValue,
+    MetricTypeMismatch, MetricValue,
 };
 pub use model::{Gap, Guid, IngestItem, RealEvent, SyntheticEvent};
 pub use payload_index::{PayloadIndexValue, query_key as payload_query_key};

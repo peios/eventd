@@ -5,10 +5,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
-    BoundedQueue, Histogram, MetricRecord, MetricStore, MetricStoreError, MetricType, MetricValue,
+    BoundedQueue, Histogram, MetricCommitStats, MetricRecord, MetricStore, MetricStoreError,
+    MetricType, MetricValue,
 };
 use peios::msgpack::{Reader, Type};
 
@@ -25,6 +26,50 @@ pub enum MetricMaintenance {
         response: SyncSender<Result<usize, String>>,
     },
     Checkpoint(SyncSender<Result<usize, String>>),
+}
+
+#[derive(Default)]
+struct TypeMismatchReporter {
+    last_warning: Option<Instant>,
+    pending: u64,
+}
+
+impl TypeMismatchReporter {
+    const WARNING_INTERVAL: Duration = Duration::from_mins(1);
+
+    fn record(&mut self, stats: &MetricCommitStats) {
+        crate::diagnostics::metric_type_mismatches(
+            stats.type_mismatches,
+            stats.last_type_mismatch.as_ref(),
+        );
+        let Some(count) = self.warning_count(stats.type_mismatches, Instant::now()) else {
+            return;
+        };
+        let Some(conflict) = stats.last_type_mismatch.as_ref() else {
+            return;
+        };
+        eprintln!(
+            "eventd: discarded {count} metric samples due to immutable type conflicts; \
+             latest name={} expected={} received={}",
+            conflict.name,
+            conflict.expected.as_str(),
+            conflict.received.as_str(),
+        );
+    }
+
+    fn warning_count(&mut self, count: usize, now: Instant) -> Option<u64> {
+        self.pending = self
+            .pending
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < Self::WARNING_INTERVAL)
+        {
+            return None;
+        }
+        self.last_warning = Some(now);
+        Some(core::mem::take(&mut self.pending))
+    }
 }
 
 #[allow(
@@ -57,6 +102,7 @@ pub fn run(
     let mut batch = Vec::with_capacity(initial_batch_size);
     let mut started = None;
     let mut last_authorization_error = None;
+    let mut type_mismatch_reporter = TypeMismatchReporter::default();
     while !stopping.load(Ordering::Acquire) {
         let (
             max_batch_size,
@@ -118,6 +164,7 @@ pub fn run(
                             retention_requested,
                             boot_id,
                             error_events,
+                            &mut type_mismatch_reporter,
                         )?;
                         batch.clear();
                         started = None;
@@ -136,6 +183,7 @@ pub fn run(
                     retention_requested,
                     boot_id,
                     error_events,
+                    &mut type_mismatch_reporter,
                 )?;
                 batch.clear();
                 started = None;
@@ -177,6 +225,7 @@ pub fn run(
                             retention_requested,
                             boot_id,
                             error_events,
+                            &mut type_mismatch_reporter,
                         )?;
                         batch.clear();
                     }
@@ -196,6 +245,7 @@ pub fn run(
             retention_requested,
             boot_id,
             error_events,
+            &mut type_mismatch_reporter,
         )?;
     }
     Ok(())
@@ -248,9 +298,13 @@ fn commit_batch(
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
     error_events: &BoundedQueue<WriterMessage>,
+    type_mismatch_reporter: &mut TypeMismatchReporter,
 ) -> Result<(), MetricIngestError> {
     match store.commit(batch) {
-        Ok(_) => {
+        Ok(stats) => {
+            if stats.type_mismatches != 0 {
+                type_mismatch_reporter.record(&stats);
+            }
             crate::diagnostics::metric_series(store.cache_len());
             Ok(())
         }
@@ -735,5 +789,20 @@ mod tests {
             .write_float(2.5);
         let records = parse_datagram(&writer.to_bytes().unwrap(), [1; 16], 7).unwrap();
         assert!(matches!(records[0].value, MetricValue::Histogram(_)));
+    }
+
+    #[test]
+    fn type_mismatch_warnings_are_globally_rate_limited_and_coalesced() {
+        let mut reporter = TypeMismatchReporter::default();
+        let start = Instant::now();
+        assert_eq!(reporter.warning_count(2, start), Some(2));
+        assert_eq!(
+            reporter.warning_count(3, start + Duration::from_secs(59)),
+            None
+        );
+        assert_eq!(
+            reporter.warning_count(4, start + Duration::from_mins(1)),
+            Some(7)
+        );
     }
 }

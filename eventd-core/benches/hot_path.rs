@@ -3,13 +3,17 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use eventd_core::{BoundedQueue, IngestItem, Pop, RealEvent, Shard};
+use eventd_core::{
+    BoundedQueue, IngestItem, MetricRecord, MetricStore, MetricType, MetricValue, Pop, RealEvent,
+    Shard,
+};
 
 const ITEMS: usize = 200_000;
 
 fn main() {
     benchmark_queue();
     benchmark_sqlite();
+    benchmark_metric_sqlite();
 }
 
 fn benchmark_queue() {
@@ -33,16 +37,7 @@ fn benchmark_queue() {
 }
 
 fn benchmark_sqlite() {
-    let mut directory = std::env::temp_dir();
-    directory.push(format!(
-        "eventd-bench-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&directory).unwrap();
+    let directory = temporary_directory("events");
     let mut shard = Shard::open(directory.join("shard-0000.db"), 1_000).unwrap();
     let event = RealEvent {
         boot_id: [1; 16],
@@ -78,6 +73,52 @@ fn benchmark_sqlite() {
     report("SQLite FULL WAL", ITEMS, started.elapsed());
     drop(shard);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn benchmark_metric_sqlite() {
+    let directory = temporary_directory("metrics");
+    let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 50_000).unwrap();
+    let sample = MetricRecord {
+        boot_id: [1; 16],
+        timestamp: 1,
+        name: "benchmark.metric".into(),
+        labels: "core=0".into(),
+        metric_type: MetricType::Gauge,
+        value: MetricValue::Number(1.0),
+    };
+    let mut batch = Vec::with_capacity(5_000);
+    let started = Instant::now();
+    for timestamp in 1..=i64::try_from(ITEMS).unwrap() {
+        let mut sample = sample.clone();
+        sample.timestamp = timestamp;
+        batch.push(sample);
+        if batch.len() == batch.capacity() {
+            let stats = store.commit(&batch).unwrap();
+            black_box(stats.accepted);
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        let stats = store.commit(&batch).unwrap();
+        black_box(stats.accepted);
+    }
+    report("metric SQLite WAL", ITEMS, started.elapsed());
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn temporary_directory(label: &str) -> std::path::PathBuf {
+    let mut directory = std::env::temp_dir();
+    directory.push(format!(
+        "eventd-bench-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    directory
 }
 
 fn report(label: &str, items: usize, elapsed: Duration) {

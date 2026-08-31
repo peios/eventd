@@ -693,12 +693,22 @@ fn diagnostic_dump(
     eprintln!("  queries: active={active_queries} streaming={streaming_queries}");
     eprintln!("  metric_series_cache: {metric_series}");
     eprintln!(
-        "  metric_ingress: missing_identity={} truncated={} unauthorized_records={} authorization_errors={}",
+        "  metric_ingress: missing_identity={} truncated={} unauthorized_records={} \
+         authorization_errors={} type_mismatches={}",
         metric_ingress.missing_identity,
         metric_ingress.truncated,
         metric_ingress.unauthorized_records,
         metric_ingress.authorization_errors,
+        metric_ingress.type_mismatches,
     );
+    if let Some(conflict) = &metric_ingress.last_type_mismatch {
+        eprintln!(
+            "  last_metric_type_mismatch: name={} expected={} received={}",
+            conflict.name,
+            conflict.expected.as_str(),
+            conflict.received.as_str(),
+        );
+    }
     match load_receipts(active_paths, historical_paths) {
         Ok(receipts) => {
             let mut range_counts = std::collections::HashMap::<u16, usize>::new();
