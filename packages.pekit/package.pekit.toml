@@ -3,7 +3,7 @@
 format = "peipkg"
 
 [package]
-# Revision 5 bounds metric-store growth by default.
-version      = "{{version}}-5"
+# Revision 6 diagnoses immutable metric type conflicts.
+version      = "{{version}}-6"
 architecture = "x86_64"
 license      = "MIT"
