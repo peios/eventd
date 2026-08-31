@@ -25,7 +25,7 @@
     {
       "path": "Machine\\System\\Services\\eventd",
       "values": [
-        { "name": "ImagePath",          "type": "sz",    "data": "/sbin/eventd" },
+        { "name": "ImagePath",          "type": "sz",    "data": "/usr/sbin/eventd" },
         { "name": "Triggers",           "type": "multi", "data": ["boot"] },
         { "name": "RuntimeDirectories", "type": "multi", "data": ["eventd"] },
         { "name": "Requires",           "type": "multi", "data": ["authd"] },
