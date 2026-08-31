@@ -3,7 +3,7 @@
 format = "peipkg"
 
 [package]
-# Revision 8 exposes histogram percentile overflow as an explicit result.
-version      = "{{version}}-8"
+# Revision 9 adds self-validating adaptive metric rollups.
+version      = "{{version}}-9"
 architecture = "x86_64"
 license      = "MIT"
