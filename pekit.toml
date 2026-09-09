@@ -1,80 +1,286 @@
-# eventd — Peios's durable event, log and metric daemon.
-#
-# The libpeios bootstrap mirrors the other Rust platform daemons: packaged
-# builds use pkg-config, while a monorepo build synthesizes peios.pc from the
-# sibling libpeios and built PKM header trees when necessary.
+# eventd — Peios's durable event, log, and metric service plus its independent
+# query client. One locked, offline Rust build emits both runtime boundaries,
+# split symbols, debug sources, and corresponding source.
 
 out_dir = "out"
 
-[build]
-command = """
+[source_package]
+name = "dev.peios.eventd-source"
+
+[build.vendor]
+command = '''
+set -eu
+export CARGO_HOME=/tmp/cargo-eventd-vendor
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+mkdir -p "$CARGO_HOME" "$PEKIT_OUT"
+
+# The lock must retain the reviewed libpeios-0.5-compatible peios-rs commit.
+PEIOS_RS_REV=f4309f78fbaa878a14429a5e07d778dba9ddfab7
+grep -F "peios-rs.git?rev=$PEIOS_RS_REV#$PEIOS_RS_REV" Cargo.lock >/dev/null
+cargo vendor --locked "$PEKIT_OUT/vendor" > "$PEKIT_OUT/cargo-config.toml"
+test -s "$PEKIT_OUT/cargo-config.toml"
+test -n "$(find "$PEKIT_OUT/vendor" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+'''
+
+[build.vendor.dependencies.peipkg]
+"org.rust-lang.rust" = ">= 1.98.1, < 2"
+"org.gnu.findutils"  = "*"
+"org.gnu.grep"       = "*"
+
+[build.vendor.dependencies.apt]
+cargo           = "*"
+git             = "*"
+ca-certificates = "*"
+findutils       = "*"
+grep            = "*"
+
+[build.main]
+needs = ["vendor"]
+command = '''
 set -eu
 set -o pipefail 2>/dev/null || true
 
-SRC="$(pwd)"
-REPO_ROOT="$(cd "$SRC/.." && pwd)"
+SRC=$(pwd -P)
+DEBUG_PREFIX=/usr/src/debug/dev.peios.eventd
+DEBUG_ROOT=$PEKIT_OUT$DEBUG_PREFIX
+export CARGO_HOME=$PEKIT_OUT/cargo-home
+mkdir -p "$CARGO_HOME"
+cp "$PEKIT_VENDOR_OUT/cargo-config.toml" "$CARGO_HOME/config.toml"
 
-for tool in cargo rustc gcc pkg-config; do
-  command -v "$tool" >/dev/null || { echo "missing required eventd build tool: $tool" >&2; exit 1; }
+for tool in cargo rustc gcc pkg-config python3 objcopy strip readelf debugedit; do
+  command -v "$tool" >/dev/null || {
+    echo "eventd: missing required build tool: $tool" >&2
+    exit 1
+  }
 done
 
+# Native releases consume the packaged ABI. No sibling checkout or mutable
+# Cargo cache is visible to this target.
 unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
-
-if ! pkg-config --exists peios; then
-  LIBPEIOS_ROOT="$REPO_ROOT/libpeios"
-  PKM_UAPI_ROOT="$REPO_ROOT/pkm/out/build/headers/usr/include"
-  [ -f "$LIBPEIOS_ROOT/Cargo.toml" ] || { echo "libpeios not found at $LIBPEIOS_ROOT" >&2; exit 1; }
-  [ -d "$LIBPEIOS_ROOT/include/peios" ] || { echo "libpeios headers not found" >&2; exit 1; }
-  [ -d "$PKM_UAPI_ROOT/pkm" ] || { echo "pkm UAPI headers not found at $PKM_UAPI_ROOT" >&2; exit 1; }
-
-  cargo build --release --locked --manifest-path "$LIBPEIOS_ROOT/Cargo.toml"
-
-  PC_DIR="$PEKIT_OUT/pkgconfig"
-  mkdir -p "$PC_DIR"
-  LIBPEIOS_VERSION="$(sed -n 's/^version = "\\([^"]*\\)".*/\\1/p' "$LIBPEIOS_ROOT/Cargo.toml" | head -1)"
-  {
-    printf 'prefix=%s\\n' "$LIBPEIOS_ROOT"
-    printf 'exec_prefix=${prefix}\\n'
-    printf 'libdir=%s/target/release\\n' "$LIBPEIOS_ROOT"
-    printf 'includedir=%s/include\\n' "$LIBPEIOS_ROOT"
-    printf '\\n'
-    printf 'Name: peios\\n'
-    printf 'Description: Peios userspace C ABI library (libpeios)\\n'
-    printf 'Version: %s\\n' "$LIBPEIOS_VERSION"
-    printf 'Libs: -L${libdir} -lpeios\\n'
-    printf 'Cflags: -I${includedir} -I%s\\n' "$PKM_UAPI_ROOT"
-  } > "$PC_DIR/peios.pc"
-  export PKG_CONFIG_PATH="$PC_DIR${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-fi
-
+test "$(pkg-config --modversion peios)" = 0.5.0 || {
+  echo "eventd: dev.peios.libpeios-devel 0.5.0 is required" >&2
+  exit 1
+}
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(gcc -print-file-name=include) ${BINDGEN_EXTRA_CLANG_ARGS:-}"
 
-cargo build --release --locked --bin eventd --bin evctl --target-dir "$PEKIT_OUT/target"
+# The wrapper version, Cargo workspace, and embedded CLI version must agree.
+cargo metadata --locked --offline --no-deps --format-version 1 |
+  python3 -c '
+import json, os, sys
+metadata = json.load(sys.stdin)
+members = set(metadata["workspace_members"])
+versions = sorted({p["version"] for p in metadata["packages"] if p["id"] in members})
+expected = os.environ["PEKIT_VERSION"]
+if versions != [expected]:
+    raise SystemExit(f"eventd: workspace versions {versions!r} do not equal package version {expected!r}")
+'
 
-mkdir -p "$PEKIT_OUT/usr/bin" "$PEKIT_OUT/usr/sbin" "$PEKIT_OUT/usr/share/regim" "$PEKIT_OUT/usr/share/regman"
-install -m 0755 "$PEKIT_OUT/target/release/evctl" "$PEKIT_OUT/usr/bin/evctl"
-install -m 0755 "$PEKIT_OUT/target/release/eventd" "$PEKIT_OUT/usr/sbin/eventd"
-install -m 0644 "$SRC/registry.d/eventd-config.reg" "$PEKIT_OUT/usr/share/regim/eventd-config.reg"
-install -m 0644 "$SRC/registry.d/eventd-service.reg" "$PEKIT_OUT/usr/share/regim/eventd-service.reg"
-install -m 0644 "$SRC/eventd.regman" "$PEKIT_OUT/usr/share/regman/eventd.regman"
+# Make DWARF reproducible and independent of checkout and build-root paths.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$PEKIT_WORKSPACE_ROOT=$DEBUG_PREFIX/.workspace --remap-path-prefix=$PEKIT_OUT_BASE=$DEBUG_PREFIX/.build --remap-path-prefix=$SRC=$DEBUG_PREFIX --remap-path-prefix=$PEKIT_VENDOR_OUT/vendor=$DEBUG_PREFIX/vendor"
+
+TARGET=$PEKIT_OUT/target
+cargo test --release --workspace --locked --offline --target-dir "$TARGET"
+CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
+  cargo build --release --locked --offline --bin eventd --bin evctl \
+    --target-dir "$TARGET"
+
+mkdir -p "$PEKIT_OUT/usr/bin" "$PEKIT_OUT/usr/sbin" \
+         "$PEKIT_OUT/usr/share/regim" "$PEKIT_OUT/usr/share/regman"
+install -m 0755 "$TARGET/release/evctl" "$PEKIT_OUT/usr/bin/evctl"
+install -m 0755 "$TARGET/release/eventd" "$PEKIT_OUT/usr/sbin/eventd"
+install -m 0644 "$SRC/registry.d/eventd-config.reg" \
+  "$PEKIT_OUT/usr/share/regim/eventd-config.reg"
+install -m 0644 "$SRC/registry.d/eventd-service.reg" \
+  "$PEKIT_OUT/usr/share/regim/eventd-service.reg"
+install -m 0644 "$SRC/eventd.regman" \
+  "$PEKIT_OUT/usr/share/regman/eventd.regman"
 
 # Mutable stores are never populated by a package. These empty entries only
 # provision the protected directory skeleton expected during startup.
-mkdir -p "$PEKIT_OUT/var/state/eventd/events"
-mkdir -p "$PEKIT_OUT/var/state/eventd/logs"
-mkdir -p "$PEKIT_OUT/var/state/eventd/metrics"
-"""
+mkdir -p "$PEKIT_OUT/var/state/eventd/events" \
+         "$PEKIT_OUT/var/state/eventd/logs" \
+         "$PEKIT_OUT/var/state/eventd/metrics"
 
-[build.dependencies.peipkg]
-cargo = "*"
-rust = "*"
-gcc = "*"
-pkgconf-pkg-config = "*"
-libpeios-devel = "*"
-kernel-headers = "*"
+# Split the independently installable binaries while retaining one shared
+# exact debug-source tree for the source release and vendored Cargo closure.
+: > "$PEKIT_OUT/.debug-sources"
+split_debug() {
+  component=$1
+  elf=$2
+  list=$PEKIT_OUT/.debug-$component
+  debugedit -b "$SRC" -d "$DEBUG_PREFIX" -l "$list" -n "$elf"
+  cat "$list" >> "$PEKIT_OUT/.debug-sources"
+  build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
+  test -n "$build_id"
+  first=$(printf %s "$build_id" | cut -c1-2)
+  rest=$(printf %s "$build_id" | cut -c3-)
+  debug=$PEKIT_OUT/debug/$component/usr/lib/debug/.build-id/$first/$rest.debug
+  mkdir -p "$(dirname "$debug")"
+  objcopy --only-keep-debug "$elf" "$debug"
+  strip --strip-unneeded "$elf"
+  objcopy --add-gnu-debuglink="$debug" "$elf"
+  rm -f "$list"
+}
+
+split_debug eventd "$PEKIT_OUT/usr/sbin/eventd"
+split_debug evctl "$PEKIT_OUT/usr/bin/evctl"
+
+mkdir -p "$DEBUG_ROOT"
+tr '\0' '\n' < "$PEKIT_OUT/.debug-sources" | LC_ALL=C sort -u |
+while IFS= read -r source; do
+  test -n "$source" || continue
+  case "$source" in */) continue ;; esac
+  case "$source" in
+    "$DEBUG_PREFIX"/vendor/*)
+      relative=${source#"$DEBUG_PREFIX"/}
+      origin=$PEKIT_VENDOR_OUT/$relative
+      ;;
+    "$DEBUG_PREFIX"/*)
+      relative=${source#"$DEBUG_PREFIX"/}
+      origin=$SRC/$relative
+      ;;
+    vendor/*)
+      relative=$source
+      origin=$PEKIT_VENDOR_OUT/$source
+      ;;
+    *)
+      relative=$source
+      origin=$SRC/$source
+      ;;
+  esac
+  test -f "$origin" || continue
+  mkdir -p "$DEBUG_ROOT/$(dirname "$relative")"
+  cp "$origin" "$DEBUG_ROOT/$relative"
+done
+rm -f "$PEKIT_OUT/.debug-sources"
+test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
+
+# Installed-payload tests catch path drift, CLI breakage, malformed registry
+# seeds, empty-state contamination, and incomplete regman delivery.
+test "$("$PEKIT_OUT/usr/bin/evctl" version)" = "evctl $PEKIT_VERSION"
+"$PEKIT_OUT/usr/bin/evctl" help | grep -F "Usage:" >/dev/null
+python3 - "$PEKIT_OUT" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+regim = root / "usr/share/regim"
+config = json.loads((regim / "eventd-config.reg").read_text())
+service = json.loads((regim / "eventd-service.reg").read_text())
+service_values = {
+    value["name"]: value["data"]
+    for key in service["keys"]
+    if key["path"] == r"Machine\System\Services\eventd"
+    for value in key["values"]
+}
+assert service_values["ImagePath"] == "/usr/sbin/eventd"
+assert service_values["Identity"] == "SYSTEM"
+assert service_values["Requires"] == ["authd"]
+assert service_values["ErrorControl"] == 1
+configured = {
+    value["name"]
+    for key in config["keys"]
+    if key["path"] == r"Machine\System\eventd"
+    for value in key["values"]
+}
+assert configured == {
+    "EventStorePath", "LogStorePath", "MetricStorePath",
+    "QuerySocketPath", "LogSocketPath", "MetricSocketPath",
+}
+for leaf in ("events", "logs", "metrics"):
+    directory = root / "var/state/eventd" / leaf
+    assert directory.is_dir() and not any(directory.iterdir())
+regman = (root / "usr/share/regman/eventd.regman").read_text()
+assert "Machine\\System\\eventd" in regman
+assert "EventStorePath" in regman and "MetricStorePath" in regman
+PY
+
+# Fail closed on PIE, full RELRO, BIND_NOW, NX stack, libpeios ABI linkage,
+# split-debug integrity, and build-path leaks.
+for record in \
+  "eventd:$PEKIT_OUT/usr/sbin/eventd" \
+  "evctl:$PEKIT_OUT/usr/bin/evctl"
+do
+  component=${record%%:*}
+  elf=${record#*:}
+  readelf -h "$elf" | grep -Eq 'Type:[[:space:]]+DYN'
+  readelf -lW "$elf" | grep -q 'GNU_RELRO'
+  readelf -lW "$elf" | grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'
+  readelf -dW "$elf" | grep -q 'BIND_NOW'
+  readelf -dW "$elf" | grep -Eq 'FLAGS_1.*PIE'
+  readelf -dW "$elf" | grep -Fq 'Shared library: [libpeios.so.0]'
+  ! readelf -dW "$elf" | grep -Eq '(RPATH|RUNPATH|TEXTREL)'
+  ! readelf -SW "$elf" | grep -q '\.debug_info'
+  build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
+  test -n "$build_id"
+  debug=$PEKIT_OUT/debug/$component/usr/lib/debug/.build-id/$(printf %s "$build_id" | cut -c1-2)/$(printf %s "$build_id" | cut -c3-).debug
+  test -s "$debug"
+  readelf -SW "$debug" | grep -q '\.debug_info'
+  test "$(readelf -n "$debug" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)" = "$build_id"
+  for forbidden in "$SRC" "$PEKIT_VENDOR_OUT" "$PEKIT_OUT_BASE" "$PEKIT_WORKSPACE_ROOT"; do
+    ! grep -aF "$forbidden" "$elf" "$debug" >/dev/null
+  done
+done
+'''
+
+[build.main.dependencies.peipkg]
+"org.git.kernel.dash"      = "*"
+"org.gnu.coreutils"        = "*"
+"org.gnu.findutils"        = "*"
+"org.gnu.grep"             = "*"
+"org.gnu.sed"              = "*"
+"org.rust-lang.rust"       = ">= 1.98.1, < 2"
+"org.gnu.gcc"              = ">= 16, < 17"
+"org.gnu.binutils"         = "*"
+"org.sourceware.debugedit" = "*"
+"org.python.python3"       = "*"
+"org.llvm.clang-devel"     = ">= 22, < 23"
+"org.pkgconf.pkgconf"      = "*"
+"dev.peios.libpeios-devel" = "= 0.5.0-1"
+
+[build.main.dependencies.apt]
+dash            = "*"
+coreutils       = "*"
+findutils       = "*"
+grep            = "*"
+sed             = "*"
+cargo           = "*"
+rustc           = "*"
+gcc             = "*"
+binutils        = "*"
+debugedit       = "*"
+python3         = "*"
+"libclang-dev" = "*"
+pkgconf         = "*"
 
 [test]
-command = "./tools/check"
+needs = ["vendor"]
+command = '''
+set -eu
+export CARGO_HOME=$PEKIT_OUT/cargo-home
+mkdir -p "$CARGO_HOME"
+cp "$PEKIT_VENDOR_OUT/cargo-config.toml" "$CARGO_HOME/config.toml"
+unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
+test "$(pkg-config --modversion peios)" = 0.5.0
+export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(gcc -print-file-name=include) ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+cargo test --workspace --locked --offline
+'''
+
+[test.dependencies.peipkg]
+"org.git.kernel.dash"      = "*"
+"org.gnu.coreutils"        = "*"
+"org.rust-lang.rust"       = ">= 1.98.1, < 2"
+"org.gnu.gcc"              = ">= 16, < 17"
+"org.llvm.clang-devel"     = ">= 22, < 23"
+"org.pkgconf.pkgconf"      = "*"
+"dev.peios.libpeios-devel" = "= 0.5.0-1"
+
+[test.dependencies.apt]
+dash            = "*"
+coreutils       = "*"
+cargo           = "*"
+rustc           = "*"
+gcc             = "*"
+"libclang-dev" = "*"
+pkgconf         = "*"
 
 [clean]
 command = "cargo clean"

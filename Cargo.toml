@@ -5,6 +5,7 @@ members = ["eventd-core", "eventd", "evctl"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 
@@ -12,8 +13,11 @@ publish = false
 crossbeam-utils = "0.8.21"
 hashlink = "0.10.0"
 libc = "0.2.175"
-peios = { path = "../peios-rs/peios" }
-peios-sys = { path = "../peios-rs/peios-sys" }
+# Keep the public Peios bindings release-addressable and immutable. The tag
+# predates the libpeios 0.5 ABI; this reviewed compatibility commit is the same
+# one used by the production peiosutils release.
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "f4309f78fbaa878a14429a5e07d778dba9ddfab7", package = "peios" }
+peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "f4309f78fbaa878a14429a5e07d778dba9ddfab7", package = "peios-sys" }
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]

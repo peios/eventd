@@ -1,0 +1,10 @@
+[package]
+name        = "dev.peios.eventd-debuginfo"
+description = "Debugging symbols for the Peios eventd service"
+
+[dependencies]
+"dev.peios.eventd" = "= {{version}}-10"
+
+[files]
+"@source:LICENSE"                = "usr/share/licenses/dev.peios.eventd-debuginfo/LICENSE"
+":debug/eventd/usr/lib/debug/**" = "usr/lib/debug"

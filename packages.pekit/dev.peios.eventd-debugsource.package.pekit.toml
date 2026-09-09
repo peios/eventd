@@ -1,0 +1,8 @@
+[package]
+name         = "dev.peios.eventd-debugsource"
+architecture = "noarch"
+description  = "Debug sources for eventd and evctl"
+
+[files]
+"@source:LICENSE"   = "usr/share/licenses/dev.peios.eventd-debugsource/LICENSE"
+":usr/src/debug/**" = "usr/src/debug"

@@ -2,16 +2,22 @@
 set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-peios_root=$(CDPATH= cd -- "$repo/.." && pwd)
 gcc_include=$(gcc -print-file-name=include)
 
-export PEIOS_LIB_DIR="$peios_root/libpeios/target/debug"
-export PEIOS_INCLUDE="$peios_root/libpeios/include"
-export PKM_UAPI="$peios_root/pkm/out/build/headers/usr/include"
+if pkg-config --exists peios; then
+    unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
+else
+    peios_root=$(CDPATH= cd -- "$repo/.." && pwd)
+    export PEIOS_LIB_DIR="$peios_root/libpeios/target/debug"
+    export PEIOS_INCLUDE="$peios_root/libpeios/include"
+    export PKM_UAPI="$peios_root/pkm/out/build/headers/usr/include"
+fi
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS:+ $BINDGEN_EXTRA_CLANG_ARGS}"
-export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ -n "${PEIOS_LIB_DIR:-}" ]; then
+    export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 cd "$repo"
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
