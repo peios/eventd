@@ -5,11 +5,7 @@
 name        = "dev.peios.eventd"
 description = "Peios durable event, log, and metric service"
 
-[provides]
-eventd = "{{version}}-10"
 
-[replaces]
-eventd = "<= {{version}}-9"
 
 [dependencies]
 "dev.peios.evctl" = "= {{version}}-10"
