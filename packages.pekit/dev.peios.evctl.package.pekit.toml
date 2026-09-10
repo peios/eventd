@@ -2,11 +2,7 @@
 name        = "dev.peios.evctl"
 description = "Native command-line client for Peios eventd queries"
 
-[provides]
-evctl = "{{version}}-10"
 
-[replaces]
-eventd = "<= {{version}}-9"
 
 [files]
 "@source:LICENSE" = "usr/share/licenses/dev.peios.evctl/LICENSE"

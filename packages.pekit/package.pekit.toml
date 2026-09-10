@@ -1,6 +1,6 @@
 # Shared metadata for eventd's qualified production package family. Revision
-# 10 follows the nine unqualified development snapshots and introduces the
-# hermetic source graph, split client/debug payloads, and production gates.
+# 10 introduces the hermetic source graph, split client/debug payloads, and
+# production gates.
 
 format = "peipkg"
 
