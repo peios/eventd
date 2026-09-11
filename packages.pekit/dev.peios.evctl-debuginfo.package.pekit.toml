@@ -3,7 +3,7 @@ name        = "dev.peios.evctl-debuginfo"
 description = "Debugging symbols for the Peios eventd query client"
 
 [dependencies]
-"dev.peios.evctl" = "= {{version}}-10"
+"dev.peios.evctl" = "= {{version}}-1"
 
 [files]
 "@source:LICENSE"               = "usr/share/licenses/dev.peios.evctl-debuginfo/LICENSE"

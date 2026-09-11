@@ -8,7 +8,7 @@ description = "Peios durable event, log, and metric service"
 
 
 [dependencies]
-"dev.peios.evctl" = "= {{version}}-10"
+"dev.peios.evctl" = "= {{version}}-1"
 "dev.peios.authd" = ">= 0.0.14"
 
 [files]
