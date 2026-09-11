@@ -188,7 +188,7 @@ pkgconf         = "*"
 
 [test]
 gate = true
-needs = ["main"]
+needs = ["main", "vendor"]
 command = '''
 set -eu
 export CARGO_HOME=$PEKIT_OUT/cargo-home
