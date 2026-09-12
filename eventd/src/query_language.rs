@@ -1227,6 +1227,27 @@ mod tests {
     }
 
     #[test]
+    fn a_producer_origin_is_selectable_as_a_quoted_string() {
+        // `jobs/<guid>` and `svc/ExecStartPre[0]` are accepted origins
+        // (PSPU §3.7) but not identifiers, so FROM takes them quoted.
+        let query = parse(
+            "LOGS FROM \"jellyfin/ExecStartPre[0]\", \
+             \"jobs/0f8fad5b-d9cb-469f-a165-70867728950e\"",
+        )
+        .unwrap();
+        let Source::Logs { origins, .. } = query.source else {
+            panic!("log source")
+        };
+        assert_eq!(
+            origins,
+            [
+                "jellyfin/ExecStartPre[0]",
+                "jobs/0f8fad5b-d9cb-469f-a165-70867728950e"
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unknown_log_fields_during_parsing() {
         assert!(parse("LOGS WHERE payload.secret == 1").is_err());
         assert!(parse("LOGS SELECT message, imaginary").is_err());

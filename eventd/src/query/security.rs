@@ -561,7 +561,16 @@ fn resolve_descriptor(
     namespace: Namespace,
     identifier: &str,
 ) -> Result<Option<(String, SecurityDescriptor)>, SecurityError> {
-    let mut pattern = identifier;
+    // A log origin may name a producer within a service —
+    // `jellyfin/ExecStartPre[0]`, `jobs/<guid>` — and everything from the
+    // slash on is that producer, not a pattern namespace: `/` is a
+    // registry path separator, so it is never written into a descriptor
+    // path. Resolution therefore starts at the service, which makes a
+    // service's hooks, reloads and health checks answer to the service's
+    // own descriptor rather than falling through to the wildcard.
+    // Event types and metric names carry no slash, so this is a log rule
+    // in practice.
+    let mut pattern = identifier.split('/').next().unwrap_or(identifier);
     loop {
         if let Some(descriptor) = load_descriptor(namespace, pattern)? {
             return Ok(Some((pattern.to_owned(), descriptor)));
