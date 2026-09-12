@@ -348,7 +348,11 @@ fn parse_record(
         }
     }
 
-    let origin = origin.filter(|value| valid_identifier(value))?;
+    let origin = origin?;
+    if !valid_origin(origin) {
+        report_rejected_origin(origin);
+        return None;
+    }
     let is_error = is_error?;
     let message = message?;
     valid.then(|| LogRecord {
@@ -371,13 +375,68 @@ fn read_timestamp(reader: &mut Reader<'_>) -> Option<i64> {
         .and_then(|value| i64::try_from(value).ok())
 }
 
-fn valid_identifier(value: &str) -> bool {
+/// The origin grammar, which is the vocabulary the service manager
+/// produces (peinit TRM §11.1):
+///
+/// ```text
+/// origin    := component | component "/" producer
+/// producer  := component | component "[" [0-9]+ "]"
+/// component := [A-Za-z0-9_] [A-Za-z0-9_.-]*
+/// ```
+///
+/// A main process is its service name; a hook is
+/// `<service>/ExecStartPre[0]`, a reload `<service>/ExecReload`, a health
+/// check `<service>/HealthCheck`, and a submitted job `jobs/<guid>`.
+/// At most one slash, and the bracketed index only after one — the
+/// grammar admits what the broker sends and nothing wider. `*`, `\`,
+/// whitespace and quoting characters stay excluded, so an origin can
+/// still neither impersonate a wildcard pattern nor escape the registry
+/// path its descriptor is stored under (§7.2).
+fn valid_origin(value: &str) -> bool {
+    match value.split_once('/') {
+        None => valid_component(value),
+        Some((service, producer)) => valid_component(service) && valid_producer(producer),
+    }
+}
+
+fn valid_producer(value: &str) -> bool {
+    let Some(open) = value.find('[') else {
+        return valid_component(value);
+    };
+    let Some(index) = value[open..]
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    valid_component(&value[..open])
+        && !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_component(value: &str) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
         return false;
     };
-    (first.is_ascii_alphabetic() || first == b'_')
+    (first.is_ascii_alphanumeric() || first == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Count the rejection and, at most once a minute, say so on standard
+/// error — which peinit captures, so it reaches the log store by the
+/// ordinary path. A discarded record is otherwise invisible, and a
+/// producer whose vocabulary has drifted from the collector's discards
+/// everything it sends.
+fn report_rejected_origin(origin: &str) {
+    if !crate::diagnostics::log_rejected_origin(origin) {
+        return;
+    }
+    eprintln!(
+        "eventd: discarding log records whose origin is not of the accepted grammar; \
+         most recent: \"{}\"",
+        crate::diagnostics::displayable_origin(origin)
+    );
 }
 
 #[derive(Debug)]
@@ -466,6 +525,91 @@ mod tests {
         let records = parse_datagram(&writer.to_bytes().unwrap(), [1; 16], 99).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].origin.as_ref(), "good");
+    }
+
+    fn origin_of(origin: &str) -> Option<LogRecord> {
+        let mut writer = Writer::new();
+        writer
+            .write_map(3)
+            .write_str("origin")
+            .write_str(origin)
+            .write_str("is_error")
+            .write_bool(false)
+            .write_str("message")
+            .write_str("line");
+        parse_datagram(&writer.to_bytes().unwrap(), [1; 16], 99)
+            .unwrap()
+            .pop()
+    }
+
+    #[test]
+    fn accepts_the_origins_the_service_manager_produces() {
+        for origin in [
+            "jellyfin",
+            "jellyfin/ExecStartPre[0]",
+            "jellyfin/ExecStartPost[11]",
+            "jellyfin/ExecReload",
+            "jellyfin/HealthCheck",
+            "jobs/0f8fad5b-d9cb-469f-a165-70867728950e",
+            "7zip-daemon",
+            "loregd.watcher",
+        ] {
+            let record = origin_of(origin).unwrap_or_else(|| panic!("{origin} is accepted"));
+            assert_eq!(record.origin.as_ref(), origin);
+        }
+    }
+
+    #[test]
+    fn rejects_origins_outside_the_grammar() {
+        for origin in [
+            "",
+            "svc/",
+            "/svc",
+            "svc//hook",
+            "svc/hooks/0",
+            "svc/ExecStartPre[0]extra",
+            "svc/ExecStartPre[]",
+            "svc/ExecStartPre[a]",
+            "svc/ExecStartPre[0",
+            "svc[0]",
+            "svc*",
+            r"svc\hook",
+            "svc hook",
+            "svc\"hook\"",
+            "s\u{e9}rvice",
+        ] {
+            assert!(
+                origin_of(origin).is_none(),
+                "{origin:?} is outside the origin grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_origin_is_counted() {
+        // The counters are process-wide and every test in this binary
+        // shares them, so this asserts movement rather than a total.
+        let before = crate::diagnostics::snapshot().1.rejected_origins;
+        assert!(origin_of("svc/hooks/0").is_none());
+        let after = crate::diagnostics::snapshot().1;
+        assert!(
+            after.rejected_origins > before,
+            "a discarded origin is counted: {before} -> {}",
+            after.rejected_origins
+        );
+        assert!(after.last_rejected_origin.is_some());
+    }
+
+    #[test]
+    fn a_rejected_origin_is_escaped_and_truncated_for_display() {
+        assert_eq!(
+            crate::diagnostics::displayable_origin("svc\n\"x\""),
+            "svc\\n\\\"x\\\""
+        );
+        let long = "x".repeat(200);
+        let shown = crate::diagnostics::displayable_origin(&long);
+        assert_eq!(shown.chars().count(), 65);
+        assert!(shown.ends_with('…'));
     }
 
     #[test]

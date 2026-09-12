@@ -685,7 +685,7 @@ fn diagnostic_dump(
     query_server: &QueryServer,
 ) {
     let (active_queries, streaming_queries) = query_server.counts();
-    let (metric_series, metric_ingress, errors) = crate::diagnostics::snapshot();
+    let (metric_series, log_ingress, metric_ingress, errors) = crate::diagnostics::snapshot();
     eprintln!("eventd diagnostic dump:");
     eprintln!("  boot_id: {canonical_boot_id}");
     eprintln!(
@@ -695,6 +695,13 @@ fn diagnostic_dump(
     );
     eprintln!("  queries: active={active_queries} streaming={streaming_queries}");
     eprintln!("  metric_series_cache: {metric_series}");
+    eprintln!(
+        "  log_ingress: rejected_origins={}",
+        log_ingress.rejected_origins
+    );
+    if let Some(origin) = &log_ingress.last_rejected_origin {
+        eprintln!("  last_rejected_log_origin: \"{origin}\"");
+    }
     eprintln!(
         "  metric_ingress: missing_identity={} truncated={} unauthorized_records={} \
          authorization_errors={} type_mismatches={}",
