@@ -100,6 +100,10 @@ pub enum Operator {
     StartsWith,
     EndsWith,
     Contains,
+    /// Array containment: true when the field holds an array with an
+    /// element equal to the value. `CONTAINS` is string containment and
+    /// cannot serve here.
+    Has,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -548,7 +552,10 @@ impl Parser {
                 let operator = self.comparison_operator(false)?;
                 if matches!(
                     operator,
-                    Operator::StartsWith | Operator::EndsWith | Operator::Contains
+                    Operator::StartsWith
+                        | Operator::EndsWith
+                        | Operator::Contains
+                        | Operator::Has
                 ) {
                     return Err(ParseError::new(
                         "cross-type metric comparison requires a numeric operator",
@@ -680,6 +687,8 @@ impl Parser {
             Operator::EndsWith
         } else if self.consume_keyword("CONTAINS") {
             Operator::Contains
+        } else if self.consume_keyword("HAS") {
+            Operator::Has
         } else {
             return Err(ParseError::new("expected comparison operator"));
         };
@@ -1224,6 +1233,34 @@ mod tests {
         assert_eq!(origins, ["loregd", "peinit"]);
         assert!(error_only);
         assert_eq!(containing.as_deref(), Some("failed\nopen"));
+    }
+
+    #[test]
+    fn parses_array_containment_alongside_string_containment() {
+        let query = parse("EVENTS WHERE subject.token.groups HAS x\"010200000000000520\"").unwrap();
+        let Expr::Compare {
+            field,
+            operator,
+            value,
+        } = &query.predicates[0]
+        else {
+            panic!("comparison")
+        };
+        assert_eq!(field, "subject.token.groups");
+        assert_eq!(*operator, Operator::Has);
+        assert_eq!(*value, Literal::Binary(vec![1, 2, 0, 0, 0, 0, 0, 5, 32]));
+
+        // CONTAINS keeps its own meaning, and neither operator is
+        // acceptable in a cross-type metric comparison.
+        let string = parse("LOGS WHERE message CONTAINS \"denied\"").unwrap();
+        assert!(matches!(
+            &string.predicates[0],
+            Expr::Compare {
+                operator: Operator::Contains,
+                ..
+            }
+        ));
+        assert!(parse("EVENTS SINCE 1h ago WHERE METRIC cpu HAS 1").is_err());
     }
 
     #[test]

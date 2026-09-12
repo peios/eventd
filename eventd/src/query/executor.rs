@@ -1393,6 +1393,7 @@ fn evaluate(expression: &Expr, record: &Record) -> bool {
                     ascii_ends_with(value, needle)
                 }),
                 Operator::Contains => string_operation(actual, &expected, ascii_contains),
+                Operator::Has => array_contains(actual, &expected),
             }
         }
     }
@@ -1458,6 +1459,18 @@ fn numeric_order(left: &Value, right: &Value, wanted: Ordering) -> bool {
 
 fn string_operation(left: &Value, right: &Value, operation: impl Fn(&str, &str) -> bool) -> bool {
     matches!((left, right), (Value::String(left), Value::String(right)) if operation(left, right))
+}
+
+/// `HAS`: true when the field holds an array one of whose elements
+/// equals the value under the language's own equality — so a binary SID
+/// matches a binary element and a string matches under ASCII folding,
+/// exactly as `==` would against a scalar field. Elements are compared
+/// one level deep: an array element that is itself an array is compared
+/// as a whole, not searched. A field that is not an array is false
+/// rather than an error, which is how every other type mismatch in a
+/// predicate behaves.
+fn array_contains(left: &Value, right: &Value) -> bool {
+    matches!(left, Value::Array(elements) if elements.iter().any(|element| element.language_equal(right)))
 }
 
 fn sort_rows(rows: &mut [Row], query: &Query) {
@@ -3570,6 +3583,99 @@ mod tests {
             sql_payload_constraint(&absent, &connection)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn has_matches_an_element_of_an_array_field() {
+        // The real shape: a KACS event whose payload carries the token's
+        // group SIDs as an array of binary values. `==` against one SID
+        // is an array-versus-binary mismatch and matches nothing, which
+        // is why the operator exists.
+        let administrators = [
+            1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
+        ];
+        let users = [1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
+        let absent = [1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 34, 2, 0, 0];
+        let mut writer = Writer::new();
+        writer
+            .write_map(1)
+            .write_str("subject")
+            .write_map(1)
+            .write_str("token")
+            .write_map(1)
+            .write_str("groups")
+            .write_array(2)
+            .write_bin(&administrators)
+            .write_bin(&users);
+        let mut record = Record::new();
+        crate::query::value::flatten_event_payload(&writer.to_bytes().unwrap(), &mut record);
+        assert!(matches!(
+            record.get("subject.token.groups"),
+            Some(Value::Array(elements)) if elements.len() == 2
+        ));
+
+        let has = |sid: &[u8]| {
+            evaluate(
+                &Expr::Compare {
+                    field: "subject.token.groups".into(),
+                    operator: Operator::Has,
+                    value: Literal::Binary(sid.to_vec()),
+                },
+                &record,
+            )
+        };
+        assert!(has(&administrators), "HAS matches the first element");
+        assert!(has(&users), "HAS matches a later element");
+        assert!(!has(&absent), "HAS does not match a SID that is not there");
+
+        // A field that is not an array, and a missing field, are false
+        // rather than an error — as every other type mismatch is.
+        for field in ["event_type", "subject.token.nothing"] {
+            assert!(!evaluate(
+                &Expr::Compare {
+                    field: field.into(),
+                    operator: Operator::Has,
+                    value: Literal::Binary(administrators.to_vec()),
+                },
+                &record,
+            ));
+        }
+    }
+
+    #[test]
+    fn equality_against_an_array_field_is_unchanged_by_has() {
+        // `==` stays whole-value equality: an element does not match the
+        // array, and the array matches only an equal array.
+        let first = [1_u8, 2, 3];
+        let second = [4_u8, 5, 6];
+        let mut record = Record::new();
+        record.insert(
+            "groups".into(),
+            Value::Array(vec![
+                Value::Binary(first.to_vec()),
+                Value::Binary(second.to_vec()),
+            ]),
+        );
+        let equals = |value: Literal| {
+            evaluate(
+                &Expr::Compare {
+                    field: "groups".into(),
+                    operator: Operator::Equal,
+                    value,
+                },
+                &record,
+            )
+        };
+        assert!(!equals(Literal::Binary(first.to_vec())));
+        assert!(
+            record
+                .get("groups")
+                .unwrap()
+                .language_equal(&Value::Array(vec![
+                    Value::Binary(first.to_vec()),
+                    Value::Binary(second.to_vec()),
+                ]))
         );
     }
 
