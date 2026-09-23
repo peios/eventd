@@ -23,7 +23,7 @@ test -n "$(find "$PEKIT_OUT/vendor" -mindepth 1 -maxdepth 1 -type d -print -quit
 '''
 
 [build.vendor.dependencies.peipkg]
-"org.rust-lang.rust" = ">= 1.98.1, < 2"
+"org.rust-lang.rust" = ">= 1.98.1"
 "org.gnu.findutils"  = "*"
 "org.gnu.grep"       = "*"
 "dev.peios.peiosutils" = "*"
@@ -53,10 +53,7 @@ done
 # Native releases consume the packaged ABI. No sibling checkout or mutable
 # Cargo cache is visible to this target.
 unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
-test "$(pkg-config --modversion peios)" = 0.5.0 || {
-  echo "eventd: dev.peios.libpeios-devel 0.5.0 is required" >&2
-  exit 1
-}
+. packaging/check-libpeios.sh
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(gcc -print-file-name=include) ${BINDGEN_EXTRA_CLANG_ARGS:-}"
 
 # The wrapper version, Cargo workspace, and embedded CLI version must agree.
@@ -161,18 +158,20 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 
 [build.main.dependencies.peipkg]
 "org.git.kernel.dash"      = "*"
-"org.gnu.coreutils"        = "*"
+"dev.peios.peiosutils"     = "*"
+# install -m
+"org.gnu.coreutils-build-compat" = "*"
 "org.gnu.findutils"        = "*"
 "org.gnu.grep"             = "*"
 "org.gnu.sed"              = "*"
-"org.rust-lang.rust"       = ">= 1.98.1, < 2"
-"org.gnu.gcc"              = ">= 16, < 17"
+"org.rust-lang.rust"       = ">= 1.98.1"
+"org.gnu.gcc"              = ">= 16"
 "org.gnu.binutils"         = "*"
 "org.sourceware.debugedit" = "*"
 "org.python.python3"       = "*"
-"org.llvm.clang-devel"     = ">= 22, < 23"
+"org.llvm.clang-devel"     = ">= 22"
 "org.pkgconf.pkgconf"      = "*"
-"dev.peios.libpeios-devel" = "= 0.5.0-1"
+"dev.peios.libpeios-devel" = ">= 0.5.0"
 
 [test]
 gate = true
@@ -183,7 +182,7 @@ export CARGO_HOME=$PEKIT_OUT/cargo-home
 mkdir -p "$CARGO_HOME"
 cp "$PEKIT_VENDOR_OUT/cargo-config.toml" "$CARGO_HOME/config.toml"
 unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
-test "$(pkg-config --modversion peios)" = 0.5.0
+. packaging/check-libpeios.sh
 export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(gcc -print-file-name=include) ${BINDGEN_EXTRA_CLANG_ARGS:-}"
 cargo test --release --workspace --locked --offline --target-dir "$PEKIT_OUT/target"
 
@@ -242,8 +241,8 @@ do
   readelf -dW "$elf" | grep -q 'BIND_NOW'
   readelf -dW "$elf" | grep -Eq 'FLAGS_1.*PIE'
   readelf -dW "$elf" | grep -Fq 'Shared library: [libpeios.so.0]'
-  ! readelf -dW "$elf" | grep -Eq '(RPATH|RUNPATH|TEXTREL)'
-  ! readelf -SW "$elf" | grep -q '\.debug_info'
+  if readelf -dW "$elf" | grep -Eq '(RPATH|RUNPATH|TEXTREL)'; then echo "$elf has an RPATH, RUNPATH or TEXTREL" >&2; exit 1; fi
+  if readelf -SW "$elf" | grep -q '\.debug_info'; then echo "$elf still carries .debug_info" >&2; exit 1; fi
   build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
   test -n "$build_id"
   debug=$PEKIT_OUT/debug/$component/usr/lib/debug/.build-id/$(printf %s "$build_id" | cut -c1-2)/$(printf %s "$build_id" | cut -c3-).debug
@@ -251,25 +250,25 @@ do
   readelf -SW "$debug" | grep -q '\.debug_info'
   test "$(readelf -n "$debug" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)" = "$build_id"
   for forbidden in "$SRC" "$PEKIT_VENDOR_OUT" "$PEKIT_OUT_BASE" "$PEKIT_WORKSPACE_ROOT"; do
-    ! grep -aF "$forbidden" "$elf" "$debug" >/dev/null
+    if grep -aF "$forbidden" "$elf" "$debug" >/dev/null; then echo "$elf or its debug file embeds $forbidden" >&2; exit 1; fi
   done
 done
 '''
 
 [test.dependencies.peipkg]
 "org.git.kernel.dash"      = "*"
-"org.gnu.coreutils"        = "*"
+"dev.peios.peiosutils"     = "*"
 "org.gnu.findutils"        = "*"
 "org.gnu.grep"             = "*"
 "org.gnu.sed"              = "*"
-"org.rust-lang.rust"       = ">= 1.98.1, < 2"
-"org.gnu.gcc"              = ">= 16, < 17"
+"org.rust-lang.rust"       = ">= 1.98.1"
+"org.gnu.gcc"              = ">= 16"
 "org.gnu.binutils"         = "*"
 "org.sourceware.debugedit" = "*"
 "org.python.python3"       = "*"
-"org.llvm.clang-devel"     = ">= 22, < 23"
+"org.llvm.clang-devel"     = ">= 22"
 "org.pkgconf.pkgconf"      = "*"
-"dev.peios.libpeios-devel" = "= 0.5.0-1"
+"dev.peios.libpeios-devel" = ">= 0.5.0"
 
 [clean]
 command = "cargo clean"
