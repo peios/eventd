@@ -87,7 +87,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "evctl"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "peios",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "eventd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "eventd-core",
  "libc",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "eventd-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossbeam-utils",
  "hashlink",
