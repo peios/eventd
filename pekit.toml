@@ -77,6 +77,10 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$PEKIT_WORKSPACE_
 # hatch is the one the Rust recipe itself uses for the same flag.
 export RUSTC_BOOTSTRAP=1
 RUSTFLAGS="$RUSTFLAGS -Zcf-protection=full"
+# The same mapping for C compiled by build scripts (libsqlite3-sys). GCC
+# applies the last matching map, so the most specific prefix comes last.
+PREFIX_MAPS="-ffile-prefix-map=$PEKIT_WORKSPACE_ROOT=$DEBUG_PREFIX/.workspace -ffile-prefix-map=$PEKIT_OUT_BASE=$DEBUG_PREFIX/.build -ffile-prefix-map=$SRC=$DEBUG_PREFIX -ffile-prefix-map=$PEKIT_VENDOR_OUT/vendor=$DEBUG_PREFIX/vendor"
+export CFLAGS="${CFLAGS:+$CFLAGS }$PREFIX_MAPS"
 
 TARGET=$PEKIT_OUT/target
 CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
