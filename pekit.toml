@@ -30,13 +30,6 @@ test -n "$(find "$PEKIT_OUT/vendor" -mindepth 1 -maxdepth 1 -type d -print -quit
 # Cargo fetches the pinned Git dependencies through the git CLI.
 "com.git-scm.git"    = ">= 2.55.0"
 
-[build.vendor.dependencies.apt]
-cargo           = "*"
-git             = "*"
-ca-certificates = "*"
-findutils       = "*"
-grep            = "*"
-
 [build.main]
 needs = ["vendor"]
 command = '''
@@ -181,26 +174,6 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.pkgconf.pkgconf"      = "*"
 "dev.peios.libpeios-devel" = "= 0.5.0-1"
 
-[build.main.dependencies.apt]
-# The libpeios SDK and PKM UAPI headers come from the signed catalogue
-# (pkgs/_debroot_); Debian has no Peios ABI packages.
-"dev.peios.libpeios"       = "= 0.5.0-1"
-"dev.peios.libpeios-devel" = "= 0.5.0-1"
-"dev.peios.kernel-headers" = "*"
-dash            = "*"
-coreutils       = "*"
-findutils       = "*"
-grep            = "*"
-sed             = "*"
-cargo           = "*"
-rustc           = "*"
-gcc             = "*"
-binutils        = "*"
-debugedit       = "*"
-python3         = "*"
-"libclang-dev" = "*"
-pkgconf         = "*"
-
 [test]
 gate = true
 needs = ["main", "vendor"]
@@ -297,24 +270,6 @@ done
 "org.llvm.clang-devel"     = ">= 22, < 23"
 "org.pkgconf.pkgconf"      = "*"
 "dev.peios.libpeios-devel" = "= 0.5.0-1"
-
-[test.dependencies.apt]
-"dev.peios.libpeios"       = "= 0.5.0-1"
-"dev.peios.libpeios-devel" = "= 0.5.0-1"
-"dev.peios.kernel-headers" = "*"
-dash            = "*"
-coreutils       = "*"
-findutils       = "*"
-grep            = "*"
-sed             = "*"
-cargo           = "*"
-rustc           = "*"
-gcc             = "*"
-binutils        = "*"
-debugedit       = "*"
-python3         = "*"
-"libclang-dev" = "*"
-pkgconf         = "*"
 
 [clean]
 command = "cargo clean"
