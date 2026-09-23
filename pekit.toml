@@ -87,6 +87,34 @@ CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off \
   cargo build --release --locked --offline --bin eventd --bin evctl \
     --target-dir "$TARGET"
 
+# Each binary links its own crate closure, so each package ships that
+# closure's notices and declares its conjunction of licences; --check holds
+# every package definition to it (PEI-1163). The debug sources cover both
+# closures. peios-rs carries no package-local notice; ship the reviewed
+# notice of that same pinned source.
+LICENSE_ROOT=$PEKIT_OUT/licenses
+collect_licences() {
+  out=$1
+  roots=$2
+  shift 2
+  root_args=
+  for root in $roots; do root_args="$root_args --root $root"; done
+  for definition in "$@"; do
+    # shellcheck disable=SC2086 # crate names are single words
+    /usr/libexec/peios-packaging/collect-rust-licences \
+      --licence-root "$LICENSE_ROOT/$out" $root_args \
+      --notice "git+https://github.com/peios/peios-rs.git=third-party/peios-rs-LICENSE" \
+      --check "packages.pekit/$definition.package.pekit.toml"
+  done
+  test -s "$LICENSE_ROOT/$out/crate-licenses.tsv"
+}
+collect_licences eventd eventd \
+  dev.peios.eventd dev.peios.eventd-debuginfo
+collect_licences evctl evctl \
+  dev.peios.evctl dev.peios.evctl-debuginfo
+collect_licences debugsource "eventd evctl" \
+  dev.peios.eventd-debugsource
+
 mkdir -p "$PEKIT_OUT/usr/bin" "$PEKIT_OUT/usr/sbin" \
          "$PEKIT_OUT/usr/share/regim" "$PEKIT_OUT/usr/share/regman"
 install -m 0755 "$TARGET/release/evctl" "$PEKIT_OUT/usr/bin/evctl"
@@ -106,6 +134,12 @@ mkdir -p "$PEKIT_OUT/var/state/eventd/events" \
 
 # Split the independently installable binaries while retaining one shared
 # exact debug-source tree for the source release and vendored Cargo closure.
+# This stays local rather than using /usr/libexec/peios-packaging/split-debug:
+# each component's symbols go to their own debuginfo package tree, and the
+# path maps above already rewrote DWARF from the source tree and the vendor
+# target's crates (a separate output tree) to $DEBUG_PREFIX, so no single
+# build root is left for split-debug to copy sources from; the loop below
+# resolves vendored sources back to $PEKIT_VENDOR_OUT.
 : > "$PEKIT_OUT/.debug-sources"
 split_debug() {
   component=$1
@@ -176,6 +210,7 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.llvm.clang-devel"     = ">= 22"
 "org.pkgconf.pkgconf"      = "*"
 "dev.peios.libpeios-devel" = ">= 0.5.0"
+"dev.peios.packaging-tools" = "*"
 
 [test]
 gate = true

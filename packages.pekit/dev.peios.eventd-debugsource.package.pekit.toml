@@ -2,7 +2,10 @@
 name         = "dev.peios.eventd-debugsource"
 architecture = "noarch"
 description  = "Debug sources for eventd and evctl"
+# The union of both binaries' crate closures; checked by build.main.
+license      = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense) AND Zlib"
 
 [files]
 "@source:LICENSE"   = "usr/share/licenses/dev.peios.eventd-debugsource/LICENSE"
+":licenses/debugsource/**" = "usr/share/licenses/dev.peios.eventd-debugsource/third-party"
 ":usr/src/debug/**" = "usr/src/debug"

@@ -1,9 +1,13 @@
 [package]
 name        = "dev.peios.evctl"
 description = "Native command-line client for Peios eventd queries"
+# The crate closure evctl links; build.main's collect-rust-licences --check
+# holds this to what those crates declare.
+license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense)"
 
 
 
 [files]
 "@source:LICENSE" = "usr/share/licenses/dev.peios.evctl/LICENSE"
 ":usr/bin/evctl"  = "usr/bin/evctl"
+":licenses/evctl/**" = "usr/share/licenses/dev.peios.evctl/third-party"
