@@ -4,6 +4,9 @@
 [package]
 name        = "dev.peios.eventd"
 description = "Peios durable event, log, and metric service"
+# The crate closure eventd links; build.main's collect-rust-licences --check
+# holds this to what those crates declare.
+license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense) AND Zlib"
 
 
 
@@ -13,6 +16,7 @@ description = "Peios durable event, log, and metric service"
 
 [files]
 "@source:LICENSE"                    = "usr/share/licenses/dev.peios.eventd/LICENSE"
+":licenses/eventd/**"                = "usr/share/licenses/dev.peios.eventd/third-party"
 ":usr/sbin/eventd"                   = "usr/sbin/eventd"
 ":usr/share/regim/eventd-config.reg" = "usr/share/regim/eventd-config.reg"
 ":usr/share/regim/eventd-service.reg" = "usr/share/regim/eventd-service.reg"

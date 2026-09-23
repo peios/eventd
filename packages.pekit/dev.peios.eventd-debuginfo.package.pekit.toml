@@ -1,10 +1,13 @@
 [package]
 name        = "dev.peios.eventd-debuginfo"
 description = "Debugging symbols for the Peios eventd service"
+# The same crate closure as eventd; checked by build.main.
+license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense) AND Zlib"
 
 [dependencies]
 "dev.peios.eventd" = "= {{release}}"
 
 [files]
 "@source:LICENSE"                = "usr/share/licenses/dev.peios.eventd-debuginfo/LICENSE"
+":licenses/eventd/**"            = "usr/share/licenses/dev.peios.eventd-debuginfo/third-party"
 ":debug/eventd/usr/lib/debug/**" = "usr/lib/debug"

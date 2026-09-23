@@ -1,10 +1,13 @@
 [package]
 name        = "dev.peios.evctl-debuginfo"
 description = "Debugging symbols for the Peios eventd query client"
+# The same crate closure as evctl; checked by build.main.
+license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense)"
 
 [dependencies]
 "dev.peios.evctl" = "= {{release}}"
 
 [files]
 "@source:LICENSE"               = "usr/share/licenses/dev.peios.evctl-debuginfo/LICENSE"
+":licenses/evctl/**"            = "usr/share/licenses/dev.peios.evctl-debuginfo/third-party"
 ":debug/evctl/usr/lib/debug/**" = "usr/lib/debug"
