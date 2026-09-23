@@ -1,3 +1,5 @@
+side_effects = ["man-db"]
+
 [package]
 name        = "dev.peios.evctl"
 description = "Native command-line client for Peios eventd queries"
@@ -11,3 +13,4 @@ license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-
 "@source:LICENSE" = "usr/share/licenses/dev.peios.evctl/LICENSE"
 ":usr/bin/evctl"  = "usr/bin/evctl"
 ":licenses/evctl/**" = "usr/share/licenses/dev.peios.evctl/third-party"
+":usr/share/man/man1/evctl.1.gz" = "usr/share/man/man1/evctl.1.gz"

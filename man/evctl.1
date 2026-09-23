@@ -1,0 +1,114 @@
+.TH EVCTL 1 "" "Peios" "User Commands"
+.SH NAME
+evctl \- query the Peios event, log and metric store
+.SH SYNOPSIS
+.B evctl
+[\fIOPTIONS\fR]
+.I \(aqQUERY\(aq
+.br
+.B evctl
+[\fIOPTIONS\fR]
+.B \-\-file
+.I PATH
+.br
+.B evctl
+[\fIOPTIONS\fR]
+.B \-
+.br
+.B evctl help
+.br
+.B evctl version
+.SH DESCRIPTION
+.B evctl
+is the command-line client for
+.BR eventd (8).
+It sends one query in the PSPU observability query language to eventd's
+query socket and writes the result to standard output.
+.PP
+The query is a single argument whose first word is
+.BR EVENTS ,
+.B LOGS
+or
+.BR METRIC ,
+in any ASCII case. Quote the complete query so the shell cannot expand
+patterns or split string literals:
+.PP
+.nf
+.RS
+evctl \(aqEVENTS kacs.* SINCE 1h ago TAKE 50\(aq
+evctl \(aqLOGS FROM authd ERROR ONLY STREAM\(aq
+evctl \(aqMETRIC cpu.usage SINCE 10m ago AVG\(aq
+.RE
+.fi
+.PP
+Exact standalone words such as
+.B help
+and
+.B version
+are commands rather than queries. The query can also be read from a file with
+.BR \-\-file ,
+or from standard input when the argument is
+.BR \- .
+.PP
+eventd identifies the caller from the socket peer token and performs every
+access check; records and fields the caller may not see are omitted.
+.B evctl
+never opens an eventd database itself.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-format " \fIFORMAT\fR"
+Output encoding:
+.B pretty
+(the default, one self-describing record per line),
+.B jsonl
+(one JSON object per record; values JSON cannot carry are tagged objects),
+or
+.B msgpack
+(a lossless sequence of MessagePack records, each preceded by its four-byte
+little-endian payload length).
+.TP
+.BR \-s ", " \-\-socket " \fIPATH\fR"
+Query socket to connect to. The default is
+.IR /run/eventd/query.sock .
+.TP
+.BI \-\-file " PATH"
+Read the query from the UTF-8 file
+.IR PATH .
+It cannot be combined with a query argument.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Show the version and exit.
+.SH OUTPUT
+Records are written to standard output; diagnostics and query errors to
+standard error. Records in one result need not share a schema.
+.PP
+A result is published only once eventd confirms it complete (or, for a
+streaming query, once its initial result is complete). Until then records are
+held in an anonymous temporary spool, so an error part-way through never
+leaves a partial result on standard output. After a streaming query's initial
+result, new records are written as they arrive until
+.B evctl
+is interrupted.
+.SH EXIT STATUS
+.TP
+.B 0
+The query completed, or standard output was closed by its reader.
+.TP
+.B 1
+The query could not be read, eventd could not be reached, the protocol
+failed, eventd reported a query error, or output could not be written.
+.TP
+.B 2
+Usage error.
+.SH FILES
+.TP
+.I /run/eventd/query.sock
+Default query socket.
+.SH SEE ALSO
+.BR eventd (8)
+.PP
+The eventd manual and PSPU \(sc3 (the observability interfaces) at
+https://learn.peios.org.

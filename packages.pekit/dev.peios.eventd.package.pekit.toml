@@ -1,6 +1,8 @@
 # The critical daemon, its inert registry policy, and protected empty state
 # skeleton. The exact evctl dependency preserves the old monolith's installed
 # interface while keeping the client independently deployable.
+side_effects = ["man-db"]
+
 [package]
 name        = "dev.peios.eventd"
 description = "Peios durable event, log, and metric service"
@@ -24,6 +26,7 @@ license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-
 ":var/state/eventd/events"           = "var/state/eventd/events"
 ":var/state/eventd/logs"             = "var/state/eventd/logs"
 ":var/state/eventd/metrics"          = "var/state/eventd/metrics"
+":usr/share/man/man8/eventd.8.gz" = "usr/share/man/man8/eventd.8.gz"
 
 [sd_overrides]
 "var/state/eventd/events"  = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"

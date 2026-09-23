@@ -1,0 +1,105 @@
+.TH EVENTD 8 "" "Peios" "System Administration"
+.SH NAME
+eventd \- Peios event, log and metric service
+.SH SYNOPSIS
+.B eventd
+.SH DESCRIPTION
+.B eventd
+is the single persistent store for everything a Peios system records about
+itself, and it answers every query for that data.
+.PP
+.B Events
+are structured records stamped by the kernel. eventd drains them from the
+KMES per-CPU ring buffers into sharded SQLite stores, with sequence numbers,
+gap detection and a synthetic record written whenever events are lost.
+.PP
+.B Logs
+are text lines, mostly forwarded by the service manager from services'
+standard output and standard error. They arrive on a datagram socket.
+.PP
+.B Metrics
+are numeric samples pushed by their producers to a second datagram socket.
+eventd collects nothing itself.
+.PP
+Queries use the PSPU observability query language over a stream socket; see
+.BR evctl (1).
+.PP
+eventd runs under the Peios service manager as a Critical service, after
+loregd and authd. It takes no command-line options: all configuration comes
+from the registry.
+.SH CONFIGURATION
+Settings are read from the registry key
+.BR Machine\eSystem\eeventd .
+The six path values are required and have no compiled defaults:
+.TP
+.B EventStorePath\fR, \fBLogStorePath\fR, \fBMetricStorePath
+Protected directories holding the event shards and metadata database, the
+log database and the metric database.
+.TP
+.B QuerySocketPath\fR, \fBLogSocketPath\fR, \fBMetricSocketPath
+The query stream socket and the log and metric datagram sockets.
+.PP
+Paths apply at the next start. Every tuning value (batching, retention,
+query limits, indexing and shedding) has a compiled default and applies
+live; an invalid live change is ignored and the last valid value stays in
+effect. The standard deployment is offered by
+.IR eventd-config.reg ;
+installing the package does not apply it. See
+.I /usr/share/regman/eventd.regman
+for every value, its type, default and when it applies.
+.SH SECURITY
+Access is enforced on the read path only. Each query is authorized with KACS
+AccessCheck against the caller's token, taken from the query socket's peer;
+records and fields the caller may not see are filtered out. eventd makes no
+access decision of its own. Ingestion continues even when queries cannot be
+authorized.
+.SH SIGNALS
+.TP
+.BR SIGTERM ", " SIGINT
+Begin graceful shutdown.
+.TP
+.B SIGQUIT
+Write a diagnostic dump to standard error, then begin graceful shutdown.
+.TP
+.B SIGHUP
+Re-read configuration from the registry.
+.SH EXIT STATUS
+.B eventd
+exits 0 after a graceful shutdown and 1 on a fatal error, which it reports
+on standard error.
+.SH FILES
+.TP
+.I /var/state/eventd/events/
+Event shards and
+.IR eventd-meta.db .
+.TP
+.I /var/state/eventd/logs/logs.db
+Log store.
+.TP
+.I /var/state/eventd/metrics/metrics.db
+Metric store.
+.TP
+.I /run/eventd/query.sock
+Query socket.
+.TP
+.I /run/eventd/log.sock
+Log ingestion socket.
+.TP
+.I /run/eventd/metric.sock
+Metric ingestion socket.
+.TP
+.I /usr/share/regim/eventd-service.reg
+Service definition.
+.TP
+.I /usr/share/regim/eventd-config.reg
+Standard configuration, offered but not applied.
+.TP
+.I /usr/share/regman/eventd.regman
+Registry reference.
+.PP
+These are the standard paths; the registry values above select the actual
+ones.
+.SH SEE ALSO
+.BR evctl (1)
+.PP
+The eventd manual at https://learn.peios.org.

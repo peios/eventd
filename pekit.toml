@@ -125,6 +125,9 @@ install -m 0644 "$SRC/registry.d/eventd-service.reg" \
   "$PEKIT_OUT/usr/share/regim/eventd-service.reg"
 install -m 0644 "$SRC/eventd.regman" \
   "$PEKIT_OUT/usr/share/regman/eventd.regman"
+mkdir -p "$PEKIT_OUT/usr/share/man/man1" "$PEKIT_OUT/usr/share/man/man8"
+gzip -n -9 -c "$SRC/man/evctl.1" > "$PEKIT_OUT/usr/share/man/man1/evctl.1.gz"
+gzip -n -9 -c "$SRC/man/eventd.8" > "$PEKIT_OUT/usr/share/man/man8/eventd.8.gz"
 
 # Mutable stores are never populated by a package. These empty entries only
 # provision the protected directory skeleton expected during startup.
@@ -196,6 +199,7 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 
 [build.main.dependencies.peipkg]
 "org.git.kernel.dash"      = "*"
+"org.gnu.gzip"             = "*"
 "dev.peios.peiosutils"     = "*"
 # install -m
 "org.gnu.coreutils-build-compat" = "*"
@@ -232,6 +236,12 @@ PEKIT_OUT="$PEKIT_MAIN_OUT"
 # seeds, empty-state contamination, and incomplete regman delivery.
 test "$("$PEKIT_OUT/usr/bin/evctl" version)" = "evctl $PEKIT_VERSION"
 "$PEKIT_OUT/usr/bin/evctl" help | grep -F "Usage:" >/dev/null
+gzip -t "$PEKIT_OUT/usr/share/man/man1/evctl.1.gz"
+gzip -t "$PEKIT_OUT/usr/share/man/man8/eventd.8.gz"
+# The manual documents every option the client accepts.
+for option in --format --socket --file --help --version; do
+  gzip -dc "$PEKIT_OUT/usr/share/man/man1/evctl.1.gz" | grep -F -- "-${option#--}" >/dev/null
+done
 python3 - "$PEKIT_OUT" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -296,6 +306,7 @@ done
 
 [test.dependencies.peipkg]
 "org.git.kernel.dash"      = "*"
+"org.gnu.gzip"             = "*"
 "dev.peios.peiosutils"     = "*"
 "org.gnu.findutils"        = "*"
 "org.gnu.grep"             = "*"
