@@ -25,8 +25,12 @@ Queries use the PSPU observability query language over a stream socket; see
 .BR evctl (1).
 .PP
 eventd runs under the Peios service manager as a Critical service, after
-loregd and authd. It takes no command-line options: all configuration comes
-from the registry.
+loregd and authd. Runtime configuration comes from the registry.
+The service manager invokes
+.B --prepare-security
+once as SYSTEM before launch to initialize registry query authorization
+defaults. The long-running daemon uses its own virtual Service identity,
+with only traversal, KMES-consumer and event-emission privileges.
 .SH CONFIGURATION
 Settings are read from the registry key
 .BR Machine\eSystem\eeventd .

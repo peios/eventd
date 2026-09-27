@@ -14,8 +14,10 @@ use peios::token::Token;
 /// The service manager is SYSTEM without the Service-logon group. Every
 /// phase-2 service, including a SYSTEM service, carries `SU` (S-1-5-6). The
 /// explicit deny therefore keeps services from forging peinit's log origins,
-/// while the following SYSTEM allow leaves the broker and owner operable.
-const LOG_BROKER_SDDL: &str = "O:SYG:SYD:P(D;;0x2;;;SU)(A;;GA;;;SY)";
+/// while SYSTEM can still deliver logs and the socket owner can manage it.
+/// Preserve the virtual service owner: changing it to SYSTEM would require a
+/// privilege the long-running daemon deliberately does not hold.
+const LOG_BROKER_SDDL: &str = "D:P(D;;0x2;;;SU)(A;;GA;;;SY)(A;;GA;;;OW)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protection {
@@ -149,7 +151,7 @@ fn establish_protection(path: &Path, protection: Protection) -> Result<(), Socke
             (secinfo, descriptor)
         }
         Protection::PeinitLogBroker => (
-            SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL,
+            SecInfo::DACL,
             sddl::parse(LOG_BROKER_SDDL).map_err(SocketError::Security)?,
         ),
     };

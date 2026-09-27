@@ -10,48 +10,146 @@
     "",
     "This seed is inert until an image names eventd-config.reg in its",
     "[registry] autoapply list. Tuning values are omitted because eventd's",
-    "compiled defaults are the canonical defaults documented by regman."
+    "compiled defaults are the canonical defaults documented by regman.",
+    "eventd has its own virtual Service identity. Its SID grants only KMES consumption, event emission and traversal; System integrity permits receiving tokens from all query/metric clients without granting SYSTEM identity or TCB privilege."
   ],
   "keys": [
-    { "path": "Machine\\System" },
-    { "path": "Machine\\System\\Init" },
-    { "path": "Machine\\System\\Init\\ProvisionedPaths" },
+    {
+      "path": "Machine\\System"
+    },
+    {
+      "path": "Machine\\System\\Init"
+    },
+    {
+      "path": "Machine\\System\\Init\\ProvisionedPaths"
+    },
     {
       "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-events",
       "values": [
-        { "name": "Kind",     "type": "sz",     "data": "directory" },
-        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/events" },
-        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
-        { "name": "Required", "type": "dword",  "data": 1 }
+        {
+          "name": "Kind",
+          "type": "sz",
+          "data": "directory"
+        },
+        {
+          "name": "Path",
+          "type": "sz",
+          "data": "/var/state/eventd/events"
+        },
+        {
+          "name": "Security",
+          "type": "binary",
+          "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002005c000300000000031400000000100101000000000005120000000003180000000010010200000000000520000000200200000003280000000010010600000000000550000000d2840e756d1f666dfc67a2638a84d887a4a3e576"
+        },
+        {
+          "name": "Required",
+          "type": "dword",
+          "data": 1
+        }
       ]
     },
     {
       "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-logs",
       "values": [
-        { "name": "Kind",     "type": "sz",     "data": "directory" },
-        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/logs" },
-        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
-        { "name": "Required", "type": "dword",  "data": 1 }
+        {
+          "name": "Kind",
+          "type": "sz",
+          "data": "directory"
+        },
+        {
+          "name": "Path",
+          "type": "sz",
+          "data": "/var/state/eventd/logs"
+        },
+        {
+          "name": "Security",
+          "type": "binary",
+          "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002005c000300000000031400000000100101000000000005120000000003180000000010010200000000000520000000200200000003280000000010010600000000000550000000d2840e756d1f666dfc67a2638a84d887a4a3e576"
+        },
+        {
+          "name": "Required",
+          "type": "dword",
+          "data": 1
+        }
       ]
     },
     {
       "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-metrics",
       "values": [
-        { "name": "Kind",     "type": "sz",     "data": "directory" },
-        { "name": "Path",     "type": "sz",     "data": "/var/state/eventd/metrics" },
-        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002003400020000000003140000000010010100000000000512000000000318000000001001020000000000052000000020020000" },
-        { "name": "Required", "type": "dword",  "data": 1 }
+        {
+          "name": "Kind",
+          "type": "sz",
+          "data": "directory"
+        },
+        {
+          "name": "Path",
+          "type": "sz",
+          "data": "/var/state/eventd/metrics"
+        },
+        {
+          "name": "Security",
+          "type": "binary",
+          "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002005c000300000000031400000000100101000000000005120000000003180000000010010200000000000520000000200200000003280000000010010600000000000550000000d2840e756d1f666dfc67a2638a84d887a4a3e576"
+        },
+        {
+          "name": "Required",
+          "type": "dword",
+          "data": 1
+        }
       ]
     },
     {
       "path": "Machine\\System\\eventd",
       "values": [
-        { "name": "EventStorePath",  "type": "sz", "data": "/var/state/eventd/events/" },
-        { "name": "LogStorePath",    "type": "sz", "data": "/var/state/eventd/logs/" },
-        { "name": "MetricStorePath", "type": "sz", "data": "/var/state/eventd/metrics/" },
-        { "name": "QuerySocketPath", "type": "sz", "data": "/run/eventd/query.sock" },
-        { "name": "LogSocketPath",   "type": "sz", "data": "/run/eventd/log.sock" },
-        { "name": "MetricSocketPath","type": "sz", "data": "/run/eventd/metric.sock" }
+        {
+          "name": "EventStorePath",
+          "type": "sz",
+          "data": "/var/state/eventd/events/"
+        },
+        {
+          "name": "LogStorePath",
+          "type": "sz",
+          "data": "/var/state/eventd/logs/"
+        },
+        {
+          "name": "MetricStorePath",
+          "type": "sz",
+          "data": "/var/state/eventd/metrics/"
+        },
+        {
+          "name": "QuerySocketPath",
+          "type": "sz",
+          "data": "/run/eventd/query.sock"
+        },
+        {
+          "name": "LogSocketPath",
+          "type": "sz",
+          "data": "/run/eventd/log.sock"
+        },
+        {
+          "name": "MetricSocketPath",
+          "type": "sz",
+          "data": "/run/eventd/metric.sock"
+        }
+      ]
+    },
+    {
+      "path": "Machine\\Generic\\Authn\\Policy\\S-1-5-80-1963885778-1835409261-1671587836-2279113866-1994761124",
+      "values": [
+        {
+          "name": "Privileges",
+          "type": "multi",
+          "data": [
+            "SeChangeNotifyPrivilege",
+            "SeSecurityPrivilege",
+            "SeAuditPrivilege"
+          ]
+        },
+        {
+          "name": "Integrity",
+          "type": "sz",
+          "data": "System"
+        }
       ]
     }
   ]

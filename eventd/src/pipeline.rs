@@ -46,7 +46,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     let config_watch = ConfigWatch::arm()?;
     let runtime = config.clone().shared();
-    crate::query::provision_security_defaults()?;
     validate_distinct_paths(&config)?;
     let event_directory = StoreDirectory::open(&config.event_store_path)?;
     let log_directory = StoreDirectory::open(&config.log_store_path)?;
