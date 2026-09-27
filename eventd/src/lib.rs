@@ -26,3 +26,8 @@ mod writer;
 pub fn run() -> Result<(), Box<dyn Error>> {
     pipeline::run()
 }
+
+/// Initialize registry query policy from a short privileged pre-start hook.
+pub fn prepare_security() -> Result<(), Box<dyn Error>> {
+    query::provision_security_defaults().map_err(Into::into)
+}

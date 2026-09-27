@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use peios::file::{File, SecInfo};
 use peios::security::sddl;
 
-const REQUIRED_SDDL: &str = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+const REQUIRED_SDDL: &str = "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;S-1-5-80-1963885778-1835409261-1671587836-2279113866-1994761124)";
 
 pub struct StoreDirectory {
     handle: File,
@@ -57,7 +57,8 @@ fn open_components(path: &Path) -> Result<OwnedFd, DirectoryError> {
     }
     // SAFETY: `root` is a fresh owned descriptor after successful open.
     let mut current = unsafe { OwnedFd::from_raw_fd(root) };
-    for component in path.components() {
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
             if matches!(component, Component::RootDir) {
                 continue;
@@ -67,12 +68,20 @@ fn open_components(path: &Path) -> Result<OwnedFd, DirectoryError> {
         let name =
             CString::new(name.as_bytes()).map_err(|_| DirectoryError::Invalid(path.into()))?;
         // SAFETY: `current` and `name` are live. O_NOFOLLOW rejects a symlink at
-        // this component; O_DIRECTORY rejects non-directories.
+        // this component; O_DIRECTORY rejects non-directories. Intermediate
+        // O_PATH handles preserve anchoring without asking to list private
+        // ancestors such as /var/state. Only the store itself needs reading.
         let next = unsafe {
             libc::openat(
                 current.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                (if index + 1 == components.len() {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_PATH
+                }) | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
             )
         };
         if next < 0 {

@@ -17,24 +17,96 @@
     "ordinary crashes before peinit applies the Critical failure policy.",
     "",
     "This definition is inert until an image names eventd-service.reg in its",
-    "[registry] autoapply list. The image must also apply eventd-config.reg."
+    "[registry] autoapply list. The image must also apply eventd-config.reg.",
+    "The short SYSTEM hook initializes registry authorization defaults before the daemon starts. The long-lived daemon has its own service account and cannot write registry policy."
   ],
   "keys": [
-    { "path": "Machine\\System" },
-    { "path": "Machine\\System\\Services" },
+    {
+      "path": "Machine\\System"
+    },
+    {
+      "path": "Machine\\System\\Services"
+    },
     {
       "path": "Machine\\System\\Services\\eventd",
       "values": [
-        { "name": "ImagePath",          "type": "sz",    "data": "/usr/sbin/eventd" },
-        { "name": "Triggers",           "type": "multi", "data": ["boot"] },
-        { "name": "RuntimeDirectories", "type": "multi", "data": ["eventd"] },
-        { "name": "Requires",           "type": "multi", "data": ["authd"] },
-        { "name": "Identity",           "type": "sz",    "data": "SYSTEM" },
-        { "name": "Readiness",          "type": "dword", "data": 0 },
-        { "name": "RestartPolicy",      "type": "dword", "data": 1 },
-        { "name": "ErrorControl",       "type": "dword", "data": 1 },
-        { "name": "DisplayName",        "type": "sz",    "data": "Event and observability store" },
-        { "name": "Description",        "type": "sz",    "data": "Persists KMES events, service logs and metrics and serves authorized queries" }
+        {
+          "name": "ImagePath",
+          "type": "sz",
+          "data": "/usr/sbin/eventd"
+        },
+        {
+          "name": "Triggers",
+          "type": "multi",
+          "data": [
+            "boot"
+          ]
+        },
+        {
+          "name": "RuntimeDirectories",
+          "type": "multi",
+          "data": [
+            "eventd"
+          ]
+        },
+        {
+          "name": "Requires",
+          "type": "multi",
+          "data": [
+            "authd"
+          ]
+        },
+        {
+          "name": "Identity",
+          "type": "sz",
+          "data": "Service"
+        },
+        {
+          "name": "Readiness",
+          "type": "dword",
+          "data": 0
+        },
+        {
+          "name": "RestartPolicy",
+          "type": "dword",
+          "data": 1
+        },
+        {
+          "name": "ErrorControl",
+          "type": "dword",
+          "data": 1
+        },
+        {
+          "name": "DisplayName",
+          "type": "sz",
+          "data": "Event and observability store"
+        },
+        {
+          "name": "Description",
+          "type": "sz",
+          "data": "Persists KMES events, service logs and metrics and serves authorized queries"
+        },
+        {
+          "name": "RequiredPrivileges",
+          "type": "multi",
+          "data": [
+            "SeChangeNotifyPrivilege",
+            "SeSecurityPrivilege",
+            "SeAuditPrivilege"
+          ]
+        },
+        {
+          "name": "ExecStartPre",
+          "type": "multi",
+          "data": [
+            "/usr/sbin/eventd --prepare-security"
+          ]
+        },
+        {
+          "name": "HookIdentity",
+          "type": "sz",
+          "data": "SYSTEM"
+        }
       ]
     }
   ]

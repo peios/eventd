@@ -255,7 +255,9 @@ service_values = {
     for value in key["values"]
 }
 assert service_values["ImagePath"] == "/usr/sbin/eventd"
-assert service_values["Identity"] == "SYSTEM"
+assert service_values["Identity"] == "Service"
+assert service_values["HookIdentity"] == "SYSTEM"
+assert service_values["RequiredPrivileges"] == ["SeChangeNotifyPrivilege", "SeSecurityPrivilege", "SeAuditPrivilege"]
 assert service_values["Requires"] == ["authd"]
 assert service_values["ErrorControl"] == 1
 configured = {
