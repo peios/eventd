@@ -369,6 +369,20 @@ applies: live
 Soft result batching target. One complete record may exceed it and is never
 split or truncated.
 
+--- machine\system\eventd maxqueryheldbytes
+canonical: Machine\System\eventd MaxQueryHeldBytes
+type: REG_DWORD
+default: 268435456
+valid: 16777216 to 4294967295
+applies: live
+
+Memory every running query together may hold to answer: a sorted query's
+rows, an aggregation's groups, a live tail's batch. One budget for all of
+them, because eventd may not be killed. A query that would need more fails
+with an error. A query in the default order, newest first with no SORT or
+aggregation, holds nothing against it and is never refused for its size.
+Metric queries are not yet counted.
+
 --- machine\system\eventd adaptiverollupminsamples
 canonical: Machine\System\eventd AdaptiveRollupMinSamples
 type: REG_DWORD

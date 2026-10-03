@@ -4,6 +4,8 @@ use core::cmp::Ordering;
 use core::fmt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +13,9 @@ use eventd_core::MetricRollup;
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::security::{Authorizer, Namespace};
-use super::value::{Record, Value, ascii_equal, flatten_event_payload, guid_string, language_cmp};
+use super::value::{
+    Record, Value, ascii_equal, flatten_event_payload, guid_string, is_nan, language_cmp,
+};
 use crate::metric_ingest::RollupMaintenance;
 use crate::query_language::{
     AggregateFunction, CrossFilter, Expr, GroupFunction, Literal, MetricAggregate, Operator, Query,
@@ -32,6 +36,17 @@ pub struct Limits {
     pub adaptive_rollup_min_samples: usize,
     pub adaptive_rollup_batch_rows: usize,
     pub adaptive_rollup_max_rows: usize,
+    pub held: HeldBudget,
+}
+
+/// The memory every running query together may hold to answer
+/// (`MaxQueryHeldBytes`), and how much of it is taken. One budget for all
+/// of them, like the concurrency limits, because eventd may not be killed:
+/// what bounds it must hold however many queries run (TRM §6.5).
+#[derive(Clone)]
+pub struct HeldBudget {
+    pub used: Arc<AtomicUsize>,
+    pub limit: usize,
 }
 
 pub struct StreamState {
@@ -40,6 +55,7 @@ pub struct StreamState {
     cross_type_window: Duration,
     cross_type_max_lookback: Duration,
     authorization: AuthorizationCache,
+    held: HeldBudget,
 }
 
 #[derive(Clone)]
@@ -81,6 +97,7 @@ pub fn execute(
         limits.cross_type_max_lookback,
         &mut authorization,
         Some(limits),
+        &limits.held,
         emit,
     )
 }
@@ -112,6 +129,7 @@ pub fn start_stream(
         limits.cross_type_max_lookback,
         &mut authorization,
         Some(limits),
+        &limits.held,
         emit,
     )?;
     Ok(StreamState {
@@ -120,6 +138,7 @@ pub fn start_stream(
         cross_type_window: limits.cross_type_window,
         cross_type_max_lookback: limits.cross_type_max_lookback,
         authorization,
+        held: limits.held.clone(),
     })
 }
 
@@ -152,6 +171,7 @@ pub fn stream_next(
         state.cross_type_max_lookback,
         &mut state.authorization,
         None,
+        &state.held,
         &mut |record| {
             records.push(record);
             Ok(())
@@ -179,6 +199,7 @@ fn execute_at(
     cross_type_max_lookback: Duration,
     authorization: &mut AuthorizationCache,
     rollup_limits: Option<&Limits>,
+    budget: &HeldBudget,
     emit: &mut Emit<'_>,
 ) -> Result<(), QueryError> {
     let (since, mut until) = time_range(query, evaluation_time)?;
@@ -264,7 +285,23 @@ fn execute_at(
     };
     let mut skip = query.skip;
     let mut remaining = query.take;
-    let mut rows = Vec::new();
+    // What the other queries hold: an aggregation folds its groups as rows
+    // pass, and a sorted one keeps its rows, or with TAKE only its best
+    // SKIP + TAKE. A watch batch is gathered whole, because its cross-type
+    // conditions are judged on the batch (PSPU §3.27); it is one commit's
+    // worth.
+    let mut held = Held::new(budget);
+    let mut gathered = match &query.aggregate {
+        Some(aggregate) if !watch => Gathered::Groups(Groups::new(aggregate)),
+        _ => Gathered::Rows(Vec::new()),
+    };
+    let keep = if watch {
+        None
+    } else {
+        query
+            .take
+            .and_then(|take| usize::try_from(take.saturating_add(query.skip)).ok())
+    };
     let mut visit = |mut row: Row| -> Result<Flow, QueryError> {
         if historical_ranges
             .as_deref()
@@ -281,7 +318,7 @@ fn execute_at(
             return Ok(Flow::More);
         }
         if !newest_first {
-            rows.push(row);
+            gathered.add(row, query, keep, &mut held)?;
             return Ok(Flow::More);
         }
         if skip > 0 {
@@ -330,6 +367,10 @@ fn execute_at(
     if newest_first {
         return Ok(());
     }
+    let mut rows = match gathered {
+        Gathered::Groups(groups) => return emit_aggregate(groups.finish()?, query, emit),
+        Gathered::Rows(rows) => rows,
+    };
 
     if watch && !query.cross_filters.is_empty() {
         apply_watch_cross_filters(
@@ -343,15 +384,149 @@ fn execute_at(
     }
 
     if let Some(aggregate) = &query.aggregate {
-        let mut records = aggregate_records(rows, aggregate)?;
-        apply_record_sort(&mut records, query);
-        apply_pagination(&mut records, query);
-        return records.into_iter().try_for_each(|row| emit(row.record));
+        let mut groups = Groups::new(aggregate);
+        for row in &rows {
+            groups.add(row, &mut held)?;
+        }
+        return emit_aggregate(groups.finish()?, query, emit);
     }
     sort_rows(&mut rows, query);
     apply_pagination(&mut rows, query);
     rows.into_iter()
         .try_for_each(|row| emit(project(row.record, &query.select)))
+}
+
+fn emit_aggregate(
+    mut records: Vec<Row>,
+    query: &Query,
+    emit: &mut Emit<'_>,
+) -> Result<(), QueryError> {
+    apply_record_sort(&mut records, query);
+    apply_pagination(&mut records, query);
+    records.into_iter().try_for_each(|row| emit(row.record))
+}
+
+/// The visible rows a query that is not in the default order gathers.
+enum Gathered<'q> {
+    Rows(Vec<Row>),
+    Groups(Groups<'q>),
+}
+
+/// Rows a sorted query gathers before it trims to its best SKIP + TAKE.
+const TRIM_AT: usize = 1_024;
+
+impl Gathered<'_> {
+    fn add(
+        &mut self,
+        row: Row,
+        query: &Query,
+        keep: Option<usize>,
+        held: &mut Held<'_>,
+    ) -> Result<(), QueryError> {
+        match self {
+            Self::Groups(groups) => groups.add(&row, held),
+            Self::Rows(rows) => {
+                held.add(row_size(&row))?;
+                rows.push(row);
+                if let Some(keep) = keep
+                    && rows.len() >= keep.saturating_mul(2).max(TRIM_AT)
+                {
+                    sort_rows(rows, query);
+                    rows.truncate(keep);
+                    held.set(rows.iter().map(row_size).sum())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// What one query holds against the budget every running query shares.
+/// It is reserved in granules, so that the shared counter is touched only
+/// now and then, and given back when the query is done.
+struct Held<'a> {
+    budget: &'a HeldBudget,
+    reserved: usize,
+    holding: usize,
+}
+
+const HELD_GRANULE: usize = 64 * 1_024;
+
+impl<'a> Held<'a> {
+    const fn new(budget: &'a HeldBudget) -> Self {
+        Self {
+            budget,
+            reserved: 0,
+            holding: 0,
+        }
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<(), QueryError> {
+        self.set(self.holding.saturating_add(bytes))
+    }
+
+    fn set(&mut self, bytes: usize) -> Result<(), QueryError> {
+        self.holding = bytes;
+        let wanted = bytes.div_ceil(HELD_GRANULE).saturating_mul(HELD_GRANULE);
+        if wanted > self.reserved {
+            let more = wanted - self.reserved;
+            let limit = self.budget.limit;
+            self.budget
+                .used
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
+                    used.checked_add(more).filter(|total| *total <= limit)
+                })
+                .map_err(|_| QueryError::HeldLimit)?;
+        } else if wanted < self.reserved {
+            self.budget
+                .used
+                .fetch_sub(self.reserved - wanted, AtomicOrdering::AcqRel);
+        }
+        self.reserved = wanted;
+        Ok(())
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.reserved, AtomicOrdering::AcqRel);
+    }
+}
+
+/// Roughly what a value costs held in memory.
+fn value_size(value: &Value) -> usize {
+    size_of::<Value>()
+        + match value {
+            Value::String(text) => text.len(),
+            Value::Binary(bytes) => bytes.len(),
+            Value::Array(values) => values.iter().map(value_size).sum(),
+            Value::Map(entries) => entries
+                .iter()
+                .map(|(key, value)| value_size(key) + value_size(value))
+                .sum(),
+            Value::Null
+            | Value::Bool(_)
+            | Value::Signed(_)
+            | Value::Unsigned(_)
+            | Value::Float(_) => 0,
+        }
+}
+
+/// What one field of a record costs beyond its name and value: its share
+/// of the map's nodes and the name's own allocation.
+const FIELD_OVERHEAD: usize = 48;
+
+/// Roughly what a row costs held in memory.
+fn row_size(row: &Row) -> usize {
+    size_of::<Row>()
+        + row.identifier.len()
+        + row
+            .record
+            .iter()
+            .map(|(field, value)| FIELD_OVERHEAD + field.len() + value_size(value))
+            .sum::<usize>()
 }
 
 /// A result record narrowed to SELECT's fields, which is applied last.
@@ -1609,6 +1784,8 @@ fn canonical_guid_literal(value: &str) -> Option<String> {
     Some(format!("{{{}}}", body.to_ascii_lowercase()))
 }
 
+/// An ordering predicate. A NaN satisfies none, though it sorts after
+/// every number (PSPU §3.20–§3.21).
 fn numeric_order(left: &Value, right: &Value, wanted: Ordering) -> bool {
     matches!(
         left,
@@ -1616,7 +1793,9 @@ fn numeric_order(left: &Value, right: &Value, wanted: Ordering) -> bool {
     ) && matches!(
         right,
         Value::Signed(_) | Value::Unsigned(_) | Value::Float(_)
-    ) && language_cmp(left, right) == wanted
+    ) && !is_nan(left)
+        && !is_nan(right)
+        && language_cmp(left, right) == wanted
 }
 
 fn string_operation(left: &Value, right: &Value, operation: impl Fn(&str, &str) -> bool) -> bool {
@@ -1683,31 +1862,160 @@ fn timestamp(row: &Row) -> i64 {
     }
 }
 
-fn aggregate_records(rows: Vec<Row>, aggregate: &RecordAggregate) -> Result<Vec<Row>, QueryError> {
-    match aggregate {
-        RecordAggregate::CountBy(field) => Ok(count_by(&rows, field, None)),
-        RecordAggregate::TopBy { count, field } => Ok(count_by(&rows, field, Some(*count))),
-        RecordAggregate::Distinct(field) => Ok(distinct(&rows, field)),
-        RecordAggregate::Group { fields, function } => group(rows, fields, function),
+/// An aggregation's groups, folded as rows pass, so what is held is the
+/// groups and never the rows (TRM §6.4). Groups are found by a hash of a
+/// key that language-equal values always share, then compared under the
+/// language's own equality against each group's representative in the
+/// order the groups appeared, so that the answer is the one comparing
+/// every group in turn would give.
+struct Groups<'q> {
+    aggregate: &'q RecordAggregate,
+    index: HashMap<Vec<GroupKey>, Vec<usize>>,
+    /// Every group so far, in the order they appeared.
+    seen: Vec<Group>,
+}
+
+struct Group {
+    /// The smallest member of each grouping field (TRM §6.2).
+    keys: Vec<Value>,
+    count: u64,
+    numeric: Numeric,
+}
+
+/// What a new group costs beyond its keys.
+const GROUP_OVERHEAD: usize = 128;
+
+impl<'q> Groups<'q> {
+    fn new(aggregate: &'q RecordAggregate) -> Self {
+        Self {
+            aggregate,
+            index: HashMap::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    fn fields(&self) -> &'q [String] {
+        match self.aggregate {
+            RecordAggregate::CountBy(field)
+            | RecordAggregate::Distinct(field)
+            | RecordAggregate::TopBy { field, .. } => std::slice::from_ref(field),
+            RecordAggregate::Group { fields, .. } => fields,
+        }
+    }
+
+    fn add(&mut self, row: &Row, held: &mut Held<'_>) -> Result<(), QueryError> {
+        let keys: Vec<_> = self
+            .fields()
+            .iter()
+            .map(|field| row.record.get(field).cloned().unwrap_or(Value::Null))
+            .collect();
+        let bucket = self
+            .index
+            .entry(keys.iter().map(GroupKey::of).collect())
+            .or_default();
+        let found = bucket.iter().copied().find(|&index| {
+            self.seen[index]
+                .keys
+                .iter()
+                .zip(&keys)
+                .all(|(representative, value)| representative.language_equal(value))
+        });
+        let index = if let Some(index) = found {
+            for (representative, value) in self.seen[index].keys.iter_mut().zip(keys) {
+                if language_cmp(&value, representative) == Ordering::Less {
+                    *representative = value;
+                }
+            }
+            index
+        } else {
+            held.add(GROUP_OVERHEAD + keys.iter().map(value_size).sum::<usize>())?;
+            bucket.push(self.seen.len());
+            self.seen.push(Group {
+                keys,
+                count: 0,
+                numeric: Numeric::new(),
+            });
+            self.seen.len() - 1
+        };
+        let group = &mut self.seen[index];
+        group.count += 1;
+        if let RecordAggregate::Group {
+            function:
+                GroupFunction::Sum(field)
+                | GroupFunction::Avg(field)
+                | GroupFunction::Min(field)
+                | GroupFunction::Max(field),
+            ..
+        } = self.aggregate
+            && let Some(value) = row.record.get(field)
+        {
+            group.numeric.push(value);
+        }
+        Ok(())
+    }
+
+    /// The result rows: `COUNT BY` and `TOP N BY` by count descending,
+    /// `DISTINCT` by value, `GROUP` in the order its groups appeared.
+    fn finish(self) -> Result<Vec<Row>, QueryError> {
+        let records = match self.aggregate {
+            RecordAggregate::CountBy(field) => counted(field, self.seen, None),
+            RecordAggregate::TopBy { count, field } => counted(field, self.seen, Some(*count)),
+            RecordAggregate::Distinct(field) => {
+                let mut values: Vec<_> = self
+                    .seen
+                    .into_iter()
+                    .filter_map(|group| group.keys.into_iter().next())
+                    .collect();
+                values.sort_by(language_cmp);
+                values
+                    .into_iter()
+                    .map(|value| BTreeMap::from([(field.clone(), value)]))
+                    .collect()
+            }
+            RecordAggregate::Group { fields, function } => {
+                let mut records = Vec::with_capacity(self.seen.len());
+                for group in self.seen {
+                    let (name, value) = match function {
+                        GroupFunction::Count => ("count", Value::Unsigned(group.count)),
+                        GroupFunction::Sum(_) => {
+                            ("sum", group.numeric.finish(AggregateFunction::Sum)?)
+                        }
+                        GroupFunction::Avg(_) => {
+                            ("avg", group.numeric.finish(AggregateFunction::Avg)?)
+                        }
+                        GroupFunction::Min(_) => {
+                            ("min", group.numeric.finish(AggregateFunction::Min)?)
+                        }
+                        GroupFunction::Max(_) => {
+                            ("max", group.numeric.finish(AggregateFunction::Max)?)
+                        }
+                    };
+                    let mut record: Record = fields.iter().cloned().zip(group.keys).collect();
+                    record.insert(name.into(), value);
+                    records.push(record);
+                }
+                records
+            }
+        };
+        Ok(records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| Row {
+                record,
+                identifier: String::new(),
+                tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
+            })
+            .collect())
     }
 }
 
-fn count_by(rows: &[Row], field: &str, take: Option<u64>) -> Vec<Row> {
-    let mut groups: Vec<(Value, u64)> = Vec::new();
-    for row in rows {
-        let value = row.record.get(field).cloned().unwrap_or(Value::Null);
-        if let Some((representative, count)) = groups
-            .iter_mut()
-            .find(|(representative, _)| representative.language_equal(&value))
-        {
-            if language_cmp(&value, representative) == Ordering::Less {
-                *representative = value;
-            }
-            *count += 1;
-        } else {
-            groups.push((value, 1));
-        }
-    }
+/// `COUNT BY` and `TOP N BY` records: count descending, then value, with
+/// groups that tie on both in the order they appeared.
+fn counted(field: &str, groups: Vec<Group>, take: Option<u64>) -> Vec<Record> {
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .filter_map(|group| Some((group.keys.into_iter().next()?, group.count)))
+        .collect();
     groups.sort_by(|left, right| {
         right
             .1
@@ -1719,182 +2027,160 @@ fn count_by(rows: &[Row], field: &str, take: Option<u64>) -> Vec<Row> {
     }
     groups
         .into_iter()
-        .enumerate()
-        .map(|(index, (value, count))| Row {
-            record: BTreeMap::from([
+        .map(|(value, count)| {
+            BTreeMap::from([
                 (field.to_owned(), value),
                 ("count".into(), Value::Unsigned(count)),
-            ]),
-            identifier: String::new(),
-            tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
+            ])
         })
         .collect()
 }
 
-fn distinct(rows: &[Row], field: &str) -> Vec<Row> {
-    let mut values = Vec::<Value>::new();
-    for row in rows {
-        let value = row.record.get(field).cloned().unwrap_or(Value::Null);
-        if let Some(representative) = values.iter_mut().find(|item| item.language_equal(&value)) {
-            if language_cmp(&value, representative) == Ordering::Less {
-                *representative = value;
-            }
-        } else {
-            values.push(value);
+/// A hash key that every pair of language-equal values shares (PSPU
+/// §3.20–§3.21): numbers by their nearest binary64, with the zeros as
+/// one, text with ASCII case folded, containers by their members. Values
+/// that share a key may still differ; only equality decides.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum GroupKey {
+    Null,
+    Bool(bool),
+    Number(u64),
+    Text(Vec<u8>),
+    Binary(Vec<u8>),
+    Array(Vec<Self>),
+    Map(Vec<Self>),
+}
+
+impl GroupKey {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "an integer and a float are equal only when the float is that integer, which then converts exactly; integers that round together merely share a bucket"
+    )]
+    fn of(value: &Value) -> Self {
+        let number = |number: f64| Self::Number(if number == 0.0 { 0 } else { number.to_bits() });
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(value) => Self::Bool(*value),
+            Value::Signed(value) => number(*value as f64),
+            Value::Unsigned(value) => number(*value as f64),
+            Value::Float(value) => number(*value),
+            Value::String(text) => Self::Text(text.bytes().map(super::value::fold_ascii).collect()),
+            Value::Binary(bytes) => Self::Binary(bytes.clone()),
+            Value::Array(values) => Self::Array(values.iter().map(Self::of).collect()),
+            Value::Map(entries) => Self::Map(
+                entries
+                    .iter()
+                    .flat_map(|(key, value)| [Self::of(key), Self::of(value)])
+                    .collect(),
+            ),
         }
     }
-    values.sort_by(language_cmp);
-    values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| Row {
-            record: BTreeMap::from([(field.to_owned(), value)]),
-            identifier: String::new(),
-            tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
-        })
-        .collect()
 }
 
-fn group(
-    rows: Vec<Row>,
-    fields: &[String],
-    function: &GroupFunction,
-) -> Result<Vec<Row>, QueryError> {
-    let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
-    for row in rows {
-        let keys: Vec<_> = fields
-            .iter()
-            .map(|field| row.record.get(field).cloned().unwrap_or(Value::Null))
-            .collect();
-        if let Some((representatives, members)) = groups.iter_mut().find(|(representatives, _)| {
-            representatives
-                .iter()
-                .zip(&keys)
-                .all(|(left, right)| left.language_equal(right))
-        }) {
-            for (representative, value) in representatives.iter_mut().zip(keys) {
-                if language_cmp(&value, representative) == Ordering::Less {
-                    *representative = value;
+/// `SUM`, `AVG`, `MIN` and `MAX` over a group's numeric values, folded in
+/// the order the values come. Non-numeric values are not counted.
+struct Numeric {
+    count: usize,
+    /// The binary64 sum, from the same neutral element and in the same
+    /// order as summing every value at the end would use.
+    total: f64,
+    /// The exact sum while every value is an integer and it fits.
+    exact: Option<i128>,
+    float: bool,
+    /// The first of the smallest values, and the last of the largest.
+    least: Option<Value>,
+    most: Option<Value>,
+}
+
+impl Numeric {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            total: std::iter::empty::<f64>().sum(),
+            exact: Some(0),
+            float: false,
+            least: None,
+            most: None,
+        }
+    }
+
+    fn push(&mut self, value: &Value) {
+        match value {
+            Value::Signed(number) => {
+                self.exact = self
+                    .exact
+                    .and_then(|sum| sum.checked_add(i128::from(*number)));
+            }
+            Value::Unsigned(number) => {
+                self.exact = self
+                    .exact
+                    .and_then(|sum| sum.checked_add(i128::from(*number)));
+            }
+            Value::Float(_) => self.float = true,
+            _ => return,
+        }
+        self.count += 1;
+        self.total += as_f64(value);
+        if self
+            .least
+            .as_ref()
+            .is_none_or(|least| language_cmp(value, least) == Ordering::Less)
+        {
+            self.least = Some(value.clone());
+        }
+        if self
+            .most
+            .as_ref()
+            .is_none_or(|most| language_cmp(value, most) != Ordering::Less)
+        {
+            self.most = Some(value.clone());
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "PSPU defines AVG and overflowing integer SUM results as binary64"
+    )]
+    fn finish(&self, function: AggregateFunction) -> Result<Value, QueryError> {
+        if self.count == 0 {
+            return Ok(Value::Null);
+        }
+        let result = match function {
+            AggregateFunction::Min => return Ok(self.least.clone().unwrap_or(Value::Null)),
+            AggregateFunction::Max => return Ok(self.most.clone().unwrap_or(Value::Null)),
+            AggregateFunction::Sum => {
+                if !self.float
+                    && let Some(exact) = self.exact
+                {
+                    if let Ok(value) = i64::try_from(exact) {
+                        return Ok(Value::Signed(value));
+                    }
+                    if let Ok(value) = u64::try_from(exact) {
+                        return Ok(Value::Unsigned(value));
+                    }
                 }
+                self.total
             }
-            members.push(row);
+            AggregateFunction::Avg => self.total / self.count as f64,
+        };
+        if result.is_finite() {
+            Ok(Value::Float(result))
         } else {
-            groups.push((keys, vec![row]));
+            Err(QueryError::NonFinite)
         }
     }
-    let mut output = Vec::with_capacity(groups.len());
-    for (index, (keys, members)) in groups.into_iter().enumerate() {
-        let mut record: Record = fields.iter().cloned().zip(keys).collect();
-        match function {
-            GroupFunction::Count => {
-                record.insert("count".into(), Value::Unsigned(members.len() as u64));
-            }
-            GroupFunction::Sum(field) => {
-                record.insert(
-                    "sum".into(),
-                    numeric_aggregate(&members, field, AggregateFunction::Sum)?,
-                );
-            }
-            GroupFunction::Avg(field) => {
-                record.insert(
-                    "avg".into(),
-                    numeric_aggregate(&members, field, AggregateFunction::Avg)?,
-                );
-            }
-            GroupFunction::Min(field) => {
-                record.insert(
-                    "min".into(),
-                    numeric_aggregate(&members, field, AggregateFunction::Min)?,
-                );
-            }
-            GroupFunction::Max(field) => {
-                record.insert(
-                    "max".into(),
-                    numeric_aggregate(&members, field, AggregateFunction::Max)?,
-                );
-            }
-        }
-        output.push(Row {
-            record,
-            identifier: String::new(),
-            tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
-        });
-    }
-    Ok(output)
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "PSPU defines AVG and overflowing integer SUM results as binary64"
-)]
 fn numeric_aggregate(
     rows: &[Row],
     field: &str,
     function: AggregateFunction,
 ) -> Result<Value, QueryError> {
-    let values: Vec<_> = rows
-        .iter()
-        .filter_map(|row| row.record.get(field))
-        .filter(|value| {
-            matches!(
-                value,
-                Value::Signed(_) | Value::Unsigned(_) | Value::Float(_)
-            )
-        })
-        .collect();
-    if values.is_empty() {
-        return Ok(Value::Null);
+    let mut numeric = Numeric::new();
+    for value in rows.iter().filter_map(|row| row.record.get(field)) {
+        numeric.push(value);
     }
-    match function {
-        AggregateFunction::Min => Ok((*values
-            .into_iter()
-            .min_by(|left, right| language_cmp(left, right))
-            .expect("nonempty"))
-        .clone()),
-        AggregateFunction::Max => Ok((*values
-            .into_iter()
-            .max_by(|left, right| language_cmp(left, right))
-            .expect("nonempty"))
-        .clone()),
-        AggregateFunction::Sum if values.iter().all(|value| !matches!(value, Value::Float(_))) => {
-            let exact = values.iter().try_fold(0_i128, |sum, value| {
-                let value = match value {
-                    Value::Signed(value) => i128::from(*value),
-                    Value::Unsigned(value) => i128::from(*value),
-                    _ => unreachable!("integer-only aggregate"),
-                };
-                sum.checked_add(value)
-            });
-            if let Some(exact) = exact {
-                if let Ok(value) = i64::try_from(exact) {
-                    return Ok(Value::Signed(value));
-                }
-                if let Ok(value) = u64::try_from(exact) {
-                    return Ok(Value::Unsigned(value));
-                }
-            }
-            let result = values.iter().map(|value| as_f64(value)).sum::<f64>();
-            if result.is_finite() {
-                Ok(Value::Float(result))
-            } else {
-                Err(QueryError::NonFinite)
-            }
-        }
-        AggregateFunction::Avg | AggregateFunction::Sum => {
-            let count = values.len();
-            let sum = values.iter().map(|value| as_f64(value)).sum::<f64>();
-            let result = if function == AggregateFunction::Avg {
-                sum / count as f64
-            } else {
-                sum
-            };
-            if result.is_finite() {
-                Ok(Value::Float(result))
-            } else {
-                Err(QueryError::NonFinite)
-            }
-        }
-    }
+    numeric.finish(function)
 }
 
 #[allow(
@@ -3224,6 +3510,7 @@ pub enum QueryError {
     CrossMetricNeedsSelector,
     CrossMetricHistogram,
     DistinctStreamLimit,
+    HeldLimit,
     /// The result could not be sent: the client is gone or too slow, and
     /// there is nobody left to send an error to.
     Delivery(Box<super::QuerySocketError>),
@@ -3277,6 +3564,10 @@ impl fmt::Display for QueryError {
             Self::DistinctStreamLimit => {
                 formatter.write_str("DISTINCT stream exceeds its seen-value limit")
             }
+            Self::HeldLimit => formatter.write_str(
+                "query needs more memory than eventd lets running queries hold \
+                 (MaxQueryHeldBytes): narrow it, add TAKE, or try again later",
+            ),
             Self::Delivery(error) => write!(formatter, "query results could not be sent: {error}"),
         }
     }
@@ -4075,5 +4366,381 @@ mod tests {
             .write_str("sum")
             .write_float(0.0);
         writer.to_bytes().unwrap()
+    }
+
+    /// A budget nobody else is using.
+    fn budget(limit: usize) -> HeldBudget {
+        HeldBudget {
+            used: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    /// Rows whose `k` and `n` fields come from a small, awkward domain:
+    /// text that differs only in ASCII case, integers equal to floats in
+    /// every representation, both zeros, NaN, null and a missing field.
+    fn awkward_rows() -> Vec<Row> {
+        let keys = [
+            Value::String("b".into()),
+            Value::String("B".into()),
+            Value::String("a".into()),
+            Value::Signed(1),
+            Value::Unsigned(1),
+            Value::Float(1.0),
+            Value::Float(-0.0),
+            Value::Float(0.0),
+            Value::Signed(0),
+            Value::Float(f64::NAN),
+            Value::Null,
+            Value::Signed(-3),
+            Value::Unsigned(u64::MAX),
+            Value::Float(18_446_744_073_709_551_616.0),
+        ];
+        let numbers = [
+            Value::Signed(5),
+            Value::Unsigned(u64::MAX),
+            Value::Float(2.5),
+            Value::Signed(-7),
+            Value::String("x".into()),
+            Value::Float(-0.0),
+            Value::Signed(5),
+        ];
+        // A fixed linear congruential sequence, so the run is repeatable.
+        let mut state = 0x2545_f491_u64;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            usize::try_from(state >> 33).unwrap() % bound
+        };
+        (0..600)
+            .map(|index| {
+                let mut record = Record::new();
+                if index % 17 != 0 {
+                    record.insert("k".into(), keys[next(keys.len())].clone());
+                }
+                record.insert("j".into(), keys[next(4)].clone());
+                record.insert("n".into(), numbers[next(numbers.len())].clone());
+                Row {
+                    record,
+                    identifier: "t".into(),
+                    tie: Tie::Single(index),
+                }
+            })
+            .collect()
+    }
+
+    fn fold(rows: &[Row], aggregate: &RecordAggregate) -> String {
+        let budget = budget(usize::MAX);
+        let mut held = Held::new(&budget);
+        let mut groups = Groups::new(aggregate);
+        for row in rows {
+            groups.add(row, &mut held).unwrap();
+        }
+        format!("{:?}", groups.finish().unwrap())
+    }
+
+    // What eventd did before it folded: every group compared in turn, and
+    // a GROUP's rows kept until the end. The fold must agree exactly.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::option_if_let_else,
+        reason = "the earlier implementation, kept whole and in its own shape as the reference"
+    )]
+    fn reference(rows: &[Row], aggregate: &RecordAggregate) -> String {
+        fn find(groups: &[(Vec<Value>, Vec<&Row>)], keys: &[Value]) -> Option<usize> {
+            groups.iter().position(|(representatives, _)| {
+                representatives
+                    .iter()
+                    .zip(keys)
+                    .all(|(left, right)| left.language_equal(right))
+            })
+        }
+        let fields: Vec<String> = match aggregate {
+            RecordAggregate::CountBy(field)
+            | RecordAggregate::Distinct(field)
+            | RecordAggregate::TopBy { field, .. } => vec![field.clone()],
+            RecordAggregate::Group { fields, .. } => fields.clone(),
+        };
+        let mut groups: Vec<(Vec<Value>, Vec<&Row>)> = Vec::new();
+        for row in rows {
+            let keys: Vec<_> = fields
+                .iter()
+                .map(|field| row.record.get(field).cloned().unwrap_or(Value::Null))
+                .collect();
+            if let Some(index) = find(&groups, &keys) {
+                for (representative, value) in groups[index].0.iter_mut().zip(keys) {
+                    if language_cmp(&value, representative) == Ordering::Less {
+                        *representative = value;
+                    }
+                }
+                groups[index].1.push(row);
+            } else {
+                groups.push((keys, vec![row]));
+            }
+        }
+        let records: Vec<Record> = match aggregate {
+            RecordAggregate::CountBy(field) | RecordAggregate::TopBy { field, .. } => {
+                let mut counted: Vec<_> = groups
+                    .into_iter()
+                    .map(|(keys, members)| (keys[0].clone(), members.len() as u64))
+                    .collect();
+                counted.sort_by(|left, right| {
+                    right
+                        .1
+                        .cmp(&left.1)
+                        .then_with(|| language_cmp(&left.0, &right.0))
+                });
+                if let RecordAggregate::TopBy { count, .. } = aggregate {
+                    counted.truncate(usize::try_from(*count).unwrap());
+                }
+                counted
+                    .into_iter()
+                    .map(|(value, count)| {
+                        BTreeMap::from([
+                            (field.clone(), value),
+                            ("count".into(), Value::Unsigned(count)),
+                        ])
+                    })
+                    .collect()
+            }
+            RecordAggregate::Distinct(field) => {
+                let mut values: Vec<_> = groups
+                    .into_iter()
+                    .map(|(keys, _)| keys[0].clone())
+                    .collect();
+                values.sort_by(language_cmp);
+                values
+                    .into_iter()
+                    .map(|value| BTreeMap::from([(field.clone(), value)]))
+                    .collect()
+            }
+            RecordAggregate::Group { fields, function } => groups
+                .into_iter()
+                .map(|(keys, members)| {
+                    let values: Vec<&Value> = members
+                        .iter()
+                        .filter_map(|row| match function {
+                            GroupFunction::Count => None,
+                            GroupFunction::Sum(field)
+                            | GroupFunction::Avg(field)
+                            | GroupFunction::Min(field)
+                            | GroupFunction::Max(field) => row.record.get(field),
+                        })
+                        .filter(|value| {
+                            matches!(
+                                value,
+                                Value::Signed(_) | Value::Unsigned(_) | Value::Float(_)
+                            )
+                        })
+                        .collect();
+                    let sum = values.iter().map(|value| as_f64(value)).sum::<f64>();
+                    let exact = values.iter().try_fold(0_i128, |sum, value| match value {
+                        Value::Signed(value) => sum.checked_add(i128::from(*value)),
+                        Value::Unsigned(value) => sum.checked_add(i128::from(*value)),
+                        _ => None,
+                    });
+                    let (name, value) = match function {
+                        GroupFunction::Count => ("count", Value::Unsigned(members.len() as u64)),
+                        _ if values.is_empty() => match function {
+                            GroupFunction::Sum(_) => ("sum", Value::Null),
+                            GroupFunction::Avg(_) => ("avg", Value::Null),
+                            GroupFunction::Min(_) => ("min", Value::Null),
+                            _ => ("max", Value::Null),
+                        },
+                        GroupFunction::Min(_) => (
+                            "min",
+                            (*values
+                                .iter()
+                                .copied()
+                                .min_by(|left, right| language_cmp(left, right))
+                                .unwrap())
+                            .clone(),
+                        ),
+                        GroupFunction::Max(_) => (
+                            "max",
+                            (*values
+                                .iter()
+                                .copied()
+                                .max_by(|left, right| language_cmp(left, right))
+                                .unwrap())
+                            .clone(),
+                        ),
+                        GroupFunction::Avg(_) => ("avg", Value::Float(sum / values.len() as f64)),
+                        GroupFunction::Sum(_) => (
+                            "sum",
+                            if let Some(value) = exact.and_then(|exact| i64::try_from(exact).ok()) {
+                                Value::Signed(value)
+                            } else if let Some(value) =
+                                exact.and_then(|exact| u64::try_from(exact).ok())
+                            {
+                                Value::Unsigned(value)
+                            } else {
+                                Value::Float(sum)
+                            },
+                        ),
+                    };
+                    let mut record: Record = fields.iter().cloned().zip(keys).collect();
+                    record.insert(name.into(), value);
+                    record
+                })
+                .collect(),
+        };
+        let rows: Vec<Row> = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| Row {
+                record,
+                identifier: String::new(),
+                tie: Tie::Single(i64::try_from(index).unwrap()),
+            })
+            .collect();
+        format!("{rows:?}")
+    }
+
+    #[test]
+    fn folded_aggregates_agree_with_comparing_every_group() {
+        let rows = awkward_rows();
+        let aggregates = [
+            RecordAggregate::CountBy("k".into()),
+            RecordAggregate::TopBy {
+                count: 4,
+                field: "k".into(),
+            },
+            RecordAggregate::Distinct("k".into()),
+            RecordAggregate::Group {
+                fields: vec!["k".into(), "j".into()],
+                function: GroupFunction::Count,
+            },
+            RecordAggregate::Group {
+                fields: vec!["j".into()],
+                function: GroupFunction::Sum("n".into()),
+            },
+            RecordAggregate::Group {
+                fields: vec!["k".into()],
+                function: GroupFunction::Avg("n".into()),
+            },
+            RecordAggregate::Group {
+                fields: vec!["j".into()],
+                function: GroupFunction::Min("n".into()),
+            },
+            RecordAggregate::Group {
+                fields: vec!["j".into()],
+                function: GroupFunction::Max("n".into()),
+            },
+        ];
+        for aggregate in &aggregates {
+            assert_eq!(
+                fold(&rows, aggregate),
+                reference(&rows, aggregate),
+                "{aggregate:?}"
+            );
+        }
+        // Every NaN is one value, so they are one group (PSPU §3.21).
+        let distinct = fold(&rows, &RecordAggregate::Distinct("k".into()));
+        assert_eq!(distinct.matches("NaN").count(), 1);
+    }
+
+    #[test]
+    fn a_nan_satisfies_no_ordering_predicate() {
+        let record = BTreeMap::from([("x".into(), Value::Float(f64::NAN))]);
+        for text in [
+            "x < 5", "x <= 5", "x > 5", "x >= 5", "x == 0", "x > -1.5", "x < 1.5",
+        ] {
+            let query = crate::query_language::parse(&format!("EVENTS WHERE {text}")).unwrap();
+            assert!(!evaluate(&query.predicates[0], &record), "{text}");
+        }
+        let query = crate::query_language::parse("EVENTS WHERE x != 5").unwrap();
+        assert!(evaluate(&query.predicates[0], &record));
+    }
+
+    #[test]
+    fn language_equal_values_share_a_group_key() {
+        let equal = [
+            (Value::Signed(1), Value::Float(1.0)),
+            (Value::Unsigned(1), Value::Signed(1)),
+            (Value::Float(-0.0), Value::Signed(0)),
+            (Value::String("KACS".into()), Value::String("kacs".into())),
+            (
+                Value::Array(vec![Value::Signed(2), Value::String("A".into())]),
+                Value::Array(vec![Value::Float(2.0), Value::String("a".into())]),
+            ),
+        ];
+        for (left, right) in &equal {
+            assert!(left.language_equal(right), "{left:?} {right:?}");
+            assert_eq!(
+                GroupKey::of(left),
+                GroupKey::of(right),
+                "{left:?} {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sorted_query_with_take_keeps_only_its_best_rows() {
+        let query = crate::query_language::parse("EVENTS SORT n DESC SKIP 3 TAKE 5").unwrap();
+        let rows: Vec<Row> = (0..5_000)
+            .map(|index| Row {
+                record: BTreeMap::from([("n".into(), Value::Signed((index * 7_919) % 5_003))]),
+                identifier: "t".into(),
+                tie: Tie::Single(index),
+            })
+            .collect();
+        let budget = budget(usize::MAX);
+        let mut held = Held::new(&budget);
+        let mut gathered = Gathered::Rows(Vec::new());
+        for row in rows.clone() {
+            gathered.add(row, &query, Some(8), &mut held).unwrap();
+        }
+        let Gathered::Rows(mut kept) = gathered else {
+            unreachable!()
+        };
+        assert!(kept.len() < 2 * TRIM_AT);
+        sort_rows(&mut kept, &query);
+        apply_pagination(&mut kept, &query);
+        let mut all = rows;
+        sort_rows(&mut all, &query);
+        apply_pagination(&mut all, &query);
+        assert_eq!(format!("{kept:?}"), format!("{all:?}"));
+        assert_eq!(kept.len(), 5);
+    }
+
+    #[test]
+    fn what_queries_hold_is_shared_bounded_and_given_back() {
+        let budget = budget(4 * HELD_GRANULE);
+        let mut first = Held::new(&budget);
+        first.add(1).unwrap();
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), HELD_GRANULE);
+        first.add(2 * HELD_GRANULE).unwrap();
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), 3 * HELD_GRANULE);
+        // A second query finds only what the first left.
+        let mut second = Held::new(&budget);
+        second.add(HELD_GRANULE).unwrap();
+        assert!(matches!(second.add(1), Err(QueryError::HeldLimit)));
+        drop(second);
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), 3 * HELD_GRANULE);
+        // Trimming gives back what is no longer held.
+        first.set(10).unwrap();
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), HELD_GRANULE);
+        drop(first);
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_aggregation_past_the_budget_fails_rather_than_grows() {
+        let budget = budget(HELD_GRANULE);
+        let mut held = Held::new(&budget);
+        let aggregate = RecordAggregate::Distinct("k".into());
+        let mut groups = Groups::new(&aggregate);
+        let failed = (0..10_000).find_map(|index| {
+            let row = Row {
+                record: BTreeMap::from([("k".into(), Value::String(format!("value {index}")))]),
+                identifier: "t".into(),
+                tie: Tie::Single(index),
+            };
+            groups.add(&row, &mut held).err()
+        });
+        assert!(matches!(failed, Some(QueryError::HeldLimit)));
     }
 }
