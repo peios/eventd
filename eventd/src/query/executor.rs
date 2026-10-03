@@ -332,13 +332,14 @@ fn execute_at(
         *left -= 1;
         Ok(if *left == 0 { Flow::Enough } else { Flow::More })
     };
+    let (scan_since, scan_until) = narrow_by_timestamp(&query.predicates, since, until);
     match &query.source {
         Source::Events { .. } => scan_events(
             &stores.event_paths,
             &allowed,
             &query.predicates,
-            since,
-            until,
+            scan_since,
+            scan_until,
             deadline,
             &lower.event_ids,
             &upper.event_ids,
@@ -354,8 +355,8 @@ fn execute_at(
             &allowed,
             *error_only,
             containing.as_deref(),
-            since,
-            until,
+            scan_since,
+            scan_until,
             deadline,
             lower.log_id,
             upper.log_id,
@@ -546,6 +547,52 @@ fn row_size(row: &Row) -> usize {
             .iter()
             .map(|(field, value)| FIELD_SLOT + heap(field.len()) + value_heap(value))
             .sum::<usize>()
+}
+
+/// The time range the stores are read over, narrowed by every top-level
+/// comparison of `timestamp` with an integer. The predicate is still
+/// evaluated against each row, so this narrows and never decides (TRM
+/// §6.3); what it buys is that a page of older records, `WHERE timestamp
+/// <= T`, starts reading at T instead of at the newest record.
+fn narrow_by_timestamp(predicates: &[Expr], mut since: i64, mut until: i64) -> (i64, i64) {
+    for predicate in predicates {
+        let Expr::Compare {
+            field,
+            operator,
+            value,
+        } = predicate
+        else {
+            continue;
+        };
+        if field != "timestamp" {
+            continue;
+        }
+        let bound = match value {
+            Literal::Signed(value) => i128::from(*value),
+            Literal::Unsigned(value) => i128::from(*value),
+            _ => continue,
+        };
+        // Out of the i64 domain on the far side, a bound excludes nothing;
+        // on the near side, everything.
+        let clamp = |value: i128| {
+            i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
+        };
+        let (lower, upper) = match operator {
+            Operator::Less => (None, Some(bound)),
+            Operator::LessEqual => (None, Some(bound + 1)),
+            Operator::Greater => (Some(bound + 1), None),
+            Operator::GreaterEqual => (Some(bound), None),
+            Operator::Equal => (Some(bound), Some(bound + 1)),
+            _ => (None, None),
+        };
+        if let Some(lower) = lower {
+            since = since.max(clamp(lower));
+        }
+        if let Some(upper) = upper.filter(|upper| *upper <= i128::from(i64::MAX)) {
+            until = until.min(clamp(upper));
+        }
+    }
+    (since, until)
 }
 
 /// A result record narrowed to SELECT's fields, which is applied last.
@@ -4659,6 +4706,34 @@ mod tests {
         // Every NaN is one value, so they are one group (PSPU §3.21).
         let distinct = fold(&rows, &RecordAggregate::Distinct("k".into()));
         assert_eq!(distinct.matches("NaN").count(), 1);
+    }
+
+    #[test]
+    fn timestamp_comparisons_narrow_the_range_read() {
+        let narrowed = |text: &str| {
+            let query = crate::query_language::parse(&format!("EVENTS WHERE {text}")).unwrap();
+            narrow_by_timestamp(&query.predicates, 0, 1_000)
+        };
+        assert_eq!(narrowed("timestamp <= 500"), (0, 501));
+        assert_eq!(narrowed("timestamp < 500"), (0, 500));
+        assert_eq!(
+            narrowed("timestamp > 100 AND event_type == \"x\""),
+            (0, 1_000)
+        );
+        assert_eq!(narrowed("timestamp > 100"), (101, 1_000));
+        assert_eq!(narrowed("timestamp >= 100"), (100, 1_000));
+        assert_eq!(narrowed("timestamp == 7"), (7, 8));
+        // Only a predicate that must hold narrows: one under OR does not.
+        assert_eq!(narrowed("timestamp < 5 OR cpu_id == 1"), (0, 1_000));
+        // Bounds beyond the domain.
+        assert_eq!(narrowed("timestamp <= 9223372036854775807"), (0, 1_000));
+        assert_eq!(narrowed("timestamp < -5"), (0, -5));
+        assert_eq!(
+            narrowed("timestamp > 18446744073709551615"),
+            (i64::MAX, 1_000)
+        );
+        // A float bound narrows nothing; the predicate still applies.
+        assert_eq!(narrowed("timestamp < 5.5"), (0, 1_000));
     }
 
     #[test]
