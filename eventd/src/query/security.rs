@@ -255,6 +255,11 @@ impl Authorizer {
     pub fn descriptor_generation(&self) -> u64 {
         self.descriptors.generation()
     }
+
+    /// The caller's user SID, which `MaxQueriesPerUser` counts by.
+    pub fn user(&self) -> Result<peios::security::Sid, SecurityError> {
+        self.token.user().map_err(SecurityError::Peios)
+    }
 }
 
 #[derive(Clone)]

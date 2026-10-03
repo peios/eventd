@@ -57,6 +57,9 @@ pub struct Config {
     pub query_timeout: Duration,
     pub max_concurrent_queries: usize,
     pub max_streaming_queries: usize,
+    /// Queries one caller's user may have running at once; SYSTEM's are
+    /// not counted.
+    pub max_queries_per_user: usize,
     pub max_distinct_stream_values: usize,
     pub max_query_request_bytes: usize,
     pub query_response_target_bytes: usize,
@@ -246,6 +249,14 @@ impl Config {
                 1_024,
             ))
             .expect("MaxStreamingQueries fits usize"),
+            max_queries_per_user: usize::try_from(dword(
+                values,
+                b"MaxQueriesPerUser",
+                16,
+                1,
+                4_096,
+            ))
+            .expect("MaxQueriesPerUser fits usize"),
             max_distinct_stream_values: usize::try_from(dword(
                 values,
                 b"MaxDistinctStreamValues",
@@ -475,6 +486,7 @@ impl Config {
         retain_invalid_dword!(query_timeout, b"QueryTimeoutMs", 1_000, 300_000);
         retain_invalid_dword!(max_concurrent_queries, b"MaxConcurrentQueries", 1, 4_096);
         retain_invalid_dword!(max_streaming_queries, b"MaxStreamingQueries", 1, 1_024);
+        retain_invalid_dword!(max_queries_per_user, b"MaxQueriesPerUser", 1, 4_096);
         retain_invalid_dword!(
             max_distinct_stream_values,
             b"MaxDistinctStreamValues",
@@ -758,6 +770,7 @@ impl Config {
         milliseconds!(query_timeout, "QueryTimeoutMs");
         value!(max_concurrent_queries, "MaxConcurrentQueries", "REG_DWORD");
         value!(max_streaming_queries, "MaxStreamingQueries", "REG_DWORD");
+        value!(max_queries_per_user, "MaxQueriesPerUser", "REG_DWORD");
         value!(
             max_distinct_stream_values,
             "MaxDistinctStreamValues",

@@ -6,17 +6,19 @@ mod value;
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use peios::file::SecInfo;
 use peios::msgpack::{Reader, Type, Writer};
+use peios::security::{Sid, sddl};
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
@@ -47,6 +49,7 @@ struct QueryTuning {
     max_request_bytes: usize,
     response_target_bytes: usize,
     max_streaming: usize,
+    max_per_user: usize,
     max_distinct_stream_values: usize,
     timeout: Duration,
     cross_type_window: Duration,
@@ -63,6 +66,7 @@ impl From<&Config> for QueryTuning {
             max_request_bytes: config.max_query_request_bytes,
             response_target_bytes: config.query_response_target_bytes,
             max_streaming: config.max_streaming_queries,
+            max_per_user: config.max_queries_per_user,
             max_distinct_stream_values: config.max_distinct_stream_values,
             timeout: config.query_timeout,
             cross_type_window: config.cross_type_window,
@@ -75,12 +79,26 @@ impl From<&Config> for QueryTuning {
     }
 }
 
+/// Who may connect to the query socket: every signed-in caller. What each
+/// may read is decided per identifier against eventd's own descriptors
+/// (TRM §7), not by the socket, so the socket admits anyone a descriptor
+/// could grant. The directory it is in stays closed (`directory.rs`).
+const QUERY_SOCKET_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FW;;;AU)";
+
+/// The user SID of `SYSTEM`, whose queries `MaxQueriesPerUser` does not
+/// count: SYSTEM is the machine, not one caller among others.
+const SYSTEM_SID: &str = "S-1-5-18";
+
+/// Queries running, by the caller's user SID.
+type PerUser = Arc<Mutex<HashMap<Sid, usize>>>;
+
 pub struct QueryServer {
     listener: UnixListener,
     path: PathBuf,
     identity: (u64, u64),
     active: Arc<AtomicUsize>,
     streaming: Arc<AtomicUsize>,
+    per_user: PerUser,
     /// Bytes the running queries hold between them (`MaxQueryHeldBytes`).
     held: Arc<AtomicUsize>,
 }
@@ -101,17 +119,29 @@ impl QueryServer {
             .map_err(QuerySocketError::Io)?;
         let metadata = std::fs::symlink_metadata(path).map_err(QuerySocketError::Io)?;
 
-        let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
-        let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
+        let descriptor = sddl::parse(QUERY_SOCKET_SDDL).map_err(QuerySocketError::Peios)?;
+        peios::file::set_sd(
+            None,
+            path,
+            SecInfo::DACL,
+            &descriptor,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(QuerySocketError::Peios)?;
+        let actual = peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW)
             .map_err(QuerySocketError::Peios)?;
-        peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(QuerySocketError::Peios)?;
+        let actual = sddl::format(actual.as_bytes()).map_err(QuerySocketError::Peios)?;
+        let expected = sddl::format(descriptor.as_bytes()).map_err(QuerySocketError::Peios)?;
+        if actual != expected {
+            return Err(QuerySocketError::Protection(path.to_owned()));
+        }
         Ok(Self {
             listener,
             path: path.to_owned(),
             identity: (metadata.dev(), metadata.ino()),
             active: Arc::new(AtomicUsize::new(0)),
             streaming: Arc::new(AtomicUsize::new(0)),
+            per_user: PerUser::default(),
             held: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -143,6 +173,7 @@ impl QueryServer {
                     }
                     let worker_active = Arc::clone(&self.active);
                     let streaming = Arc::clone(&self.streaming);
+                    let per_user = Arc::clone(&self.per_user);
                     let held = Arc::clone(&self.held);
                     let stores = Arc::clone(stores);
                     let config = Arc::clone(config);
@@ -159,6 +190,7 @@ impl QueryServer {
                                 &config,
                                 &tuning,
                                 &streaming,
+                                &per_user,
                                 &held,
                                 &stopping,
                                 &event_commits,
@@ -215,6 +247,7 @@ fn handle(
     config: &ServerConfig,
     tuning: &QueryTuning,
     streaming_count: &Arc<AtomicUsize>,
+    per_user: &PerUser,
     held: &Arc<AtomicUsize>,
     stopping: &AtomicBool,
     event_commits: &CommitSignal,
@@ -229,6 +262,14 @@ fn handle(
     let authorizer =
         security::Authorizer::from_peer(stream.as_fd(), Arc::clone(&config.descriptors))
             .map_err(QuerySocketError::Security)?;
+    // One caller cannot take every query the machine allows. The slot is
+    // taken before the request is read, so a caller holding idle
+    // connections holds slots.
+    let user = authorizer.user().map_err(QuerySocketError::Security)?;
+    let Some(_user_slot) = UserSlot::take(per_user, user, tuning.max_per_user) else {
+        send_error(&mut stream, "too many concurrent queries from this user")?;
+        return Ok(());
+    };
     let query_text = match read_request(&mut stream, tuning.max_request_bytes) {
         Ok(query) => query,
         Err(error) => {
@@ -683,6 +724,48 @@ impl Drop for CounterGuard {
     }
 }
 
+/// One of a user's `MaxQueriesPerUser` queries, given back when dropped.
+/// SYSTEM's are not counted, and hold nothing.
+struct UserSlot {
+    per_user: PerUser,
+    user: Option<Sid>,
+}
+
+impl UserSlot {
+    fn take(per_user: &PerUser, user: Sid, limit: usize) -> Option<Self> {
+        if user.to_string() == SYSTEM_SID {
+            return Some(Self {
+                per_user: Arc::clone(per_user),
+                user: None,
+            });
+        }
+        let mut counts = per_user.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = counts.get(&user).copied().unwrap_or(0);
+        if count >= limit {
+            return None;
+        }
+        counts.insert(user, count + 1);
+        drop(counts);
+        Some(Self {
+            per_user: Arc::clone(per_user),
+            user: Some(user),
+        })
+    }
+}
+
+impl Drop for UserSlot {
+    fn drop(&mut self) {
+        let Some(user) = self.user else { return };
+        let mut counts = self.per_user.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&user) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&user);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum QuerySocketError {
     Io(std::io::Error),
@@ -690,6 +773,8 @@ pub enum QuerySocketError {
     Security(security::SecurityError),
     Protocol(String),
     Occupied(PathBuf),
+    /// The socket did not take the descriptor it was given.
+    Protection(PathBuf),
     FrameTooLarge,
     Timeout,
 }
@@ -706,6 +791,11 @@ impl fmt::Display for QuerySocketError {
                 "configured query path {} is not a socket",
                 path.display()
             ),
+            Self::Protection(path) => write!(
+                formatter,
+                "query socket {} did not take its security descriptor",
+                path.display()
+            ),
             Self::FrameTooLarge => {
                 formatter.write_str("query response exceeds the u32 framing bound")
             }
@@ -720,7 +810,49 @@ impl std::error::Error for QuerySocketError {
             Self::Io(error) => Some(error),
             Self::Peios(error) => Some(error),
             Self::Security(error) => Some(error),
-            Self::Protocol(_) | Self::Occupied(_) | Self::FrameTooLarge | Self::Timeout => None,
+            Self::Protocol(_)
+            | Self::Occupied(_)
+            | Self::Protection(_)
+            | Self::FrameTooLarge
+            | Self::Timeout => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_user_holds_at_most_their_share_and_system_is_not_counted() {
+        let per_user = PerUser::default();
+        let alice = Sid::build(5, &[21, 1, 2, 3, 1001]).expect("alice");
+        let dana = Sid::build(5, &[21, 1, 2, 3, 1002]).expect("dana");
+        let system = Sid::build(5, &[18]).expect("SYSTEM");
+        let first = UserSlot::take(&per_user, alice, 2).expect("first");
+        let second = UserSlot::take(&per_user, alice, 2).expect("second");
+        assert!(UserSlot::take(&per_user, alice, 2).is_none());
+        // Someone else is not held up by alice.
+        let other = UserSlot::take(&per_user, dana, 2).expect("dana's");
+        let machine: Vec<UserSlot> = (0..5)
+            .map(|_| UserSlot::take(&per_user, system, 2).expect("SYSTEM's"))
+            .collect();
+        // A query that ends gives its slot back.
+        drop(first);
+        assert!(UserSlot::take(&per_user, alice, 2).is_some());
+        drop((second, other, machine));
+        assert!(
+            per_user
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_query_socket_admits_authenticated_users_to_connect() {
+        let descriptor = sddl::parse(QUERY_SOCKET_SDDL).expect("valid descriptor");
+        let text = sddl::format(descriptor.as_bytes()).expect("formats");
+        assert!(text.contains(";AU)"), "{text}");
     }
 }
