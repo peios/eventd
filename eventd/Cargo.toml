@@ -12,6 +12,7 @@ name = "eventd"
 path = "src/main.rs"
 
 [dependencies]
+eventd-client = { path = "../eventd-client" }
 eventd-core = { path = "../eventd-core" }
 libc = { workspace = true }
 peios = { workspace = true }
