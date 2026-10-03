@@ -3592,9 +3592,7 @@ mod tests {
         // group SIDs as an array of binary values. `==` against one SID
         // is an array-versus-binary mismatch and matches nothing, which
         // is why the operator exists.
-        let administrators = [
-            1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
-        ];
+        let administrators = [1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
         let users = [1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
         let absent = [1_u8, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 34, 2, 0, 0];
         let mut writer = Writer::new();

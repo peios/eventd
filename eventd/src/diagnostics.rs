@@ -125,9 +125,8 @@ pub fn log_rejected_origin(origin: &str) -> bool {
     if now < due {
         return false;
     }
-    let next = now.saturating_add(
-        u64::try_from(ORIGIN_REPORT_INTERVAL.as_nanos()).unwrap_or(u64::MAX),
-    );
+    let next =
+        now.saturating_add(u64::try_from(ORIGIN_REPORT_INTERVAL.as_nanos()).unwrap_or(u64::MAX));
     state
         .log_origin_report_at
         .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)

@@ -106,8 +106,8 @@ impl Sha1 {
         self.block[56..].copy_from_slice(&bit_length.to_be_bytes());
         compress(&mut self.state, &self.block);
         let mut output = [0_u8; 20];
-        for (chunk, word) in output.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
+        for (chunk, word) in output.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *chunk = word.to_be_bytes();
         }
         output
     }
@@ -119,8 +119,8 @@ impl Sha1 {
 )]
 fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     let mut words = [0_u32; 80];
-    for (index, chunk) in block.chunks_exact(4).enumerate() {
-        words[index] = u32::from_be_bytes(chunk.try_into().expect("word size"));
+    for (index, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+        words[index] = u32::from_be_bytes(*chunk);
     }
     for index in 16..80 {
         words[index] =
