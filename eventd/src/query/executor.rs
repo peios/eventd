@@ -734,7 +734,7 @@ fn authorize_identifiers(
         let generation = authorizer.descriptor_generation();
         let mut allowed = HashSet::with_capacity(identifiers.len());
         for identifier in &identifiers {
-            if authorizer.may_read(namespace, identifier, fields)? {
+            if cache.may_read(authorizer, namespace, identifier, fields)? {
                 allowed.insert(identifier.clone());
             }
         }
@@ -1644,6 +1644,9 @@ type AccessEntries = HashMap<(String, Vec<String>), Option<std::collections::Has
 struct AuthorizationCache {
     generation: u64,
     entries: AccessEntries,
+    /// Whether each identifier's records may be visible with the fields
+    /// asked about, before any is read (`Authorizer::may_read`).
+    identifiers: HashMap<(String, Vec<String>), bool>,
 }
 
 impl AuthorizationCache {
@@ -1651,6 +1654,7 @@ impl AuthorizationCache {
         Self {
             generation: authorizer.descriptor_generation(),
             entries: HashMap::new(),
+            identifiers: HashMap::new(),
         }
     }
 
@@ -1659,7 +1663,25 @@ impl AuthorizationCache {
         if self.generation != generation {
             self.generation = generation;
             self.entries.clear();
+            self.identifiers.clear();
         }
+    }
+
+    fn may_read(
+        &mut self,
+        authorizer: &Authorizer,
+        namespace: Namespace,
+        identifier: &str,
+        fields: &[String],
+    ) -> Result<bool, QueryError> {
+        self.refresh(authorizer);
+        let key = (identifier.to_owned(), fields.to_vec());
+        if let Some(visible) = self.identifiers.get(&key) {
+            return Ok(*visible);
+        }
+        let visible = authorizer.may_read(namespace, identifier, fields)?;
+        self.identifiers.insert(key, visible);
+        Ok(visible)
     }
 
     fn check(
