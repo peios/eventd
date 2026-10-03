@@ -98,6 +98,7 @@ dependencies = [
 name = "eventd"
 version = "0.1.5"
 dependencies = [
+ "eventd-client",
  "eventd-core",
  "libc",
  "peios",

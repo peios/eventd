@@ -11,15 +11,20 @@ use peios::registry::{CreateFlags, Key, KeyAccess, NotifyFilter, OpenFlags, Valu
 use peios::security::SecurityDescriptor;
 use peios::token::Token;
 
-const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
-const EVENTD_READ: u32 = 0x0001;
-const EVENTD_ADMINISTER: u32 = 0x0004;
-const EVENTD_PUBLISH: u32 = 0x0008;
+// What eventd and its clients must agree on comes from the client crate,
+// so that the two cannot drift: the rights, the mapping, the namespaces
+// and their root GUIDs, and the walk from an identifier to its pattern.
+pub use eventd_client::access::Namespace;
+use eventd_client::access::{
+    EVENTD_ADMINISTER, EVENTD_PUBLISH, EVENTD_READ, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
+    GENERIC_WRITE, SECURITY_ROOT,
+};
+
 const EVENTD_GENERIC_MAPPING: peios_sys::kacs_generic_mapping = peios_sys::kacs_generic_mapping {
-    read: 0x0002_0001,
-    write: 0x0002_000e,
-    execute: 0x0002_0001,
-    all: 0x000f_000f,
+    read: GENERIC_READ,
+    write: GENERIC_WRITE,
+    execute: GENERIC_EXECUTE,
+    all: GENERIC_ALL,
 };
 const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 4] = [
     (
@@ -109,35 +114,6 @@ pub fn provision_defaults() -> Result<(), SecurityError> {
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Namespace {
-    Events,
-    Logs,
-    Metrics,
-}
-
-impl Namespace {
-    const fn registry_name(self) -> &'static str {
-        match self {
-            Self::Events => "Events",
-            Self::Logs => "Logs",
-            Self::Metrics => "Metrics",
-        }
-    }
-
-    const fn root_guid(self) -> [u8; 16] {
-        let last = match self {
-            Self::Events => 1,
-            Self::Logs => 2,
-            Self::Metrics => 3,
-        };
-        [
-            0xd4, 0xc3, 0xb2, 0xa1, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, last,
-        ]
-    }
 }
 
 pub struct Authorizer {
@@ -569,25 +545,21 @@ fn resolve_descriptor(
     // service's hooks, reloads and health checks answer to the service's
     // own descriptor rather than falling through to the wildcard.
     // Event types and metric names carry no slash, so this is a log rule
-    // in practice.
-    let mut pattern = identifier.split('/').next().unwrap_or(identifier);
-    loop {
+    // in practice. The walk is the client crate's, which clients use to
+    // tell their users what they may read.
+    for pattern in eventd_client::access::candidates(identifier) {
         if let Some(descriptor) = load_descriptor(namespace, pattern)? {
             return Ok(Some((pattern.to_owned(), descriptor)));
         }
-        let Some(index) = pattern.rfind('.') else {
-            break;
-        };
-        pattern = &pattern[..index];
     }
-    Ok(load_descriptor(namespace, "*")?.map(|descriptor| ("*".to_owned(), descriptor)))
+    Ok(None)
 }
 
 fn load_descriptor(
     namespace: Namespace,
     pattern: &str,
 ) -> Result<Option<SecurityDescriptor>, SecurityError> {
-    let path = format!("{SECURITY_ROOT}\\{}\\{pattern}", namespace.registry_name());
+    let path = eventd_client::access::descriptor_path(namespace, pattern);
     let key = match Key::open(None, &path, KeyAccess::QUERY_VALUE, OpenFlags::default()) {
         Ok(key) => key,
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -649,6 +621,26 @@ mod tests {
                 0x7e, 0x4c,
             ]
         );
+    }
+
+    // eventd-core's copy names fields in the object type lists eventd
+    // builds; the client's names them in the descriptors people write.
+    #[test]
+    fn eventd_and_its_clients_derive_the_same_field_guids() {
+        for field in [
+            "timestamp",
+            "event_type",
+            "source.name",
+            "granted_access",
+            "core",
+            "",
+        ] {
+            assert_eq!(
+                eventd_core::field_guid(field),
+                eventd_client::access::field_guid(field),
+                "{field}"
+            );
+        }
     }
 
     #[test]

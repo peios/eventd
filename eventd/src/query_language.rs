@@ -1204,6 +1204,67 @@ impl std::error::Error for ParseError {}
 mod tests {
     use super::*;
 
+    // What a client writes with eventd-client's `text` must read back as
+    // exactly the value it meant, wherever it goes: a quoting bug there
+    // would let a person's text become query.
+    #[test]
+    fn client_quoted_text_parses_back_to_the_same_value() {
+        use eventd_client::text;
+        let awkward = [
+            "",
+            "plain",
+            "STREAM",
+            "WHERE",
+            "TAKE 1",
+            "say \"hi\"",
+            "back\\slash",
+            "\\u0041 is not an escape here",
+            "line\nbreak\rand\ttab",
+            "\u{0}\u{1}\u{1f}\u{7f}\u{85}",
+            "é ü 漢字 😀",
+            "jellyfin/ExecStartPre[0]",
+            "x\"41\"",
+            "a, b) OR (c == d",
+        ];
+        for value in awkward {
+            let quoted = text::string(value);
+            let logs = parse(&format!("LOGS FROM {quoted} CONTAINING {quoted}")).unwrap();
+            let Source::Logs {
+                origins,
+                containing,
+                ..
+            } = logs.source
+            else {
+                panic!("logs mode")
+            };
+            assert_eq!(origins, [value]);
+            assert_eq!(containing.as_deref(), Some(value));
+
+            let events = parse(&format!("EVENTS {quoted} WHERE note == {quoted}")).unwrap();
+            let Source::Events { pattern } = events.source else {
+                panic!("events mode")
+            };
+            assert_eq!(pattern.as_deref(), Some(value), "{value:?}");
+            assert_eq!(
+                events.predicates,
+                [Expr::Compare {
+                    field: "note".into(),
+                    operator: Operator::Equal,
+                    value: Literal::String(value.into()),
+                }],
+                "{value:?}"
+            );
+        }
+        let bytes = [0x00, 0x41, 0xff];
+        let events = parse(&format!("EVENTS WHERE sid == {}", text::binary(&bytes))).unwrap();
+        assert!(matches!(
+            &events.predicates[0],
+            Expr::Compare { value: Literal::Binary(parsed), .. } if parsed == &bytes
+        ));
+        let since = text::duration(std::time::Duration::from_secs(7_200)).unwrap();
+        assert!(parse(&format!("EVENTS SINCE {since} ago")).is_ok());
+    }
+
     #[test]
     fn parses_event_query_with_reordered_clauses() {
         let query = parse(
