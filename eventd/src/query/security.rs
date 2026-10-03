@@ -26,7 +26,7 @@ const EVENTD_GENERIC_MAPPING: peios_sys::kacs_generic_mapping = peios_sys::kacs_
     execute: GENERIC_EXECUTE,
     all: GENERIC_ALL,
 };
-const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 4] = [
+const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 5] = [
     (
         "Events",
         "*",
@@ -44,6 +44,14 @@ const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 4] = [
         "*",
         "O:SYG:SYD:P(A;;0x00000009;;;SY)(A;;0x00000009;;;BA)(A;;0x00000001;;;AU)",
         Some("O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)"),
+    ),
+    // eventd writes its own health straight into its store (TRM §5.7), so
+    // nobody, not even an administrator, may publish under its prefix.
+    (
+        "Metrics",
+        "eventd",
+        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+        None,
     ),
     (
         "",

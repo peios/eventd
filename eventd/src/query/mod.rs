@@ -22,6 +22,7 @@ use peios::security::{Sid, sddl};
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
+use crate::health::{self, Failure, Refusal};
 use crate::indexing::{PolicyMessage, Tracker};
 use crate::metric_ingest::RollupMaintenance;
 use crate::query_language::{RecordAggregate, Source};
@@ -146,6 +147,11 @@ impl QueryServer {
         })
     }
 
+    /// The running and streaming query counts, for eventd's health.
+    pub fn gauges(&self) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        (Arc::clone(&self.active), Arc::clone(&self.streaming))
+    }
+
     pub fn counts(&self) -> (usize, usize) {
         (
             self.active.load(Ordering::Acquire),
@@ -168,6 +174,7 @@ impl QueryServer {
                         (live.max_concurrent_queries, QueryTuning::from(live))
                     });
                     if !try_acquire(&self.active, max_concurrent) {
+                        health::query_refused(Refusal::Machine);
                         let _ = send_error(stream, "too many concurrent queries");
                         continue;
                     }
@@ -267,6 +274,7 @@ fn handle(
     // connections holds slots.
     let user = authorizer.user().map_err(QuerySocketError::Security)?;
     let Some(_user_slot) = UserSlot::take(per_user, user, tuning.max_per_user) else {
+        health::query_refused(Refusal::User);
         send_error(&mut stream, "too many concurrent queries from this user")?;
         return Ok(());
     };
@@ -286,6 +294,7 @@ fn handle(
         }
     };
     if Instant::now() >= deadline {
+        health::query_failed(Failure::Timeout);
         send_error(&mut stream, "query timed out")?;
         return Ok(());
     }
@@ -309,6 +318,7 @@ fn handle(
     config.index_tracker.record_query(&query);
     let stream_guard = if query.stream {
         if !try_acquire(streaming_count, tuning.max_streaming) {
+            health::query_refused(Refusal::Streaming);
             send_error(&mut stream, "too many concurrent streaming queries")?;
             return Ok(());
         }
@@ -364,6 +374,7 @@ fn handle(
         Err(executor::QueryError::Delivery(error)) => return Err(*error),
         Err(error) => {
             drop(sender);
+            count_failure(&error);
             send_error(&mut stream, &error.to_string())?;
             return Ok(());
         }
@@ -391,6 +402,7 @@ fn handle(
                         match executor::stream_next(state, &query, stores, &authorizer) {
                             Ok(records) => records,
                             Err(error) => {
+                                count_failure(&error);
                                 let _ = send_error(&mut stream, &error.to_string());
                                 return Ok(());
                             }
@@ -426,6 +438,15 @@ fn handle(
     }
     drop(stream_guard);
     Ok(())
+}
+
+/// A query that ran into its time or memory limit, for eventd's health.
+fn count_failure(error: &executor::QueryError) {
+    match error {
+        executor::QueryError::Timeout => health::query_failed(Failure::Timeout),
+        executor::QueryError::HeldLimit => health::query_failed(Failure::HeldBytes),
+        _ => {}
+    }
 }
 
 fn distinct_field(query: &crate::query_language::Query) -> Option<&str> {

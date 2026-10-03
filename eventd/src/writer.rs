@@ -13,6 +13,7 @@ use eventd_core::{
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
+use crate::health::Shed;
 
 /// Ordered data and control messages consumed by a shard's sole owner.
 pub enum WriterMessage {
@@ -206,6 +207,7 @@ fn commit_batch(
     if !pending_gaps.is_empty() {
         match shard.commit_gaps(&boot_id, pending_gaps) {
             Ok(_) => {
+                count_lost(pending_gaps.iter().copied());
                 pending_gaps.clear();
                 commits.committed();
             }
@@ -225,6 +227,7 @@ fn commit_batch(
                 )?;
                 match shard.commit_gaps(&boot_id, pending_gaps) {
                     Ok(_) => {
+                        count_lost(pending_gaps.iter().copied());
                         pending_gaps.clear();
                         commits.committed();
                     }
@@ -240,7 +243,7 @@ fn commit_batch(
         }
     }
     match shard.commit(batch) {
-        Ok(_) => {}
+        Ok(_) => count_committed(shard_index, batch),
         Err(error) if error.is_capacity() => {
             record_lost(batch, pending_gaps);
             request_retention(retention_requested, "event", &error);
@@ -277,8 +280,9 @@ fn commit_batch(
             .iter()
             .any(|pressure| pressure.load(Ordering::Acquire) >= shedding.emergency_buffer_percent);
     if emergency {
-        if let Err(error) = shard.shed_all_indexes() {
-            eprintln!("eventd: adaptive event-index shedding failed: {error}");
+        match shard.shed_all_indexes() {
+            Ok(shed) => crate::health::index_shed(Shed::Emergency, shed),
+            Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
         }
         return Ok(());
     }
@@ -287,11 +291,38 @@ fn commit_batch(
         > history
             .len()
             .saturating_mul(shedding.batch_percent as usize)
-        && let Err(error) = shard.shed_lowest_index(desired)
     {
-        eprintln!("eventd: adaptive event-index shedding failed: {error}");
+        match shard.shed_lowest_index(desired) {
+            Ok(shed) => crate::health::index_shed(Shed::Pressure, usize::from(shed.is_some())),
+            Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
+        }
     }
     Ok(())
+}
+
+/// Count a committed batch's events, and the sequences its gaps name.
+fn count_committed(shard_index: usize, batch: &[IngestItem]) {
+    crate::health::events_stored(
+        shard_index,
+        batch.iter().filter(|item| item.store_event).count(),
+    );
+    count_lost(
+        batch
+            .iter()
+            .flat_map(|item| item.gaps.iter().map(|gap| (item.event.cpu_id, *gap))),
+    );
+}
+
+/// Count the sequences that committed gap records name (§2.5).
+fn count_lost(gaps: impl Iterator<Item = (u16, Gap)>) {
+    for (cpu_id, gap) in gaps {
+        crate::health::events_lost(
+            cpu_id,
+            gap.last_sequence
+                .saturating_sub(gap.first_sequence)
+                .saturating_add(1),
+        );
+    }
 }
 
 fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {

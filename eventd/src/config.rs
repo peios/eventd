@@ -54,6 +54,9 @@ pub struct Config {
     pub max_metric_datagram_bytes: usize,
     pub metric_series_cache_size: usize,
     pub metric_authorization_cache_size: usize,
+    /// How often eventd samples its own health as `eventd.*` metrics;
+    /// zero turns them off.
+    pub health_metric_interval: Duration,
     pub query_timeout: Duration,
     pub max_concurrent_queries: usize,
     pub max_streaming_queries: usize,
@@ -226,6 +229,13 @@ impl Config {
                 1_000_000,
             ))
             .expect("MetricAuthorizationCacheSize fits usize"),
+            health_metric_interval: Duration::from_secs(u64::from(dword(
+                values,
+                b"HealthMetricIntervalSeconds",
+                15,
+                0,
+                3_600,
+            ))),
             query_timeout: Duration::from_millis(u64::from(dword(
                 values,
                 b"QueryTimeoutMs",
@@ -483,6 +493,12 @@ impl Config {
             256,
             1_000_000
         );
+        retain_invalid_dword!(
+            health_metric_interval,
+            b"HealthMetricIntervalSeconds",
+            0,
+            3_600
+        );
         retain_invalid_dword!(query_timeout, b"QueryTimeoutMs", 1_000, 300_000);
         retain_invalid_dword!(max_concurrent_queries, b"MaxConcurrentQueries", 1, 4_096);
         retain_invalid_dword!(max_streaming_queries, b"MaxStreamingQueries", 1, 1_024);
@@ -724,6 +740,7 @@ impl Config {
             "MetricAuthorizationCacheSize",
             "REG_DWORD"
         );
+        seconds!(health_metric_interval, "HealthMetricIntervalSeconds", 1);
         seconds!(adaptive_index_window, "AdaptiveIndexWindowHours", 3_600);
         seconds!(
             adaptive_index_policy_interval,
