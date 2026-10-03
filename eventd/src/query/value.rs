@@ -121,7 +121,26 @@ const fn kind(value: &Value) -> u8 {
     }
 }
 
+/// Whether `value` is a NaN, which a payload may carry (PSPU §3.5) and a
+/// literal may not (§3.19).
+pub const fn is_nan(value: &Value) -> bool {
+    matches!(value, Value::Float(number) if number.is_nan())
+}
+
+const fn is_number(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Signed(_) | Value::Unsigned(_) | Value::Float(_)
+    )
+}
+
 fn numeric_cmp(left: &Value, right: &Value) -> Option<Ordering> {
+    // Every NaN is one value, after every other number, the infinities
+    // included (PSPU §3.21), so that ordering stays total and all NaNs
+    // group together.
+    if is_nan(left) || is_nan(right) {
+        return (is_number(left) && is_number(right)).then(|| is_nan(left).cmp(&is_nan(right)));
+    }
     match (left, right) {
         (Value::Signed(left), Value::Signed(right)) => Some(left.cmp(right)),
         (Value::Unsigned(left), Value::Unsigned(right)) => Some(left.cmp(right)),
@@ -373,6 +392,44 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn nan_is_one_value_after_every_other_number() {
+        let nan = Value::Float(f64::NAN);
+        assert!(nan.language_equal(&Value::Float(-f64::NAN)));
+        for number in [
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Signed(0),
+            Value::Signed(i64::MIN),
+            Value::Unsigned(u64::MAX),
+            Value::Float(-0.0),
+        ] {
+            assert_eq!(language_cmp(&nan, &number), Ordering::Greater, "{number:?}");
+            assert_eq!(language_cmp(&number, &nan), Ordering::Less, "{number:?}");
+            assert!(!nan.language_equal(&number));
+        }
+        // Still a number: after null and booleans, before strings.
+        assert_eq!(language_cmp(&nan, &Value::Bool(true)), Ordering::Greater);
+        assert_eq!(
+            language_cmp(&nan, &Value::String(String::new())),
+            Ordering::Less
+        );
+        // A total order, which sorting checks and panics without.
+        let mut values = [
+            Value::Float(1.0),
+            nan,
+            Value::Signed(5),
+            Value::Float(f64::NAN),
+            Value::Unsigned(2),
+            Value::Float(-0.0),
+            Value::Float(f64::INFINITY),
+            Value::Signed(0),
+        ];
+        values.sort_by(language_cmp);
+        assert!(values[..6].iter().all(|value| !is_nan(value)));
+        assert!(values[6..].iter().all(is_nan));
     }
 
     #[test]

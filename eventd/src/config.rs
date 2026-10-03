@@ -60,6 +60,7 @@ pub struct Config {
     pub max_distinct_stream_values: usize,
     pub max_query_request_bytes: usize,
     pub query_response_target_bytes: usize,
+    pub max_query_held_bytes: usize,
     pub adaptive_rollup_min_samples: usize,
     pub adaptive_rollup_batch_rows: usize,
     pub adaptive_rollup_max_rows: usize,
@@ -269,6 +270,14 @@ impl Config {
                 16_777_216,
             ))
             .expect("QueryResponseTargetBytes fits usize"),
+            max_query_held_bytes: usize::try_from(dword(
+                values,
+                b"MaxQueryHeldBytes",
+                268_435_456,
+                16_777_216,
+                u32::MAX,
+            ))
+            .expect("MaxQueryHeldBytes fits usize"),
             adaptive_rollup_min_samples: usize::try_from(dword(
                 values,
                 b"AdaptiveRollupMinSamples",
@@ -483,6 +492,12 @@ impl Config {
             b"QueryResponseTargetBytes",
             1_024,
             16_777_216
+        );
+        retain_invalid_dword!(
+            max_query_held_bytes,
+            b"MaxQueryHeldBytes",
+            16_777_216,
+            u32::MAX
         );
         retain_invalid_dword!(
             adaptive_rollup_min_samples,
@@ -754,6 +769,7 @@ impl Config {
             "QueryResponseTargetBytes",
             "REG_DWORD"
         );
+        value!(max_query_held_bytes, "MaxQueryHeldBytes", "REG_DWORD");
         value!(
             adaptive_rollup_min_samples,
             "AdaptiveRollupMinSamples",

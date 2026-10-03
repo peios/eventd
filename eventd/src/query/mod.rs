@@ -54,6 +54,7 @@ struct QueryTuning {
     adaptive_rollup_min_samples: usize,
     adaptive_rollup_batch_rows: usize,
     adaptive_rollup_max_rows: usize,
+    max_held_bytes: usize,
 }
 
 impl From<&Config> for QueryTuning {
@@ -69,6 +70,7 @@ impl From<&Config> for QueryTuning {
             adaptive_rollup_min_samples: config.adaptive_rollup_min_samples,
             adaptive_rollup_batch_rows: config.adaptive_rollup_batch_rows,
             adaptive_rollup_max_rows: config.adaptive_rollup_max_rows,
+            max_held_bytes: config.max_query_held_bytes,
         }
     }
 }
@@ -79,6 +81,8 @@ pub struct QueryServer {
     identity: (u64, u64),
     active: Arc<AtomicUsize>,
     streaming: Arc<AtomicUsize>,
+    /// Bytes the running queries hold between them (`MaxQueryHeldBytes`).
+    held: Arc<AtomicUsize>,
 }
 
 impl QueryServer {
@@ -108,6 +112,7 @@ impl QueryServer {
             identity: (metadata.dev(), metadata.ino()),
             active: Arc::new(AtomicUsize::new(0)),
             streaming: Arc::new(AtomicUsize::new(0)),
+            held: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -138,6 +143,7 @@ impl QueryServer {
                     }
                     let worker_active = Arc::clone(&self.active);
                     let streaming = Arc::clone(&self.streaming);
+                    let held = Arc::clone(&self.held);
                     let stores = Arc::clone(stores);
                     let config = Arc::clone(config);
                     let stopping = Arc::clone(stopping);
@@ -153,6 +159,7 @@ impl QueryServer {
                                 &config,
                                 &tuning,
                                 &streaming,
+                                &held,
                                 &stopping,
                                 &event_commits,
                                 &log_commits,
@@ -208,6 +215,7 @@ fn handle(
     config: &ServerConfig,
     tuning: &QueryTuning,
     streaming_count: &Arc<AtomicUsize>,
+    held: &Arc<AtomicUsize>,
     stopping: &AtomicBool,
     event_commits: &CommitSignal,
     log_commits: &CommitSignal,
@@ -280,6 +288,10 @@ fn handle(
         adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
         adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
         adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
+        held: executor::HeldBudget {
+            used: Arc::clone(held),
+            limit: tuning.max_held_bytes,
+        },
     };
     // The initial result set goes out as it is produced. If the query then
     // fails, the error that follows tells the client to discard every "ok"
