@@ -48,12 +48,18 @@ struct StoreCursor {
     log_id: i64,
 }
 
+/// Where a query's result records go, one at a time and in result order.
+/// A query in the default order hands each record over as it is read, so
+/// nothing but the merge frontier is held (TRM §6.4).
+pub type Emit<'a> = dyn FnMut(Record) -> Result<(), QueryError> + 'a;
+
 pub fn execute(
     query: &Query,
     stores: &Stores,
     authorizer: &Authorizer,
     limits: &Limits,
-) -> Result<Vec<Record>, QueryError> {
+    emit: &mut Emit<'_>,
+) -> Result<(), QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
     let mut authorization = AuthorizationCache::new(authorizer);
     execute_at(
@@ -75,6 +81,7 @@ pub fn execute(
         limits.cross_type_max_lookback,
         &mut authorization,
         Some(limits),
+        emit,
     )
 }
 
@@ -83,7 +90,8 @@ pub fn start_stream(
     stores: &Stores,
     authorizer: &Authorizer,
     limits: &Limits,
-) -> Result<(Vec<Record>, StreamState), QueryError> {
+    emit: &mut Emit<'_>,
+) -> Result<StreamState, QueryError> {
     let evaluation_time = realtime_nanoseconds()?;
     let mut authorization = AuthorizationCache::new(authorizer);
     let cursor = capture_cursor(stores, &query.source, Some(limits.deadline))?;
@@ -91,7 +99,7 @@ pub fn start_stream(
         event_ids: vec![0; stores.event_paths.len()],
         log_id: 0,
     };
-    let records = execute_at(
+    execute_at(
         query,
         stores,
         authorizer,
@@ -104,17 +112,15 @@ pub fn start_stream(
         limits.cross_type_max_lookback,
         &mut authorization,
         Some(limits),
+        emit,
     )?;
-    Ok((
-        records,
-        StreamState {
-            evaluation_time,
-            cursor,
-            cross_type_window: limits.cross_type_window,
-            cross_type_max_lookback: limits.cross_type_max_lookback,
-            authorization,
-        },
-    ))
+    Ok(StreamState {
+        evaluation_time,
+        cursor,
+        cross_type_window: limits.cross_type_window,
+        cross_type_max_lookback: limits.cross_type_max_lookback,
+        authorization,
+    })
 }
 
 pub fn stream_next(
@@ -131,7 +137,9 @@ pub fn stream_next(
     watch_query.sort.clear();
     watch_query.take = None;
     watch_query.skip = 0;
-    let records = execute_at(
+    // One commit's worth of records at a time, which is small.
+    let mut records = Vec::new();
+    execute_at(
         &watch_query,
         stores,
         authorizer,
@@ -144,6 +152,10 @@ pub fn stream_next(
         state.cross_type_max_lookback,
         &mut state.authorization,
         None,
+        &mut |record| {
+            records.push(record);
+            Ok(())
+        },
     )?;
     state.cursor = upper;
     Ok(records)
@@ -167,13 +179,14 @@ fn execute_at(
     cross_type_max_lookback: Duration,
     authorization: &mut AuthorizationCache,
     rollup_limits: Option<&Limits>,
-) -> Result<Vec<Record>, QueryError> {
+    emit: &mut Emit<'_>,
+) -> Result<(), QueryError> {
     let (since, mut until) = time_range(query, evaluation_time)?;
     if watch {
         until = i64::MAX;
     }
     if since >= until {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let historical_ranges = if watch || query.cross_filters.is_empty() {
         None
@@ -193,7 +206,7 @@ fn execute_at(
         )?)
     };
     let referenced = referenced_fields(query);
-    let rows = match &query.source {
+    let (namespace, allowed) = match &query.source {
         Source::Events { pattern } => {
             let identifiers =
                 discover_event_identifiers(&stores.event_paths, pattern.as_deref(), deadline)?;
@@ -204,22 +217,9 @@ fn execute_at(
                 &referenced,
                 authorization,
             )?;
-            read_events(
-                &stores.event_paths,
-                &allowed,
-                &query.predicates,
-                since,
-                until,
-                deadline,
-                &lower.event_ids,
-                &upper.event_ids,
-            )?
+            (Namespace::Events, allowed)
         }
-        Source::Logs {
-            origins,
-            error_only,
-            containing,
-        } => {
+        Source::Logs { origins, .. } => {
             let identifiers = discover_log_identifiers(&stores.log_path, origins, deadline)?;
             let allowed = authorize_identifiers(
                 authorizer,
@@ -228,17 +228,7 @@ fn execute_at(
                 &referenced,
                 authorization,
             )?;
-            read_logs(
-                &stores.log_path,
-                &allowed,
-                *error_only,
-                containing.as_deref(),
-                since,
-                until,
-                deadline,
-                lower.log_id,
-                upper.log_id,
-            )?
+            (Namespace::Logs, allowed)
         }
         Source::Metric { name, labels } => {
             return execute_metric(
@@ -253,34 +243,94 @@ fn execute_at(
                 historical_ranges.as_deref(),
                 authorization,
                 rollup_limits,
-            );
+            )?
+            .into_iter()
+            .try_for_each(emit);
         }
     };
 
-    let namespace = match query.source {
-        Source::Events { .. } => Namespace::Events,
-        Source::Logs { .. } => Namespace::Logs,
-        Source::Metric { .. } => unreachable!(),
+    // A query in the default order holds nothing but the merge frontier:
+    // every store is read newest first, and each record goes to `emit` as
+    // soon as it has passed access control and every predicate, until TAKE
+    // is met (TRM §6.4). Anything else needs the whole visible set first.
+    let newest_first = !watch && query.aggregate.is_none() && query.sort.is_empty();
+    if newest_first && query.take == Some(0) {
+        return Ok(());
+    }
+    let order = if newest_first {
+        ScanOrder::Newest
+    } else {
+        ScanOrder::Stored
     };
-    let mut visible = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        check_deadline(deadline)?;
+    let mut skip = query.skip;
+    let mut remaining = query.take;
+    let mut rows = Vec::new();
+    let mut visit = |mut row: Row| -> Result<Flow, QueryError> {
         if historical_ranges
             .as_deref()
             .is_some_and(|ranges| !range_contains(ranges, timestamp(&row)))
         {
-            continue;
+            return Ok(Flow::More);
         }
-        if authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
-            && query
+        if !authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
+            || !query
                 .predicates
                 .iter()
                 .all(|predicate| evaluate(predicate, &row.record))
         {
-            visible.push(row);
+            return Ok(Flow::More);
         }
+        if !newest_first {
+            rows.push(row);
+            return Ok(Flow::More);
+        }
+        if skip > 0 {
+            skip -= 1;
+            return Ok(Flow::More);
+        }
+        emit(project(row.record, &query.select))?;
+        let Some(left) = remaining.as_mut() else {
+            return Ok(Flow::More);
+        };
+        *left -= 1;
+        Ok(if *left == 0 { Flow::Enough } else { Flow::More })
+    };
+    match &query.source {
+        Source::Events { .. } => scan_events(
+            &stores.event_paths,
+            &allowed,
+            &query.predicates,
+            since,
+            until,
+            deadline,
+            &lower.event_ids,
+            &upper.event_ids,
+            order,
+            &mut visit,
+        )?,
+        Source::Logs {
+            error_only,
+            containing,
+            ..
+        } => scan_logs(
+            &stores.log_path,
+            &allowed,
+            *error_only,
+            containing.as_deref(),
+            since,
+            until,
+            deadline,
+            lower.log_id,
+            upper.log_id,
+            order,
+            &mut visit,
+        )?,
+        Source::Metric { .. } => unreachable!("metric queries returned above"),
     }
-    let mut rows = visible;
+    if newest_first {
+        return Ok(());
+    }
+
     if watch && !query.cross_filters.is_empty() {
         apply_watch_cross_filters(
             &mut rows,
@@ -296,17 +346,20 @@ fn execute_at(
         let mut records = aggregate_records(rows, aggregate)?;
         apply_record_sort(&mut records, query);
         apply_pagination(&mut records, query);
-        return Ok(records.into_iter().map(|row| row.record).collect());
+        return records.into_iter().try_for_each(|row| emit(row.record));
     }
     sort_rows(&mut rows, query);
     apply_pagination(&mut rows, query);
-    let mut records: Vec<_> = rows.into_iter().map(|row| row.record).collect();
-    if !query.select.is_empty() {
-        for record in &mut records {
-            record.retain(|field, _| query.select.contains(field));
-        }
+    rows.into_iter()
+        .try_for_each(|row| emit(project(row.record, &query.select)))
+}
+
+/// A result record narrowed to SELECT's fields, which is applied last.
+fn project(mut record: Record, select: &[String]) -> Record {
+    if !select.is_empty() {
+        record.retain(|field, _| select.contains(field));
     }
-    Ok(records)
+    record
 }
 
 fn capture_cursor(
@@ -933,11 +986,34 @@ enum Tie {
     Single(i64),
 }
 
+/// The order a scan hands rows over in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanOrder {
+    /// Each database in whatever order it yields, one after another, for a
+    /// query that will order or aggregate the whole visible set itself.
+    Stored,
+    /// The default result order, newest first with the tiebreakers of TRM
+    /// §6.2, merged across every database as it is read.
+    Newest,
+}
+
+/// Whether a scan should go on reading after a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    More,
+    Enough,
+}
+
+type Visit<'a> = dyn FnMut(Row) -> Result<Flow, QueryError> + 'a;
+
+/// Rows read between deadline checks while nothing is being accepted.
+const DEADLINE_CHECK_ROWS: usize = 1_024;
+
 #[allow(
     clippy::too_many_arguments,
     reason = "event shards use independent selector, predicate, time and stream-cursor bounds"
 )]
-fn read_events(
+fn scan_events(
     paths: &[PathBuf],
     allowed: &HashSet<String>,
     predicates: &[Expr],
@@ -946,19 +1022,19 @@ fn read_events(
     deadline: Option<Instant>,
     lower_ids: &[i64],
     upper_ids: &[i64],
-) -> Result<Vec<Row>, QueryError> {
+    order: ScanOrder,
+    visit: &mut Visit<'_>,
+) -> Result<(), QueryError> {
     if allowed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let header_constraint = predicates.iter().find_map(sql_header_constraint);
-    let mut output = Vec::new();
-    for (shard, path) in paths.iter().enumerate() {
-        check_deadline(deadline)?;
-        let connection = open_read_only(path, deadline)?;
+    let mut read = 0;
+    let select = |connection: &Connection, shard: usize| {
         let constraint = if let Some(constraint) = header_constraint.clone() {
             Some(constraint)
         } else {
-            first_payload_constraint(predicates, &connection)?
+            first_payload_constraint(predicates, connection)?
         };
         let mut sql = String::from(
             "SELECT id, boot_id, timestamp, cpu_id, sequence, origin_class, event_type, \
@@ -978,50 +1054,123 @@ fn read_events(
                 values.push(value);
             }
         }
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(values))?;
-        while let Some(row) = rows.next()? {
-            if output.len().is_multiple_of(1_024) {
-                check_deadline(deadline)?;
+        if order == ScanOrder::Newest {
+            sql.push_str(" ORDER BY timestamp DESC, id DESC");
+        }
+        Ok::<_, QueryError>((sql, values))
+    };
+
+    if order == ScanOrder::Stored {
+        for (shard, path) in paths.iter().enumerate() {
+            check_deadline(deadline)?;
+            let connection = open_read_only(path, deadline)?;
+            let (sql, values) = select(&connection, shard)?;
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+            while let Some(row) = next_event(&mut rows, shard, allowed, deadline, &mut read)? {
+                if visit(row)? == Flow::Enough {
+                    return Ok(());
+                }
             }
-            let identifier: String = row.get(6)?;
-            if !allowed.contains(&identifier) {
-                continue;
-            }
-            let id: i64 = row.get(0)?;
-            let boot: Vec<u8> = row.get(1)?;
-            let timestamp: i64 = row.get(2)?;
-            let cpu_id: Option<u64> = row.get(3)?;
-            let sequence: Option<u64> = row.get(4)?;
-            let origin_class: Option<u64> = row.get(5)?;
-            let effective: Option<Vec<u8>> = row.get(7)?;
-            let true_token: Option<Vec<u8>> = row.get(8)?;
-            let process: Option<Vec<u8>> = row.get(9)?;
-            let payload: Option<Vec<u8>> = row.get(10)?;
-            let mut record = Record::new();
-            record.insert("timestamp".into(), Value::Signed(timestamp));
-            record.insert("cpu_id".into(), option_unsigned(cpu_id));
-            record.insert("sequence".into(), option_unsigned(sequence));
-            record.insert("origin_class".into(), option_unsigned(origin_class));
-            record.insert("event_type".into(), Value::String(identifier.clone()));
-            record.insert(
-                "effective_token_guid".into(),
-                option_guid(effective.as_deref()),
-            );
-            record.insert("true_token_guid".into(), option_guid(true_token.as_deref()));
-            record.insert("process_guid".into(), option_guid(process.as_deref()));
-            record.insert("boot_id".into(), option_guid(Some(&boot)));
-            if let Some(payload) = payload {
-                flatten_event_payload(&payload, &mut record);
-            }
-            output.push(Row {
-                record,
-                identifier,
-                tie: Tie::Event { shard, id },
-            });
+        }
+        return Ok(());
+    }
+
+    // Every shard at once, each newest first, and always the newest head
+    // next: the frontier is one row per shard, whatever the result's size.
+    let mut connections = Vec::with_capacity(paths.len());
+    for path in paths {
+        check_deadline(deadline)?;
+        connections.push(open_read_only(path, deadline)?);
+    }
+    let mut statements = Vec::with_capacity(connections.len());
+    for (shard, connection) in connections.iter().enumerate() {
+        let (sql, values) = select(connection, shard)?;
+        statements.push((connection.prepare(&sql)?, values));
+    }
+    let mut cursors = Vec::with_capacity(statements.len());
+    for (statement, values) in &mut statements {
+        cursors.push(statement.query(rusqlite::params_from_iter(values.iter()))?);
+    }
+    let mut heads = Vec::with_capacity(cursors.len());
+    for (shard, rows) in cursors.iter_mut().enumerate() {
+        heads.push(next_event(rows, shard, allowed, deadline, &mut read)?);
+    }
+    while let Some(shard) = newest_head(&heads) {
+        let row = heads[shard].take().expect("the newest head is present");
+        heads[shard] = next_event(&mut cursors[shard], shard, allowed, deadline, &mut read)?;
+        if visit(row)? == Flow::Enough {
+            return Ok(());
         }
     }
-    Ok(output)
+    Ok(())
+}
+
+/// The shard whose head comes first in the default order: the newest, and
+/// of equally new ones the lowest shard (TRM §6.2). Each shard's own rows
+/// already come id descending.
+fn newest_head(heads: &[Option<Row>]) -> Option<usize> {
+    heads
+        .iter()
+        .enumerate()
+        .filter_map(|(shard, head)| head.as_ref().map(|row| (shard, timestamp(row))))
+        .max_by(|(left_shard, left), (right_shard, right)| {
+            left.cmp(right).then_with(|| right_shard.cmp(left_shard))
+        })
+        .map(|(shard, _)| shard)
+}
+
+/// The next event in `rows` whose type may be read, decoded. Denied types
+/// are skipped before their payloads are decoded.
+fn next_event(
+    rows: &mut rusqlite::Rows<'_>,
+    shard: usize,
+    allowed: &HashSet<String>,
+    deadline: Option<Instant>,
+    read: &mut usize,
+) -> Result<Option<Row>, QueryError> {
+    while let Some(row) = rows.next()? {
+        *read += 1;
+        if read.is_multiple_of(DEADLINE_CHECK_ROWS) {
+            check_deadline(deadline)?;
+        }
+        let identifier: String = row.get(6)?;
+        if !allowed.contains(&identifier) {
+            continue;
+        }
+        let id: i64 = row.get(0)?;
+        let boot: Vec<u8> = row.get(1)?;
+        let timestamp: i64 = row.get(2)?;
+        let cpu_id: Option<u64> = row.get(3)?;
+        let sequence: Option<u64> = row.get(4)?;
+        let origin_class: Option<u64> = row.get(5)?;
+        let effective: Option<Vec<u8>> = row.get(7)?;
+        let true_token: Option<Vec<u8>> = row.get(8)?;
+        let process: Option<Vec<u8>> = row.get(9)?;
+        let payload: Option<Vec<u8>> = row.get(10)?;
+        let mut record = Record::new();
+        record.insert("timestamp".into(), Value::Signed(timestamp));
+        record.insert("cpu_id".into(), option_unsigned(cpu_id));
+        record.insert("sequence".into(), option_unsigned(sequence));
+        record.insert("origin_class".into(), option_unsigned(origin_class));
+        record.insert("event_type".into(), Value::String(identifier.clone()));
+        record.insert(
+            "effective_token_guid".into(),
+            option_guid(effective.as_deref()),
+        );
+        record.insert("true_token_guid".into(), option_guid(true_token.as_deref()));
+        record.insert("process_guid".into(), option_guid(process.as_deref()));
+        record.insert("boot_id".into(), option_guid(Some(&boot)));
+        if let Some(payload) = payload {
+            flatten_event_payload(&payload, &mut record);
+        }
+        return Ok(Some(Row {
+            record,
+            identifier,
+            tie: Tie::Event { shard, id },
+        }));
+    }
+    Ok(None)
 }
 
 #[derive(Clone)]
@@ -1153,7 +1302,7 @@ fn first_payload_constraint(
     clippy::too_many_arguments,
     reason = "the fixed log selectors are independent SQL narrowing inputs"
 )]
-fn read_logs(
+fn scan_logs(
     path: &Path,
     allowed: &HashSet<String>,
     error_only: bool,
@@ -1163,19 +1312,29 @@ fn read_logs(
     deadline: Option<Instant>,
     lower_id: i64,
     upper_id: i64,
-) -> Result<Vec<Row>, QueryError> {
+    order: ScanOrder,
+    visit: &mut Visit<'_>,
+) -> Result<(), QueryError> {
     if allowed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let connection = open_read_only(path, deadline)?;
-    let mut statement = connection.prepare(
-        "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
-         FROM logs WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4",
-    )?;
+    let mut statement = connection.prepare(match order {
+        ScanOrder::Stored => {
+            "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
+             FROM logs WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4"
+        }
+        ScanOrder::Newest => {
+            "SELECT id, boot_id, timestamp, origin, is_error, message, job_id \
+             FROM logs WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3 AND id <= ?4 \
+             ORDER BY timestamp DESC, id DESC"
+        }
+    })?;
     let mut rows = statement.query(params![since, until, lower_id, upper_id])?;
-    let mut output = Vec::new();
+    let mut read = 0_usize;
     while let Some(row) = rows.next()? {
-        if output.len().is_multiple_of(1_024) {
+        read += 1;
+        if read.is_multiple_of(DEADLINE_CHECK_ROWS) {
             check_deadline(deadline)?;
         }
         let identifier: String = row.get(3)?;
@@ -1202,13 +1361,16 @@ fn read_logs(
             ("boot_id".into(), option_guid(Some(&boot))),
             ("job_id".into(), option_guid(job_id.as_deref())),
         ]);
-        output.push(Row {
+        let row = Row {
             record,
             identifier,
             tie: Tie::Single(id),
-        });
+        };
+        if visit(row)? == Flow::Enough {
+            return Ok(());
+        }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn authorize_row(
@@ -3061,6 +3223,16 @@ pub enum QueryError {
     CrossTypeRangeTooLarge,
     CrossMetricNeedsSelector,
     CrossMetricHistogram,
+    DistinctStreamLimit,
+    /// The result could not be sent: the client is gone or too slow, and
+    /// there is nobody left to send an error to.
+    Delivery(Box<super::QuerySocketError>),
+}
+
+impl QueryError {
+    pub fn delivery(error: super::QuerySocketError) -> Self {
+        Self::Delivery(Box::new(error))
+    }
 }
 
 impl fmt::Display for QueryError {
@@ -3102,6 +3274,10 @@ impl fmt::Display for QueryError {
             Self::CrossMetricHistogram => {
                 formatter.write_str("cross-type metric conditions require a counter or gauge series")
             }
+            Self::DistinctStreamLimit => {
+                formatter.write_str("DISTINCT stream exceeds its seen-value limit")
+            }
+            Self::Delivery(error) => write!(formatter, "query results could not be sent: {error}"),
         }
     }
 }
@@ -3112,6 +3288,7 @@ impl std::error::Error for QueryError {
             Self::Sql(error) => Some(error),
             Self::Peios(error) => Some(error),
             Self::Security(error) => Some(error),
+            Self::Delivery(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -3216,7 +3393,8 @@ mod tests {
                  (1, zeroblob(16), 1, NULL, NULL, NULL, 'denied.type', NULL, NULL, NULL, X'C1'),\
                  (2, zeroblob(16), 2, NULL, NULL, NULL, 'allowed.type', NULL, NULL, NULL, NULL);",
         );
-        let rows = read_events(
+        let mut rows = Vec::new();
+        scan_events(
             std::slice::from_ref(&events.0),
             &HashSet::from(["allowed.type".to_owned()]),
             &[],
@@ -3225,10 +3403,159 @@ mod tests {
             None,
             &[0],
             &[i64::MAX],
+            ScanOrder::Stored,
+            &mut |row| {
+                rows.push(row);
+                Ok(Flow::More)
+            },
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].identifier, "allowed.type");
+    }
+
+    /// An event shard holding `(id, timestamp)` events of type `t`.
+    fn event_shard(events: &[(i64, i64)]) -> TestDatabase {
+        let values: Vec<_> = events
+            .iter()
+            .map(|(id, timestamp)| {
+                format!("({id}, zeroblob(16), {timestamp}, NULL, NULL, NULL, 't', NULL, NULL, NULL, NULL)")
+            })
+            .collect();
+        TestDatabase::create(&format!(
+            "CREATE TABLE events(\
+                 id INTEGER PRIMARY KEY, boot_id BLOB NOT NULL, timestamp INTEGER NOT NULL,\
+                 cpu_id INTEGER, sequence INTEGER, origin_class INTEGER, event_type TEXT NOT NULL,\
+                 effective_token_guid BLOB, true_token_guid BLOB, process_guid BLOB, payload BLOB\
+             );\
+             CREATE INDEX idx_events_timestamp ON events(timestamp);\
+             INSERT INTO events VALUES {};",
+            values.join(", ")
+        ))
+    }
+
+    /// The events of `shards` as `(timestamp, shard, id)`, as a scan in
+    /// `order` hands them over, stopping after `take`.
+    fn scanned(shards: &[TestDatabase], order: ScanOrder, take: usize) -> Vec<(i64, usize, i64)> {
+        let paths: Vec<_> = shards.iter().map(|shard| shard.0.clone()).collect();
+        let mut seen = Vec::new();
+        scan_events(
+            &paths,
+            &HashSet::from(["t".to_owned()]),
+            &[],
+            i64::MIN,
+            i64::MAX,
+            None,
+            &vec![0; paths.len()],
+            &vec![i64::MAX; paths.len()],
+            order,
+            &mut |row| {
+                let Tie::Event { shard, id } = row.tie else {
+                    panic!("an event row has an event tie")
+                };
+                seen.push((timestamp(&row), shard, id));
+                Ok(if seen.len() == take {
+                    Flow::Enough
+                } else {
+                    Flow::More
+                })
+            },
+        )
+        .unwrap();
+        seen
+    }
+
+    #[test]
+    fn the_newest_first_merge_is_the_default_result_order() {
+        // Equal timestamps across and within shards, and ids out of time
+        // order, so every tiebreaker of TRM §6.2 decides something.
+        let shards = [
+            event_shard(&[(1, 30), (2, 10), (3, 20), (4, 20), (5, 40)]),
+            event_shard(&[(1, 20), (2, 40), (3, 5), (4, 20)]),
+            event_shard(&[(1, 20), (2, 50)]),
+        ];
+        let merged = scanned(&shards, ScanOrder::Newest, usize::MAX);
+        // What sorting the whole set in the default order gives.
+        let paths: Vec<_> = shards.iter().map(|shard| shard.0.clone()).collect();
+        let mut rows = Vec::new();
+        scan_events(
+            &paths,
+            &HashSet::from(["t".to_owned()]),
+            &[],
+            i64::MIN,
+            i64::MAX,
+            None,
+            &[0; 3],
+            &[i64::MAX; 3],
+            ScanOrder::Stored,
+            &mut |row| {
+                rows.push(row);
+                Ok(Flow::More)
+            },
+        )
+        .unwrap();
+        sort_rows(&mut rows, &crate::query_language::parse("EVENTS").unwrap());
+        let sorted: Vec<_> = rows
+            .iter()
+            .map(|row| match row.tie {
+                Tie::Event { shard, id } => (timestamp(row), shard, id),
+                Tie::Single(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(merged, sorted);
+        assert_eq!(merged.len(), 11);
+        assert_eq!(&merged[..3], &[(50, 2, 2), (40, 0, 5), (40, 1, 2)]);
+        assert_eq!(
+            &merged[4..8],
+            &[(20, 0, 4), (20, 0, 3), (20, 1, 4), (20, 1, 1)]
+        );
+    }
+
+    #[test]
+    fn a_newest_first_scan_stops_when_told_enough() {
+        let shards = [
+            event_shard(&[(1, 1), (2, 2), (3, 3)]),
+            event_shard(&[(1, 4), (2, 5)]),
+        ];
+        assert_eq!(
+            scanned(&shards, ScanOrder::Newest, 2),
+            [(5, 1, 2), (4, 1, 1)]
+        );
+        assert_eq!(scanned(&shards, ScanOrder::Stored, 1).len(), 1);
+    }
+
+    #[test]
+    fn logs_are_scanned_newest_first_with_id_breaking_ties() {
+        let logs = TestDatabase::create(
+            "CREATE TABLE logs(\
+                 id INTEGER PRIMARY KEY, boot_id BLOB NOT NULL, timestamp INTEGER NOT NULL,\
+                 origin TEXT NOT NULL, is_error INTEGER NOT NULL, message TEXT NOT NULL, job_id BLOB\
+             );\
+             INSERT INTO logs VALUES\
+                 (1, zeroblob(16), 10, 'a', 0, 'one', NULL),\
+                 (2, zeroblob(16), 30, 'a', 1, 'two', NULL),\
+                 (3, zeroblob(16), 10, 'a', 0, 'three', NULL),\
+                 (4, zeroblob(16), 20, 'b', 0, 'four', NULL);",
+        );
+        let mut seen = Vec::new();
+        scan_logs(
+            &logs.0,
+            &HashSet::from(["a".to_owned()]),
+            false,
+            None,
+            i64::MIN,
+            i64::MAX,
+            None,
+            0,
+            i64::MAX,
+            ScanOrder::Newest,
+            &mut |row| {
+                seen.push(row.tie);
+                Ok(Flow::More)
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, [Tie::Single(2), Tie::Single(3), Tie::Single(1)]);
     }
 
     #[test]
