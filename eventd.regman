@@ -341,6 +341,17 @@ applies: live
 
 Global streaming-query limit, enforced in addition to MaxConcurrentQueries.
 
+--- machine\system\eventd maxqueriesperuser
+canonical: Machine\System\eventd MaxQueriesPerUser
+type: REG_DWORD
+default: 16
+valid: 1 to 4096
+applies: live
+
+Queries, streaming or not, that one caller's user SID may have running at
+once, so that one user cannot take every query the machine allows. SYSTEM's
+queries are not counted. Excess requests are rejected, not queued.
+
 --- machine\system\eventd maxdistinctstreamvalues
 canonical: Machine\System\eventd MaxDistinctStreamValues
 type: REG_DWORD
