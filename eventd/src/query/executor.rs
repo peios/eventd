@@ -734,10 +734,7 @@ fn authorize_identifiers(
         let generation = authorizer.descriptor_generation();
         let mut allowed = HashSet::with_capacity(identifiers.len());
         for identifier in &identifiers {
-            if cache
-                .check(authorizer, namespace, identifier, fields)?
-                .is_some_and(|visible| fields.iter().all(|field| visible.contains(field)))
-            {
+            if authorizer.may_read(namespace, identifier, fields)? {
                 allowed.insert(identifier.clone());
             }
         }

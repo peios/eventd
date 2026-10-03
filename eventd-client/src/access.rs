@@ -13,7 +13,7 @@
 
 use peios::access::AccessCheck;
 use peios::registry::{Key, KeyAccess, OpenFlags, ValueType};
-use peios::security::{AccessMask, GenericMapping, SecurityDescriptor};
+use peios::security::{AccessMask, AceType, GenericMapping, SecurityDescriptor};
 
 /// The registry key holding eventd's read policy.
 pub const SECURITY_ROOT: &str = r"Machine\System\eventd\Security";
@@ -182,7 +182,8 @@ pub fn patterns(namespace: Namespace) -> Result<Vec<String>, peios::Error> {
 /// What the caller may read under one descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Access {
-    /// Whether records under it are visible at all.
+    /// Whether records under it are visible at all: the record as a whole,
+    /// or some field of it, may be read.
     pub records: bool,
     /// Of the fields asked about, those the caller may read. Meaningful
     /// only when `records` is.
@@ -191,22 +192,34 @@ pub struct Access {
 
 /// What this process's token may read under `descriptor`, asking about
 /// `fields` as well as the records.
+///
+/// Records are visible to a caller who may read the record as a whole or
+/// any field of it (§7.3): a grant of some fields shows the records with
+/// those fields. Which fields a descriptor grants by name is in its object
+/// ACEs (`field_grants`), so those are asked about too.
 pub fn access(
     descriptor: &SecurityDescriptor,
     namespace: Namespace,
     fields: &[&str],
 ) -> Result<Access, peios::Error> {
-    let mut tree = Vec::with_capacity(fields.len() + 1);
+    let asked: Vec<[u8; 16]> = fields.iter().map(|field| field_guid(field)).collect();
+    let mut guids = asked.clone();
+    guids.extend(
+        field_grants(descriptor)
+            .into_iter()
+            .filter(|guid| !asked.contains(guid)),
+    );
+    let mut tree = Vec::with_capacity(guids.len() + 1);
     tree.push(peios_sys::kacs_object_type_entry {
         level: 0,
         _reserved: 0,
         guid: namespace.root_guid(),
     });
-    for field in fields {
+    for guid in guids {
         tree.push(peios_sys::kacs_object_type_entry {
             level: 1,
             _reserved: 0,
-            guid: field_guid(field),
+            guid,
         });
     }
     let results = AccessCheck::new(
@@ -219,7 +232,7 @@ pub fn access(
         result.status == 0 && result.granted & EVENTD_READ != 0
     };
     Ok(Access {
-        records: reads(&results[0]),
+        records: results.iter().any(reads),
         fields: fields
             .iter()
             .zip(&results[1..])
@@ -227,6 +240,32 @@ pub fn access(
             .map(|(field, _)| (*field).to_owned())
             .collect(),
     })
+}
+
+/// The fields `descriptor` grants by name: the object GUIDs of its
+/// allowing object ACEs, each a field's (§7.3), once each. Whether they
+/// grant anything to a given caller is the access check's to say.
+#[must_use]
+pub fn field_grants(descriptor: &SecurityDescriptor) -> Vec<[u8; 16]> {
+    /// `ACCESS_ALLOWED_OBJECT` and `ACCESS_ALLOWED_CALLBACK_OBJECT` (MS-DTYP
+    /// 2.4.4.1), which the SDK leaves as raw types.
+    const ALLOWING_OBJECT: [u8; 2] = [0x05, 0x0b];
+    let Ok(view) = descriptor.view() else {
+        return Vec::new();
+    };
+    let Some(dacl) = view.dacl() else {
+        return Vec::new();
+    };
+    let mut guids: Vec<[u8; 16]> = dacl
+        .iter()
+        .filter(
+            |ace| matches!(ace.ace_type(), AceType::Other(raw) if ALLOWING_OBJECT.contains(&raw)),
+        )
+        .filter_map(|ace| ace.object_type().copied())
+        .collect();
+    guids.sort_unstable();
+    guids.dedup();
+    guids
 }
 
 /// How much of one kind of data the caller may read, from every pattern
@@ -449,6 +488,23 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_descriptor_grants_by_name_the_fields_its_allowing_object_aces_name() {
+        let descriptor = peios::security::sddl::parse(
+            "O:SYG:SYD:P(A;;0x1;;;SY)\
+             (OA;;0x1;fe639b5f-4f7f-54c5-9702-f20fac24fa0e;;BA)\
+             (OA;;0x1;341d2267-b9db-536b-b36c-94ab6cd47e4c;;BA)\
+             (OA;;0x1;341d2267-b9db-536b-b36c-94ab6cd47e4c;;AU)\
+             (OD;;0x1;1f638b88-4da0-5dd1-ace6-05204455e880;;AU)",
+        )
+        .expect("descriptor");
+        let mut expected = vec![field_guid("message"), field_guid("timestamp")];
+        expected.sort_unstable();
+        assert_eq!(field_grants(&descriptor), expected);
+        let plain = peios::security::sddl::parse("O:SYG:SYD:P(A;;0x1;;;SY)").expect("descriptor");
+        assert!(field_grants(&plain).is_empty());
+    }
 
     #[test]
     fn field_guids_match_eventds_stable_vector() {
