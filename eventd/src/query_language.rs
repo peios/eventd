@@ -319,7 +319,7 @@ fn binary_literal(bytes: &[u8], start: usize) -> Result<(Vec<u8>, usize), ParseE
         return Err(ParseError::new("binary literal has an odd digit count"));
     }
     let mut output = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.chunks_exact(2) {
+    for pair in digits.as_chunks::<2>().0 {
         output.push(u8::try_from(parse_hex(pair)?).expect("two hex digits fit u8"));
     }
     Ok((output, end + 1))
@@ -552,10 +552,7 @@ impl Parser {
                 let operator = self.comparison_operator(false)?;
                 if matches!(
                     operator,
-                    Operator::StartsWith
-                        | Operator::EndsWith
-                        | Operator::Contains
-                        | Operator::Has
+                    Operator::StartsWith | Operator::EndsWith | Operator::Contains | Operator::Has
                 ) {
                     return Err(ParseError::new(
                         "cross-type metric comparison requires a numeric operator",
