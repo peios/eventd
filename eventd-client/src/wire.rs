@@ -1,4 +1,10 @@
-//! PSPU query framing and response decoding.
+//! Query framing and response decoding (PSPU §3.15–§3.17).
+//!
+//! One query per connection: send it with [`Connection::send_query`], then
+//! read [`Response`]s until `End`, `Watch` or `Error`. Until `End` or
+//! `Watch` has arrived the query has not succeeded, and an `Error` before
+//! either voids every `Records` already read (§3.16). [`crate::query`] and
+//! [`crate::Tail`] keep that rule for you.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Write};
@@ -7,23 +13,37 @@ use peios::msgpack::{Reader, Type, Writer};
 
 const RESPONSE_MAX_DEPTH: u32 = peios::msgpack::DEFAULT_MAX_DEPTH.saturating_add(4);
 
+/// One result record: a flat map from field name to value (§3.22).
+/// Records in one result may carry different fields.
 pub type Record = BTreeMap<String, Value>;
 
+/// A value as the query channel carries it (§3.17).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// Nil.
     Null,
+    /// A boolean.
     Bool(bool),
+    /// An integer that fits in `i64`.
     Signed(i64),
+    /// An integer beyond `i64`.
     Unsigned(u64),
+    /// A binary64 float.
     Float(f64),
+    /// UTF-8 text, GUIDs included.
     String(String),
+    /// Bytes.
     Binary(Vec<u8>),
+    /// An array.
     Array(Vec<Self>),
+    /// A map, in the order it was sent.
     Map(Vec<(Self, Self)>),
+    /// An extension type: its number and bytes.
     Extension(i8, Vec<u8>),
 }
 
 impl Value {
+    /// Writes the value to `writer`.
     pub fn write_message_pack(&self, writer: &mut Writer) -> Result<(), Error> {
         match self {
             Self::Null => {
@@ -68,20 +88,29 @@ impl Value {
     }
 }
 
+/// One message from eventd (§3.16).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
+    /// A chunk of result records.
     Records(Vec<Record>),
+    /// A query that does not stream is complete.
     End,
+    /// A streaming query's initial result set is complete; what follows
+    /// is live.
     Watch,
+    /// The query failed, with eventd's words for why. Show them; never
+    /// parse them.
     Error(String),
 }
 
+/// A connection carrying one query.
 pub struct Connection<S> {
     stream: S,
     frame: Vec<u8>,
 }
 
 impl<S: Read + Write> Connection<S> {
+    /// A connection over `stream`, already connected to the query socket.
     pub const fn new(stream: S) -> Self {
         Self {
             stream,
@@ -89,6 +118,7 @@ impl<S: Read + Write> Connection<S> {
         }
     }
 
+    /// Sends the query, which must be the only one on this connection.
     pub fn send_query(&mut self, query: &str) -> Result<(), Error> {
         let mut writer = Writer::new();
         writer.write_map(1).write_str("query").write_str(query);
@@ -101,6 +131,7 @@ impl<S: Read + Write> Connection<S> {
         self.stream.flush().map_err(Error::Io)
     }
 
+    /// Reads the next message.
     pub fn next_response(&mut self) -> Result<Response, Error> {
         let mut prefix = [0_u8; 4];
         self.stream.read_exact(&mut prefix).map_err(Error::Io)?;
@@ -112,6 +143,11 @@ impl<S: Read + Write> Connection<S> {
         self.frame.resize(length, 0);
         self.stream.read_exact(&mut self.frame).map_err(Error::Io)?;
         decode_response(&self.frame)
+    }
+
+    /// The stream underneath.
+    pub const fn stream(&self) -> &S {
+        &self.stream
     }
 }
 
@@ -258,13 +294,22 @@ fn count(length: usize) -> Result<u32, Error> {
     u32::try_from(length).map_err(|_| Error::FrameTooLarge)
 }
 
+/// Why the channel itself failed, as opposed to the query (which is
+/// [`Response::Error`]).
 #[derive(Debug)]
 pub enum Error {
+    /// The socket failed.
     Io(io::Error),
+    /// A message could not be decoded.
     Codec(peios::Error),
+    /// A message decoded but was not a valid response.
     Malformed(&'static str),
+    /// A response declared more items than could be allocated.
     Allocation(usize),
+    /// A query was too large to frame.
     FrameTooLarge,
+    /// A terminal message arrived where none may: a second one, or `end`
+    /// for a streaming query.
     UnexpectedStatus,
 }
 
@@ -304,7 +349,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn frame(payload: &[u8]) -> Vec<u8> {
+    pub fn frame(payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::from(u32::try_from(payload.len()).unwrap().to_le_bytes());
         frame.extend_from_slice(payload);
         frame

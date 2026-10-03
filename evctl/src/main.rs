@@ -2,15 +2,14 @@
 
 mod cli;
 mod output;
-mod protocol;
 
 use std::io::{self, IsTerminal};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use cli::{Action, Arguments};
+use eventd_client::wire::{self as protocol, Connection, Response};
 use output::TransactionalOutput;
-use protocol::{Connection, Response};
 
 fn main() -> ExitCode {
     match run(std::env::args_os()) {
