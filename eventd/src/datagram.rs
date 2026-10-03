@@ -19,10 +19,26 @@ use peios::token::Token;
 /// privilege the long-running daemon deliberately does not hold.
 const LOG_BROKER_SDDL: &str = "D:P(D;;0x2;;;SU)(A;;GA;;;SY)(A;;GA;;;OW)";
 
+/// Every authenticated caller may send to the metric socket. Who may publish
+/// what is decided per metric name, against the token each datagram carries
+/// (`EVENTD_PUBLISH`, TRM §7.6), not by the socket. An operator who wants it
+/// narrower sets another descriptor after eventd starts; eventd sets this one
+/// again each time it starts.
+const METRIC_PUBLISHERS_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FW;;;AU)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protection {
-    Inherited,
     PeinitLogBroker,
+    MetricPublishers,
+}
+
+impl Protection {
+    const fn sddl(self) -> &'static str {
+        match self {
+            Self::PeinitLogBroker => LOG_BROKER_SDDL,
+            Self::MetricPublishers => METRIC_PUBLISHERS_SDDL,
+        }
+    }
 }
 
 pub struct IngestionSocket {
@@ -143,29 +159,21 @@ impl IngestionSocket {
 }
 
 fn establish_protection(path: &Path, protection: Protection) -> Result<(), SocketError> {
-    let (secinfo, descriptor) = match protection {
-        Protection::Inherited => {
-            let secinfo = SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL | SecInfo::LABEL;
-            let descriptor = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
-                .map_err(SocketError::Security)?;
-            (secinfo, descriptor)
-        }
-        Protection::PeinitLogBroker => (
-            SecInfo::DACL,
-            sddl::parse(LOG_BROKER_SDDL).map_err(SocketError::Security)?,
-        ),
-    };
-    peios::file::set_sd(None, path, secinfo, &descriptor, libc::AT_SYMLINK_NOFOLLOW)
+    let descriptor = sddl::parse(protection.sddl()).map_err(SocketError::Security)?;
+    peios::file::set_sd(
+        None,
+        path,
+        SecInfo::DACL,
+        &descriptor,
+        libc::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(SocketError::Security)?;
+    let actual = peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW)
         .map_err(SocketError::Security)?;
-
-    if protection == Protection::PeinitLogBroker {
-        let actual = peios::file::get_sd(None, path, secinfo, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(SocketError::Security)?;
-        let actual = sddl::format(actual.as_bytes()).map_err(SocketError::Security)?;
-        let expected = sddl::format(descriptor.as_bytes()).map_err(SocketError::Security)?;
-        if actual != expected {
-            return Err(SocketError::Protection(path.to_owned()));
-        }
+    let actual = sddl::format(actual.as_bytes()).map_err(SocketError::Security)?;
+    let expected = sddl::format(descriptor.as_bytes()).map_err(SocketError::Security)?;
+    if actual != expected {
+        return Err(SocketError::Protection(path.to_owned()));
     }
     Ok(())
 }
@@ -273,5 +281,12 @@ mod tests {
             sddl::format(descriptor.as_bytes()).expect("format descriptor"),
             LOG_BROKER_SDDL
         );
+    }
+
+    #[test]
+    fn every_authenticated_caller_may_send_to_the_metric_socket() {
+        let descriptor = sddl::parse(METRIC_PUBLISHERS_SDDL).expect("valid publishers descriptor");
+        let text = sddl::format(descriptor.as_bytes()).expect("format descriptor");
+        assert!(text.contains(";AU)"), "{text}");
     }
 }

@@ -138,7 +138,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_socket = Arc::new(IngestionSocket::bind(
         &config.metric_socket_path,
         config.max_metric_datagram_bytes,
-        Protection::Inherited,
+        Protection::MetricPublishers,
     )?);
     let query_server = Arc::new(QueryServer::bind(&config.query_socket_path)?);
 
