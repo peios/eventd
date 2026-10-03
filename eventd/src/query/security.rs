@@ -140,6 +140,10 @@ impl Authorizer {
         })
     }
 
+    /// The fields of a record under `identifier` the caller may read, of
+    /// `fields`, which are the record's; or `None` when the record is not
+    /// visible. A record is visible when the caller may read it as a whole
+    /// or any of its fields, and then holds only those (TRM §7.3).
     pub fn check(
         &self,
         namespace: Namespace,
@@ -149,17 +153,70 @@ impl Authorizer {
         let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
             return Ok(None);
         };
-        let mut tree = Vec::with_capacity(fields.len() + 1);
+        let guids: Vec<[u8; 16]> = fields
+            .iter()
+            .map(|field| eventd_core::field_guid(field))
+            .collect();
+        let reads = self.reads(namespace, &pattern, &descriptor, &guids)?;
+        let granted: HashSet<String> = fields
+            .iter()
+            .zip(&reads[1..])
+            .filter(|(_, reads)| **reads)
+            .map(|(field, _)| field.clone())
+            .collect();
+        if !reads[0] && granted.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(granted))
+    }
+
+    /// Whether records under `identifier` may be visible to the caller with
+    /// every one of `fields` readable, before any record has been read. A
+    /// descriptor that grants some fields by name grants records with those
+    /// fields, so those count too, though a given record may lack them.
+    pub fn may_read(
+        &self,
+        namespace: Namespace,
+        identifier: &str,
+        fields: &[String],
+    ) -> Result<bool, SecurityError> {
+        let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
+            return Ok(false);
+        };
+        let mut guids: Vec<[u8; 16]> = fields
+            .iter()
+            .map(|field| eventd_core::field_guid(field))
+            .collect();
+        let named = guids.len();
+        let granted: Vec<[u8; 16]> = eventd_client::access::field_grants(&descriptor)
+            .into_iter()
+            .filter(|guid| !guids.contains(guid))
+            .collect();
+        guids.extend(granted);
+        let reads = self.reads(namespace, &pattern, &descriptor, &guids)?;
+        Ok(reads.iter().any(|reads| *reads) && reads[1..=named].iter().all(|reads| *reads))
+    }
+
+    /// Whether the caller may read the record (first) and each field in
+    /// `guids` under `descriptor`, the one `pattern` resolved to.
+    fn reads(
+        &self,
+        namespace: Namespace,
+        pattern: &str,
+        descriptor: &SecurityDescriptor,
+        guids: &[[u8; 16]],
+    ) -> Result<Vec<bool>, SecurityError> {
+        let mut tree = Vec::with_capacity(guids.len() + 1);
         tree.push(peios_sys::kacs_object_type_entry {
             level: 0,
             _reserved: 0,
             guid: namespace.root_guid(),
         });
-        for field in fields {
+        for guid in guids {
             tree.push(peios_sys::kacs_object_type_entry {
                 level: 1,
                 _reserved: 0,
-                guid: eventd_core::field_guid(field),
+                guid: *guid,
             });
         }
         let audit_context = format!(
@@ -204,17 +261,10 @@ impl Authorizer {
         if result != 0 {
             return Err(SecurityError::Peios(peios::Error::last_os_error()));
         }
-        if results[0].status != 0 || results[0].granted & EVENTD_READ == 0 {
-            return Ok(None);
-        }
-        Ok(Some(
-            fields
-                .iter()
-                .zip(&results[1..])
-                .filter(|(_, result)| result.status == 0 && result.granted & EVENTD_READ != 0)
-                .map(|(field, _)| field.clone())
-                .collect(),
-        ))
+        Ok(results
+            .iter()
+            .map(|result| result.status == 0 && result.granted & EVENTD_READ != 0)
+            .collect())
     }
 
     pub fn administer(&self) -> Result<bool, SecurityError> {
