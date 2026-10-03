@@ -8,7 +8,7 @@ use std::path::Path;
 
 use peios::msgpack::Writer;
 
-use crate::protocol::{Record, Value};
+use eventd_client::{Record, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {

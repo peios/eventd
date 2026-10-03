@@ -12,6 +12,7 @@ name = "evctl"
 path = "src/main.rs"
 
 [dependencies]
+eventd-client = { path = "../eventd-client" }
 libc = { workspace = true }
 peios = { workspace = true }
 
