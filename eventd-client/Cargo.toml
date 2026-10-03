@@ -8,7 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+libc = { workspace = true }
 peios = { workspace = true }
+peios-sys = { workspace = true }
 
 [lints]
 workspace = true

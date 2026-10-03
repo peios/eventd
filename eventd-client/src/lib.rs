@@ -11,8 +11,14 @@
 //! - [`Tail`] follows a `STREAM` query on a thread of its own, so the
 //!   socket is read as fast as eventd writes it, and hands over the initial
 //!   result once it is complete, then each live batch.
+//! - [`text`] writes values into query text safely.
+//! - [`access`] holds eventd's rights and the descriptors that grant them,
+//!   so a program can say what its user may read: eventd itself leaves out
+//!   what the caller may not read without saying so (§3.28).
 //! - [`wire`] is the framing underneath, for a client that needs it.
 
+pub mod access;
+pub mod text;
 pub mod wire;
 
 use std::io;

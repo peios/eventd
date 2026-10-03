@@ -109,7 +109,9 @@ dependencies = [
 name = "eventd-client"
 version = "0.1.5"
 dependencies = [
+ "libc",
  "peios",
+ "peios-sys",
 ]
 
 [[package]]
