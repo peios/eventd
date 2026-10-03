@@ -495,37 +495,56 @@ impl Drop for Held<'_> {
     }
 }
 
-/// Roughly what a value costs held in memory.
-fn value_size(value: &Value) -> usize {
-    size_of::<Value>()
-        + match value {
-            Value::String(text) => text.len(),
-            Value::Binary(bytes) => bytes.len(),
-            Value::Array(values) => values.iter().map(value_size).sum(),
-            Value::Map(entries) => entries
-                .iter()
-                .map(|(key, value)| value_size(key) + value_size(value))
-                .sum(),
-            Value::Null
-            | Value::Bool(_)
-            | Value::Signed(_)
-            | Value::Unsigned(_)
-            | Value::Float(_) => 0,
-        }
+/// What the allocator takes for `len` bytes: rounded up to 16, plus a
+/// header.
+const fn heap(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        len.div_ceil(16) * 16 + 16
+    }
 }
 
-/// What one field of a record costs beyond its name and value: its share
-/// of the map's nodes and the name's own allocation.
-const FIELD_OVERHEAD: usize = 48;
+/// What a value owns beyond its own slot.
+fn value_heap(value: &Value) -> usize {
+    match value {
+        Value::String(text) => heap(text.len()),
+        Value::Binary(bytes) => heap(bytes.len()),
+        Value::Array(values) => {
+            heap(values.len() * size_of::<Value>()) + values.iter().map(value_heap).sum::<usize>()
+        }
+        Value::Map(entries) => {
+            heap(entries.len() * 2 * size_of::<Value>())
+                + entries
+                    .iter()
+                    .map(|(key, value)| value_heap(key) + value_heap(value))
+                    .sum::<usize>()
+        }
+        Value::Null | Value::Bool(_) | Value::Signed(_) | Value::Unsigned(_) | Value::Float(_) => 0,
+    }
+}
 
-/// Roughly what a row costs held in memory.
+/// Roughly what a value costs held in memory.
+fn value_size(value: &Value) -> usize {
+    size_of::<Value>() + value_heap(value)
+}
+
+/// One record field's share of its map's B-tree: a name slot and a value
+/// slot, in nodes that run about half to two thirds full, with the
+/// nodes' own links and lengths.
+const FIELD_SLOT: usize = (size_of::<String>() + size_of::<Value>()) * 2;
+
+/// Roughly what a row costs held in memory: its fields' slots, and what
+/// the allocator takes for each name and each text or binary value. On
+/// the dev VM, a sort gathering event rows until the budget refused it
+/// grew eventd by 1.07 to 1.12 times the budget.
 fn row_size(row: &Row) -> usize {
     size_of::<Row>()
-        + row.identifier.len()
+        + heap(row.identifier.len())
         + row
             .record
             .iter()
-            .map(|(field, value)| FIELD_OVERHEAD + field.len() + value_size(value))
+            .map(|(field, value)| FIELD_SLOT + heap(field.len()) + value_heap(value))
             .sum::<usize>()
 }
 
