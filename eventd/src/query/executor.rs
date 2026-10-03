@@ -264,9 +264,9 @@ fn execute_at(
                 historical_ranges.as_deref(),
                 authorization,
                 rollup_limits,
-            )?
-            .into_iter()
-            .try_for_each(emit);
+                budget,
+                emit,
+            );
         }
     };
 
@@ -466,6 +466,11 @@ impl<'a> Held<'a> {
         self.set(self.holding.saturating_add(bytes))
     }
 
+    /// Give back what is no longer held. Shrinking cannot fail.
+    fn release(&mut self, bytes: usize) {
+        let _ = self.set(self.holding.saturating_sub(bytes));
+    }
+
     fn set(&mut self, bytes: usize) -> Result<(), QueryError> {
         self.holding = bytes;
         let wanted = bytes.div_ceil(HELD_GRANULE).saturating_mul(HELD_GRANULE);
@@ -540,13 +545,14 @@ const FIELD_SLOT: usize = (size_of::<String>() + size_of::<Value>()) * 2;
 /// the dev VM, a sort gathering event rows until the budget refused it
 /// grew eventd by 1.07 to 1.12 times the budget.
 fn row_size(row: &Row) -> usize {
-    size_of::<Row>()
-        + heap(row.identifier.len())
-        + row
-            .record
-            .iter()
-            .map(|(field, value)| FIELD_SLOT + heap(field.len()) + value_heap(value))
-            .sum::<usize>()
+    size_of::<Row>() + heap(row.identifier.len()) + record_size(&row.record)
+}
+
+fn record_size(record: &Record) -> usize {
+    record
+        .iter()
+        .map(|(field, value)| FIELD_SLOT + heap(field.len()) + value_heap(value))
+        .sum::<usize>()
 }
 
 /// The time range the stores are read over, narrowed by every top-level
@@ -2237,6 +2243,7 @@ impl Numeric {
     }
 }
 
+#[cfg(test)]
 fn numeric_aggregate(
     rows: &[Row],
     field: &str,
@@ -2313,7 +2320,9 @@ fn execute_metric(
     cross_ranges: Option<&[TimeRange]>,
     authorization: &mut AuthorizationCache,
     rollup_limits: Option<&Limits>,
-) -> Result<Vec<Record>, QueryError> {
+    budget: &HeldBudget,
+    emit: &mut Emit<'_>,
+) -> Result<(), QueryError> {
     let connection = open_read_only(path, deadline)?;
     let referenced = referenced_fields(query);
     let identifiers = discover_metric_identifiers(&connection, name_pattern, deadline)?;
@@ -2325,8 +2334,12 @@ fn execute_metric(
         authorization,
     )?;
     if allowed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
+    // What this query holds: the series it matched, then only what its
+    // result needs, with every window folded as samples are read (TRM
+    // §6.5).
+    let mut held = Held::new(budget);
     let mut series_statement = connection.prepare("SELECT id, name, labels, type FROM series")?;
     let mut series_rows = series_statement.query([])?;
     let mut series = Vec::new();
@@ -2348,10 +2361,11 @@ fn execute_metric(
         if labels.is_some_and(|items| !items.iter().all(|item| evaluate(item, &selector_record))) {
             continue;
         }
+        held.add(SERIES_OVERHEAD + heap(name.len()) + record_size(&label_map))?;
         series.push((id, name, metric_type, label_map));
     }
     if series.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let series_count = series.len();
     let first_type = series[0].2;
@@ -2367,7 +2381,7 @@ fn execute_metric(
     {
         return Err(QueryError::MetricNeedsWindow);
     }
-    if let Some(mut output) = execute_rollup_window_query(
+    let rollup = execute_rollup_window_query(
         &connection,
         &series,
         query,
@@ -2380,69 +2394,618 @@ fn execute_metric(
         &referenced,
         authorization,
         rollup_limits,
-    )? {
-        sort_metric_rows(&mut output, query);
-        apply_pagination(&mut output, query);
-        return Ok(output.into_iter().map(|row| row.record).collect());
-    }
-    let mut resolved = Vec::with_capacity(series_count);
-    for (series_id, name, metric_type, label_map) in series {
-        check_deadline(deadline)?;
-        let pair_transform = matches!(query.transform, Some(Transform::Rate | Transform::Delta));
-        let mut inputs = Vec::new();
-        if pair_transform && since > i64::MIN {
-            let mut preceding = connection.prepare(
-                "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
-                 WHERE series_id = ?1 AND timestamp < ?2 \
-                 ORDER BY timestamp DESC, id DESC LIMIT 1",
-            )?;
-            let mut rows = preceding.query(params![series_id, since])?;
-            if let Some(sample) = rows.next()? {
-                inputs.push(read_metric_input(sample, &name, metric_type, &label_map)?);
-            }
-        }
-        let mut statement = connection.prepare(
-            "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
-             WHERE series_id = ?1 AND timestamp >= ?2 AND timestamp < ?3 \
-             ORDER BY timestamp ASC, id ASC",
-        )?;
-        let mut samples = statement.query(params![series_id, since, until])?;
-        while let Some(sample) = samples.next()? {
-            inputs.push(read_metric_input(sample, &name, metric_type, &label_map)?);
-        }
-        let mut visible = Vec::with_capacity(inputs.len());
-        for mut input in inputs {
-            if cross_ranges.is_some_and(|ranges| !range_contains(ranges, timestamp(&input.row))) {
-                continue;
-            }
-            if authorize_row(
-                authorizer,
-                Namespace::Metrics,
-                &mut input.row,
-                &referenced,
-                authorization,
-            )? && query
-                .predicates
-                .iter()
-                .all(|item| evaluate(item, &input.row.record))
-            {
-                visible.push(input);
-            }
-        }
-        let points = transform_metric_inputs(visible, query.transform, since)?;
-        resolved.push((series_id, name, points));
-    }
-    let mut output = finish_metric_query(
-        resolved,
-        query,
-        name_pattern,
-        first_type,
-        bracketed,
-        series_count,
+        &mut held,
     )?;
+    let mut output = if let Some(output) = rollup {
+        output
+    } else {
+        let mut sink = MetricSink::new(query, name_pattern, first_type, bracketed, series_count)?;
+        for (series_id, name, metric_type, label_map) in &series {
+            check_deadline(deadline)?;
+            let mut transformer = Transformer::new(query.transform, since);
+            read_series(
+                &connection,
+                &SeriesRef {
+                    id: *series_id,
+                    name,
+                    metric_type: *metric_type,
+                    labels: label_map,
+                },
+                since,
+                until,
+                query.transform,
+                deadline,
+                &mut |row| {
+                    if cross_ranges.is_some_and(|ranges| !range_contains(ranges, timestamp(row))) {
+                        return Ok(false);
+                    }
+                    Ok(authorize_row(
+                        authorizer,
+                        Namespace::Metrics,
+                        row,
+                        &referenced,
+                        authorization,
+                    )? && query
+                        .predicates
+                        .iter()
+                        .all(|item| evaluate(item, &row.record)))
+                },
+                &mut |input| {
+                    transformer
+                        .push(input)?
+                        .map_or(Ok(()), |point| sink.push(point, &mut held))
+                },
+            )?;
+            sink.end_series(*series_id, &mut held)?;
+        }
+        sink.finish(&mut held)?
+    };
     sort_metric_rows(&mut output, query);
     apply_pagination(&mut output, query);
-    Ok(output.into_iter().map(|row| row.record).collect())
+    output.into_iter().try_for_each(|row| emit(row.record))
+}
+
+/// What one matched series costs held beside its name and labels.
+const SERIES_OVERHEAD: usize = size_of::<(i64, String, i64, Record)>();
+
+/// One matched metric series, as its samples are read.
+struct SeriesRef<'a> {
+    id: i64,
+    name: &'a str,
+    metric_type: i64,
+    labels: &'a Record,
+}
+
+/// How often a series read looks at the query's deadline.
+const DEADLINE_STRIDE: usize = 4_096;
+
+/// Hand each sample of one series in `[since, until)` that `visible`
+/// passes to `visit`, in ascending order, holding none of them. A pair
+/// transform gets the sample before `since` first, as its first pair's
+/// earlier half (PSPU §3.25).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a series read carries the authorized query context explicitly"
+)]
+fn read_series(
+    connection: &Connection,
+    series: &SeriesRef<'_>,
+    since: i64,
+    until: i64,
+    transform: Option<Transform>,
+    deadline: Option<Instant>,
+    visible: &mut dyn FnMut(&mut Row) -> Result<bool, QueryError>,
+    visit: &mut dyn FnMut(MetricInput) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    let mut offer = |mut input: MetricInput| -> Result<(), QueryError> {
+        if visible(&mut input.row)? {
+            visit(input)?;
+        }
+        Ok(())
+    };
+    if matches!(transform, Some(Transform::Rate | Transform::Delta)) && since > i64::MIN {
+        let mut preceding = connection.prepare(
+            "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
+             WHERE series_id = ?1 AND timestamp < ?2 \
+             ORDER BY timestamp DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = preceding.query(params![series.id, since])?;
+        if let Some(sample) = rows.next()? {
+            offer(read_metric_input(
+                sample,
+                series.name,
+                series.metric_type,
+                series.labels,
+            )?)?;
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
+         WHERE series_id = ?1 AND timestamp >= ?2 AND timestamp < ?3 \
+         ORDER BY timestamp ASC, id ASC",
+    )?;
+    let mut samples = statement.query(params![series.id, since, until])?;
+    let mut read = 0_usize;
+    while let Some(sample) = samples.next()? {
+        read += 1;
+        if read.is_multiple_of(DEADLINE_STRIDE) {
+            check_deadline(deadline)?;
+        }
+        offer(read_metric_input(
+            sample,
+            series.name,
+            series.metric_type,
+            series.labels,
+        )?)?;
+    }
+    Ok(())
+}
+
+/// The transform stage for one series, holding at most the sample before
+/// (PSPU §3.25).
+struct Transformer {
+    transform: Option<Transform>,
+    since: i64,
+    previous: Option<(i64, f64)>,
+}
+
+impl Transformer {
+    const fn new(transform: Option<Transform>, since: i64) -> Self {
+        Self {
+            transform,
+            since,
+            previous: None,
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "RATE is specified as a finite binary64 ratio over nanoseconds"
+    )]
+    fn push(&mut self, mut input: MetricInput) -> Result<Option<MetricPoint>, QueryError> {
+        let at = timestamp(&input.row);
+        let point = |row| MetricPoint {
+            row,
+            adjusted_delta: None,
+            elapsed_ns: None,
+        };
+        match self.transform {
+            None => Ok((at >= self.since).then(|| point(input.row))),
+            Some(Transform::Percentile(percentile)) => {
+                if at < self.since {
+                    return Ok(None);
+                }
+                let value = histogram_percentile(
+                    input
+                        .histogram
+                        .as_deref()
+                        .ok_or(QueryError::InvalidHistogram)?,
+                    percentile,
+                )?;
+                match value {
+                    PercentileValue::Empty => return Ok(None),
+                    PercentileValue::Finite(value) => {
+                        set_metric_result(&mut input.row.record, finite_value(value)?, false);
+                    }
+                    PercentileValue::Overflow => {
+                        set_metric_result(&mut input.row.record, Value::Null, true);
+                    }
+                }
+                Ok(Some(point(input.row)))
+            }
+            Some(transform @ (Transform::Rate | Transform::Delta)) => {
+                let Some((earlier_at, earlier)) = self.previous.replace((at, input.number)) else {
+                    return Ok(None);
+                };
+                let elapsed_ns = at.saturating_sub(earlier_at);
+                if at < self.since || elapsed_ns <= 0 {
+                    return Ok(None);
+                }
+                let adjusted_delta = if input.number >= earlier {
+                    input.number - earlier
+                } else {
+                    input.number
+                };
+                let value = if transform == Transform::Rate {
+                    adjusted_delta * 1_000_000_000.0 / elapsed_ns as f64
+                } else {
+                    adjusted_delta
+                };
+                input
+                    .row
+                    .record
+                    .insert("value".into(), finite_value(value)?);
+                Ok(Some(MetricPoint {
+                    row: input.row,
+                    adjusted_delta: Some(adjusted_delta),
+                    elapsed_ns: Some(elapsed_ns),
+                }))
+            }
+        }
+    }
+}
+
+/// One window's, or one series', aggregation, folded as points pass: the
+/// first point's row for the result's labels, and the values in the order
+/// they came, so the result is the one aggregating them all at the end
+/// would give.
+struct Fold {
+    template: Row,
+    numeric: Numeric,
+    overflow: bool,
+    delta: f64,
+    elapsed: Option<i64>,
+    latest: i64,
+}
+
+impl Fold {
+    fn new(point: &MetricPoint) -> Self {
+        let mut fold = Self {
+            template: point.row.clone(),
+            numeric: Numeric::new(),
+            overflow: false,
+            delta: std::iter::empty::<f64>().sum(),
+            elapsed: Some(0),
+            latest: i64::MIN,
+        };
+        fold.push(point);
+        fold
+    }
+
+    fn push(&mut self, point: &MetricPoint) {
+        if matches!(point.row.record.get("overflow"), Some(Value::Bool(true))) {
+            self.overflow = true;
+        }
+        if let Some(value) = point.row.record.get("value") {
+            self.numeric.push(value);
+        }
+        if let Some(delta) = point.adjusted_delta {
+            self.delta += delta;
+        }
+        if let Some(elapsed) = point.elapsed_ns {
+            self.elapsed = self.elapsed.and_then(|total| total.checked_add(elapsed));
+        }
+        self.latest = self.latest.max(timestamp(&point.row));
+    }
+
+    /// A window of a `RATE` or `DELTA` is the sum of its pairs' deltas,
+    /// over the time they cover for `RATE`; anything else is `function`
+    /// over the values, or the overflow result if any was one.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "RATE is specified as a finite binary64 ratio over nanoseconds"
+    )]
+    fn value(
+        &self,
+        function: AggregateFunction,
+        pairs: Option<Transform>,
+    ) -> Result<Value, QueryError> {
+        match pairs {
+            Some(Transform::Rate) => {
+                let elapsed = self.elapsed.ok_or(QueryError::InvalidTime)?;
+                finite_value(self.delta * 1_000_000_000.0 / elapsed as f64)
+            }
+            Some(Transform::Delta) => finite_value(self.delta),
+            _ if self.overflow => Ok(Value::Null),
+            _ => self.numeric.finish(function),
+        }
+    }
+}
+
+/// What a fold costs held beside its template row.
+const FOLD_OVERHEAD: usize = size_of::<Fold>() + size_of::<i64>() * 4;
+
+/// Points folded into epoch-aligned windows of one width (PSPU §3.25).
+struct Windows {
+    width: i64,
+    folds: BTreeMap<i64, Fold>,
+    cost: usize,
+}
+
+impl Windows {
+    const fn new(width: i64) -> Self {
+        Self {
+            width,
+            folds: BTreeMap::new(),
+            cost: 0,
+        }
+    }
+
+    fn push(&mut self, point: &MetricPoint, held: &mut Held<'_>) -> Result<(), QueryError> {
+        let start = timestamp(&point.row).div_euclid(self.width) * self.width;
+        if let Some(fold) = self.folds.get_mut(&start) {
+            fold.push(point);
+            return Ok(());
+        }
+        let cost = FOLD_OVERHEAD + row_size(&point.row);
+        held.add(cost)?;
+        self.cost += cost;
+        self.folds.insert(start, Fold::new(point));
+        Ok(())
+    }
+
+    /// One row per window, starting at the window, with `tie` or else
+    /// the window start as its tiebreaker. What the folds held is given
+    /// back and the rows are held instead.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "metric output metadata is explicit"
+    )]
+    fn rows(
+        self,
+        function: AggregateFunction,
+        pairs: Option<Transform>,
+        retain_labels: bool,
+        output_name: Option<&str>,
+        metric_type: i64,
+        tie: Option<i64>,
+        held: &mut Held<'_>,
+    ) -> Result<Vec<Row>, QueryError> {
+        let mut rows = Vec::with_capacity(self.folds.len());
+        for (start, fold) in self.folds {
+            let name = output_name.unwrap_or(&fold.template.identifier);
+            let row = metric_aggregate_row(
+                &fold.template,
+                fold.value(function, pairs)?,
+                start,
+                retain_labels,
+                name,
+                metric_type,
+                tie.unwrap_or(start),
+            )?;
+            held.add(row_size(&row))?;
+            rows.push(row);
+        }
+        held.release(self.cost);
+        Ok(rows)
+    }
+}
+
+/// Where a metric query's transformed points go, chosen once from its
+/// shape (PSPU §3.25), each keeping no more than its result needs.
+struct MetricSink<'q> {
+    output_name: &'q str,
+    metric_type: i64,
+    /// An unbracketed result keeps labels only when one series matched.
+    single: bool,
+    transform: Option<Transform>,
+    mode: SinkMode,
+}
+
+enum SinkMode {
+    /// Every point is a result: held whole.
+    Points(Vec<Row>),
+    /// Each series' latest point, as is when `rows`, otherwise reduced
+    /// across series by `function`.
+    Latest {
+        current: Option<MetricPoint>,
+        points: Vec<MetricPoint>,
+        rows: bool,
+        function: AggregateFunction,
+    },
+    /// `function` over each series' whole range.
+    PerSeries {
+        current: Option<Fold>,
+        rows: Vec<Row>,
+        function: AggregateFunction,
+    },
+    /// Each series' windows, kept per series.
+    SeriesWindows {
+        current: Windows,
+        rows: Vec<Row>,
+        function: AggregateFunction,
+    },
+    /// Each series' `RATE` or `DELTA` windows, combined across series by
+    /// `function`.
+    Combined {
+        current: Windows,
+        combined: Windows,
+        function: AggregateFunction,
+    },
+    /// Windows over every series' points together.
+    Shared {
+        windows: Windows,
+        function: AggregateFunction,
+    },
+}
+
+impl<'q> MetricSink<'q> {
+    fn new(
+        query: &Query,
+        output_name: &'q str,
+        metric_type: i64,
+        bracketed: bool,
+        series_count: usize,
+    ) -> Result<Self, QueryError> {
+        let pairs = matches!(query.transform, Some(Transform::Rate | Transform::Delta));
+        let latest = |rows, function| SinkMode::Latest {
+            current: None,
+            points: Vec::new(),
+            rows,
+            function,
+        };
+        let mode = match query.metric_aggregate {
+            Some(MetricAggregate::Scalar(function)) if bracketed || query.since.is_some() => {
+                SinkMode::PerSeries {
+                    current: None,
+                    rows: Vec::new(),
+                    function,
+                }
+            }
+            Some(MetricAggregate::Scalar(function)) => latest(false, function),
+            Some(MetricAggregate::Window(function, width)) => {
+                let width = i64::try_from(width).map_err(|_| QueryError::InvalidTime)?;
+                if bracketed {
+                    SinkMode::SeriesWindows {
+                        current: Windows::new(width),
+                        rows: Vec::new(),
+                        function,
+                    }
+                } else if pairs {
+                    SinkMode::Combined {
+                        current: Windows::new(width),
+                        combined: Windows::new(width),
+                        function,
+                    }
+                } else {
+                    SinkMode::Shared {
+                        windows: Windows::new(width),
+                        function,
+                    }
+                }
+            }
+            None if query.since.is_none() => latest(bracketed, AggregateFunction::Avg),
+            None => SinkMode::Points(Vec::new()),
+        };
+        Ok(Self {
+            output_name,
+            metric_type,
+            single: series_count == 1,
+            transform: query.transform,
+            mode,
+        })
+    }
+
+    /// The transform whose pairs a window sums, if any.
+    fn pairs(&self) -> Option<Transform> {
+        self.transform
+            .filter(|transform| matches!(transform, Transform::Rate | Transform::Delta))
+    }
+
+    fn push(&mut self, point: MetricPoint, held: &mut Held<'_>) -> Result<(), QueryError> {
+        match &mut self.mode {
+            SinkMode::Points(rows) => {
+                held.add(row_size(&point.row))?;
+                rows.push(point.row);
+            }
+            SinkMode::Latest { current, .. } => *current = Some(point),
+            SinkMode::PerSeries { current, .. } => match current {
+                Some(fold) => fold.push(&point),
+                None => *current = Some(Fold::new(&point)),
+            },
+            SinkMode::SeriesWindows { current, .. } | SinkMode::Combined { current, .. } => {
+                current.push(&point, held)?;
+            }
+            SinkMode::Shared { windows, .. } => windows.push(&point, held)?,
+        }
+        Ok(())
+    }
+
+    fn end_series(&mut self, series_id: i64, held: &mut Held<'_>) -> Result<(), QueryError> {
+        let pairs = self.pairs();
+        let single = self.single;
+        let output_name = self.output_name;
+        let metric_type = self.metric_type;
+        match &mut self.mode {
+            SinkMode::Points(_) | SinkMode::Shared { .. } => {}
+            SinkMode::Latest {
+                current, points, ..
+            } => {
+                if let Some(point) = current.take() {
+                    held.add(row_size(&point.row))?;
+                    points.push(point);
+                }
+            }
+            SinkMode::PerSeries {
+                current,
+                rows,
+                function,
+            } => {
+                if let Some(fold) = current.take() {
+                    let name = fold.template.identifier.clone();
+                    let row = metric_aggregate_row(
+                        &fold.template,
+                        fold.value(*function, None)?,
+                        fold.latest,
+                        true,
+                        &name,
+                        metric_type,
+                        series_id,
+                    )?;
+                    held.add(row_size(&row))?;
+                    rows.push(row);
+                }
+            }
+            SinkMode::SeriesWindows {
+                current,
+                rows,
+                function,
+            } => {
+                let width = current.width;
+                let windows = core::mem::replace(current, Windows::new(width));
+                rows.extend(windows.rows(
+                    *function,
+                    pairs,
+                    true,
+                    None,
+                    metric_type,
+                    Some(series_id),
+                    held,
+                )?);
+            }
+            SinkMode::Combined {
+                current,
+                combined,
+                function,
+            } => {
+                let width = current.width;
+                let windows = core::mem::replace(current, Windows::new(width));
+                let rows = windows.rows(
+                    *function,
+                    pairs,
+                    single,
+                    Some(output_name),
+                    metric_type,
+                    Some(series_id),
+                    held,
+                )?;
+                for row in rows {
+                    held.release(row_size(&row));
+                    combined.push(
+                        &MetricPoint {
+                            row,
+                            adjusted_delta: None,
+                            elapsed_ns: None,
+                        },
+                        held,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, held: &mut Held<'_>) -> Result<Vec<Row>, QueryError> {
+        let pairs = self.pairs();
+        match self.mode {
+            SinkMode::Points(rows)
+            | SinkMode::PerSeries { rows, .. }
+            | SinkMode::SeriesWindows { rows, .. } => Ok(rows),
+            SinkMode::Latest {
+                points, rows: true, ..
+            } => Ok(points.into_iter().map(|point| point.row).collect()),
+            SinkMode::Latest {
+                points, function, ..
+            } => {
+                let Some((first, rest)) = points.split_first() else {
+                    return Ok(Vec::new());
+                };
+                let mut fold = Fold::new(first);
+                for point in rest {
+                    fold.push(point);
+                }
+                Ok(vec![metric_aggregate_row(
+                    &fold.template,
+                    fold.value(function, None)?,
+                    fold.latest,
+                    self.single,
+                    self.output_name,
+                    self.metric_type,
+                    0,
+                )?])
+            }
+            SinkMode::Combined {
+                combined, function, ..
+            } => combined.rows(
+                function,
+                None,
+                self.single,
+                Some(self.output_name),
+                self.metric_type,
+                None,
+                held,
+            ),
+            SinkMode::Shared { windows, function } => windows.rows(
+                function,
+                pairs,
+                self.single,
+                Some(self.output_name),
+                self.metric_type,
+                Some(0),
+                held,
+            ),
+        }
+    }
 }
 
 #[allow(
@@ -2463,6 +3026,7 @@ fn execute_rollup_window_query(
     referenced: &[String],
     authorization: &mut AuthorizationCache,
     limits: Option<&Limits>,
+    held: &mut Held<'_>,
 ) -> Result<Option<Vec<Row>>, QueryError> {
     let Some(limits) = limits else {
         return Ok(None);
@@ -2528,103 +3092,71 @@ fn execute_rollup_window_query(
         )? {
             continue;
         }
+        let series = SeriesRef {
+            id: *series_id,
+            name,
+            metric_type,
+            labels,
+        };
+        let mut windows =
+            |lower: i64, upper: i64, sources: Option<&mut RollupSources>, held: &mut Held<'_>| {
+                series_windows(
+                    connection,
+                    &series,
+                    lower,
+                    upper,
+                    query.transform,
+                    function,
+                    width,
+                    if bracketed { name } else { output_name },
+                    limits.deadline,
+                    &mut |row| {
+                        authorize_row(
+                            authorizer,
+                            Namespace::Metrics,
+                            row,
+                            referenced,
+                            authorization,
+                        )
+                    },
+                    sources,
+                    held,
+                )
+            };
         if complete {
             for cached in cached.values() {
-                if let Some(value) = cached.value {
-                    output.push(metric_aggregate_row(
-                        &template,
-                        Value::Float(value),
-                        cached.window_start,
-                        true,
-                        if bracketed { name } else { output_name },
-                        metric_type,
-                        *series_id,
-                    )?);
-                } else if cached.overflow {
-                    output.push(metric_aggregate_row(
-                        &template,
-                        Value::Null,
-                        cached.window_start,
-                        true,
-                        if bracketed { name } else { output_name },
-                        metric_type,
-                        *series_id,
-                    )?);
-                }
+                let value = match cached.value {
+                    Some(value) => Value::Float(value),
+                    None if cached.overflow => Value::Null,
+                    None => continue,
+                };
+                let row = metric_aggregate_row(
+                    &template,
+                    value,
+                    cached.window_start,
+                    true,
+                    if bracketed { name } else { output_name },
+                    metric_type,
+                    *series_id,
+                )?;
+                held.add(row_size(&row))?;
+                output.push(row);
             }
             for (lower, upper) in [(since, first_full), (full_end, until)] {
                 if lower < upper {
-                    let inputs = read_metric_range(
-                        connection,
-                        *series_id,
-                        name,
-                        metric_type,
-                        labels,
-                        lower,
-                        upper,
-                        query.transform,
-                        authorizer,
-                        referenced,
-                        authorization,
-                    )?;
-                    let points = transform_metric_inputs(inputs, query.transform, lower)?;
-                    output.extend(window_points(
-                        points,
-                        function,
-                        u64::try_from(width).map_err(|_| QueryError::InvalidTime)?,
-                        query.transform,
-                        true,
-                        Some(if bracketed { name } else { output_name }),
-                        metric_type,
-                        *series_id,
-                    )?);
+                    output.extend(windows(lower, upper, None, held)?);
                 }
             }
             continue;
         }
 
-        let inputs = read_metric_range(
-            connection,
-            *series_id,
-            name,
-            metric_type,
-            labels,
-            since,
-            until,
-            query.transform,
-            authorizer,
-            referenced,
-            authorization,
-        )?;
-        let rollup_sources = inputs
-            .iter()
-            .map(|input| (timestamp(&input.row), row_id(&input.row)))
-            .collect::<Vec<_>>();
-        let points = transform_metric_inputs(inputs, query.transform, since)?;
-        let rows = window_points(
-            points,
-            function,
-            u64::try_from(width).map_err(|_| QueryError::InvalidTime)?,
-            query.transform,
-            true,
-            Some(if bracketed { name } else { output_name }),
-            metric_type,
-            *series_id,
-        )?;
-        if rollup_sources.len() >= limits.adaptive_rollup_min_samples {
+        let mut sources = RollupSources::new(width);
+        let rows = windows(since, until, Some(&mut sources), held)?;
+        if sources.count >= limits.adaptive_rollup_min_samples {
             let by_start: HashMap<_, _> = rows.iter().map(|row| (timestamp(row), row)).collect();
             let mut start = first_full;
-            let mut source_index = 0;
-            let mut preceding_id = None;
             while start < full_end && pending.len() < limits.adaptive_rollup_batch_rows {
-                let end = start.checked_add(width).ok_or(QueryError::InvalidTime)?;
-                let (source_max_sample_id, baseline_id) = advance_rollup_sources(
-                    &rollup_sources,
-                    &mut source_index,
-                    &mut preceding_id,
-                    start,
-                    end,
-                );
+                let (source_max_sample_id, baseline_id) = sources.proof(start);
                 if !cached.contains_key(&start) {
                     let source_baseline_sample_id =
                         if matches!(query.transform, Some(Transform::Rate | Transform::Delta)) {
@@ -2655,6 +3187,7 @@ fn execute_rollup_window_query(
                 start = start.checked_add(width).ok_or(QueryError::InvalidTime)?;
             }
         }
+        held.release(sources.cost);
         output.extend(rows);
     }
     if !pending.is_empty()
@@ -2665,25 +3198,104 @@ fn execute_rollup_window_query(
     Ok(Some(output))
 }
 
-fn advance_rollup_sources(
-    sources: &[(i64, i64)],
-    index: &mut usize,
-    preceding_id: &mut Option<i64>,
-    start: i64,
-    end: i64,
-) -> (i64, Option<i64>) {
-    while *index < sources.len() && sources[*index].0 < start {
-        *preceding_id = Some(sources[*index].1);
-        *index += 1;
+/// Per window, the largest id of the visible samples in it and the id of
+/// its last in order: what proves a cached rollup still fresh, kept
+/// without keeping the samples (TRM §5.6).
+struct RollupSources {
+    width: i64,
+    windows: BTreeMap<i64, (i64, i64)>,
+    count: usize,
+    cost: usize,
+}
+
+/// What one window's proof costs held.
+const SOURCE_COST: usize = size_of::<(i64, (i64, i64))>() * 3;
+
+impl RollupSources {
+    const fn new(width: i64) -> Self {
+        Self {
+            width,
+            windows: BTreeMap::new(),
+            count: 0,
+            cost: 0,
+        }
     }
-    let baseline_id = *preceding_id;
-    let mut source_max_sample_id = 0;
-    while *index < sources.len() && sources[*index].0 < end {
-        source_max_sample_id = source_max_sample_id.max(sources[*index].1);
-        *preceding_id = Some(sources[*index].1);
-        *index += 1;
+
+    fn push(&mut self, at: i64, id: i64, held: &mut Held<'_>) -> Result<(), QueryError> {
+        self.count += 1;
+        let start = at.div_euclid(self.width) * self.width;
+        if let Some((largest, last)) = self.windows.get_mut(&start) {
+            *largest = (*largest).max(id);
+            *last = id;
+            return Ok(());
+        }
+        held.add(SOURCE_COST)?;
+        self.cost += SOURCE_COST;
+        self.windows.insert(start, (id, id));
+        Ok(())
     }
-    (source_max_sample_id, baseline_id)
+
+    /// The largest sample id in the window at `start`, 0 when it has
+    /// none, and the id of the last sample before it.
+    fn proof(&self, start: i64) -> (i64, Option<i64>) {
+        (
+            self.windows.get(&start).map_or(0, |(largest, _)| *largest),
+            self.windows
+                .range(..start)
+                .next_back()
+                .map(|(_, (_, last))| *last),
+        )
+    }
+}
+
+/// One series' windows over `[since, until)`, folded as its samples are
+/// read, with each window's proof noted in `sources` when given.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a series read carries the authorized query context explicitly"
+)]
+fn series_windows(
+    connection: &Connection,
+    series: &SeriesRef<'_>,
+    since: i64,
+    until: i64,
+    transform: Option<Transform>,
+    function: AggregateFunction,
+    width: i64,
+    output_name: &str,
+    deadline: Instant,
+    visible: &mut dyn FnMut(&mut Row) -> Result<bool, QueryError>,
+    mut sources: Option<&mut RollupSources>,
+    held: &mut Held<'_>,
+) -> Result<Vec<Row>, QueryError> {
+    let mut windows = Windows::new(width);
+    let mut transformer = Transformer::new(transform, since);
+    read_series(
+        connection,
+        series,
+        since,
+        until,
+        transform,
+        Some(deadline),
+        visible,
+        &mut |input| {
+            if let Some(sources) = sources.as_deref_mut() {
+                sources.push(timestamp(&input.row), row_id(&input.row), held)?;
+            }
+            transformer
+                .push(input)?
+                .map_or(Ok(()), |point| windows.push(&point, held))
+        },
+    )?;
+    windows.rows(
+        function,
+        transform.filter(|transform| matches!(transform, Transform::Rate | Transform::Delta)),
+        true,
+        Some(output_name),
+        series.metric_type,
+        Some(series.id),
+        held,
+    )
 }
 
 #[derive(Debug)]
@@ -2730,57 +3342,6 @@ fn read_valid_rollups(
         output.insert(cached.window_start, cached);
     }
     Ok(output)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "metric range reads preserve the authorized query context"
-)]
-fn read_metric_range(
-    connection: &Connection,
-    series_id: i64,
-    name: &str,
-    metric_type: i64,
-    labels: &Record,
-    since: i64,
-    until: i64,
-    transform: Option<Transform>,
-    authorizer: &Authorizer,
-    referenced: &[String],
-    authorization: &mut AuthorizationCache,
-) -> Result<Vec<MetricInput>, QueryError> {
-    let mut inputs = Vec::new();
-    if matches!(transform, Some(Transform::Rate | Transform::Delta)) && since > i64::MIN {
-        let mut preceding = connection.prepare(
-            "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
-             WHERE series_id=?1 AND timestamp<?2 ORDER BY timestamp DESC, id DESC LIMIT 1",
-        )?;
-        let mut rows = preceding.query(params![series_id, since])?;
-        if let Some(sample) = rows.next()? {
-            inputs.push(read_metric_input(sample, name, metric_type, labels)?);
-        }
-    }
-    let mut statement = connection.prepare(
-        "SELECT id, boot_id, timestamp, value, histogram_data FROM samples \
-         WHERE series_id=?1 AND timestamp>=?2 AND timestamp<?3 ORDER BY timestamp ASC, id ASC",
-    )?;
-    let mut rows = statement.query(params![series_id, since, until])?;
-    while let Some(sample) = rows.next()? {
-        inputs.push(read_metric_input(sample, name, metric_type, labels)?);
-    }
-    let mut visible = Vec::with_capacity(inputs.len());
-    for mut input in inputs {
-        if authorize_row(
-            authorizer,
-            Namespace::Metrics,
-            &mut input.row,
-            referenced,
-            authorization,
-        )? {
-            visible.push(input);
-        }
-    }
-    Ok(visible)
 }
 
 fn metric_template(name: &str, metric_type: i64, labels: &Record) -> Result<Row, QueryError> {
@@ -2895,6 +3456,10 @@ const fn validate_metric_pipeline(
     }
 }
 
+// The metric pipeline as it was before windows folded, gathering every
+// sample first: kept as the reference the fold is tested against.
+
+#[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
     reason = "RATE is specified as a finite binary64 ratio over nanoseconds"
@@ -3043,8 +3608,11 @@ fn histogram_percentile(bytes: &[u8], percentile: u8) -> Result<PercentileValue,
     Ok(PercentileValue::Overflow)
 }
 
+#[cfg(test)]
 type ResolvedMetricSeries = (i64, String, Vec<MetricPoint>);
 
+/// The reference for `MetricSink`: every series' points, gathered whole.
+#[cfg(test)]
 #[allow(
     clippy::too_many_lines,
     reason = "the mutually exclusive metric result modes are kept together"
@@ -3192,6 +3760,7 @@ fn finish_metric_query(
     }
 }
 
+#[cfg(test)]
 fn take_latest_per_series(series: &mut [ResolvedMetricSeries]) -> Vec<MetricPoint> {
     series
         .iter_mut()
@@ -3199,6 +3768,7 @@ fn take_latest_per_series(series: &mut [ResolvedMetricSeries]) -> Vec<MetricPoin
         .collect()
 }
 
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "metric output metadata is explicit"
@@ -3263,6 +3833,7 @@ fn metric_aggregate_row(
     })
 }
 
+#[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
     clippy::too_many_arguments,
@@ -3320,6 +3891,7 @@ fn window_points(
     Ok(output)
 }
 
+#[cfg(test)]
 fn combine_window_rows(
     rows: Vec<Row>,
     function: AggregateFunction,
@@ -3347,6 +3919,7 @@ fn combine_window_rows(
     Ok(output)
 }
 
+#[cfg(test)]
 fn metric_numeric_aggregate(
     rows: &[Row],
     function: AggregateFunction,
@@ -4052,20 +4625,204 @@ mod tests {
     }
 
     #[test]
-    fn rollup_source_proofs_advance_once_and_keep_the_pre_window_baseline() {
-        let sources = [(5, 8), (10, 10), (10, 11), (18, 9), (25, 12)];
-        let mut index = 0;
-        let mut preceding = None;
-        assert_eq!(
-            advance_rollup_sources(&sources, &mut index, &mut preceding, 10, 20),
-            (11, Some(8))
-        );
-        assert_eq!(index, 4);
-        assert_eq!(
-            advance_rollup_sources(&sources, &mut index, &mut preceding, 20, 30),
-            (12, Some(9))
-        );
-        assert_eq!(index, sources.len());
+    fn rollup_source_proofs_keep_the_largest_id_and_the_pre_window_baseline() {
+        let budget = budget(1 << 20);
+        let mut held = Held::new(&budget);
+        let mut sources = RollupSources::new(10);
+        for (at, id) in [(5, 8), (10, 10), (10, 11), (18, 9), (25, 12)] {
+            sources.push(at, id, &mut held).unwrap();
+        }
+        assert_eq!(sources.count, 5);
+        assert_eq!(sources.proof(10), (11, Some(8)));
+        assert_eq!(sources.proof(20), (12, Some(9)));
+        assert_eq!(sources.proof(30), (0, Some(12)));
+        assert_eq!(sources.proof(0), (8, None));
+    }
+
+    /// Samples of `series` series named `name`, with equal timestamps,
+    /// counter resets, uneven spacing, values that do not add exactly in
+    /// binary64, and some before the range.
+    fn awkward_inputs(name: &str, series: i64, histogram: bool) -> Vec<Vec<MetricInput>> {
+        const SECOND: i64 = 1_000_000_000;
+        (0..series)
+            .map(|core| {
+                let mut value = 0.1 * f64::from(u8::try_from(core).unwrap());
+                let mut at = 0;
+                (0..90_i64)
+                    .map(|index| {
+                        at += match (index + core) % 5 {
+                            0 => 0,
+                            1 => SECOND / 3,
+                            2 => SECOND,
+                            3 => 2 * SECOND + 7,
+                            _ => 3 * SECOND,
+                        };
+                        value = if index % 23 == 22 { 0.3 } else { value + 0.1 };
+                        let mut record = Record::from([
+                            ("core".into(), Value::String(core.to_string())),
+                            ("timestamp".into(), Value::Signed(at)),
+                            ("boot_id".into(), Value::Null),
+                            ("name".into(), Value::String(name.into())),
+                        ]);
+                        let (number, histogram) = if histogram {
+                            record.insert("type".into(), Value::String("histogram".into()));
+                            record.insert("value".into(), Value::Null);
+                            let total = u64::try_from(index % 7).unwrap() * 10;
+                            let located = if index % 11 == 0 { total / 2 } else { total };
+                            (0.0, Some(test_histogram(total, located)))
+                        } else {
+                            record.insert("type".into(), Value::String("counter".into()));
+                            record.insert("value".into(), Value::Float(value));
+                            (value, None)
+                        };
+                        MetricInput {
+                            row: Row {
+                                record,
+                                identifier: name.into(),
+                                tie: Tie::Single(core * 1_000 + index),
+                            },
+                            number,
+                            histogram,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The fold gives exactly the rows the gathering pipeline gave, bit
+    /// for bit, for every result shape.
+    #[test]
+    fn the_metric_fold_matches_gathering_every_sample() {
+        let since = 20 * 1_000_000_000;
+        let shapes = [
+            ("m", false, "METRIC m[]"),
+            ("m", false, "METRIC m"),
+            ("m", false, "METRIC m MAX"),
+            ("m", false, "METRIC m RATE"),
+            ("m", false, "METRIC m[] RATE"),
+            ("m", false, "METRIC m RATE SUM"),
+            ("m", false, "METRIC m[] SINCE 1h ago"),
+            ("m", false, "METRIC m SINCE 1h ago"),
+            ("m", false, "METRIC m[] SINCE 1h ago DELTA"),
+            ("m", false, "METRIC m[] SINCE 1h ago AVG"),
+            ("m", false, "METRIC m[] SINCE 1h ago RATE MIN"),
+            ("m", false, "METRIC m SINCE 1h ago AVG_OVER 7s"),
+            ("m", false, "METRIC m SINCE 1h ago MIN_OVER 7s"),
+            ("m", false, "METRIC m[] SINCE 1h ago MAX_OVER 7s"),
+            ("m", false, "METRIC m SINCE 1h ago RATE SUM_OVER 7s"),
+            ("m", false, "METRIC m SINCE 1h ago RATE AVG_OVER 7s"),
+            ("m", false, "METRIC m[] SINCE 1h ago DELTA SUM_OVER 7s"),
+            ("m", false, "METRIC m[] SINCE 1h ago RATE AVG_OVER 7s"),
+            ("h", true, "METRIC h P95"),
+            ("h", true, "METRIC h[] P99"),
+            ("h", true, "METRIC h[] P99 SINCE 1h ago"),
+            ("h", true, "METRIC h[] P50 SINCE 1h ago MAX"),
+            ("h", true, "METRIC h P99 SINCE 1h ago AVG_OVER 7s"),
+            ("h", true, "METRIC h[] P99 SINCE 1h ago MAX_OVER 7s"),
+        ];
+        for (name, histogram, text) in shapes {
+            let query = crate::query_language::parse(text).unwrap();
+            let bracketed = matches!(
+                &query.source,
+                Source::Metric {
+                    labels: Some(_),
+                    ..
+                }
+            );
+            let metric_type = if histogram { 2 } else { 0 };
+            for count in [1, 3] {
+                let mut resolved = Vec::new();
+                for (index, inputs) in awkward_inputs(name, count, histogram)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let points = transform_metric_inputs(inputs, query.transform, since).unwrap();
+                    resolved.push((i64::try_from(index).unwrap(), name.to_owned(), points));
+                }
+                let mut expected = finish_metric_query(
+                    resolved,
+                    &query,
+                    name,
+                    metric_type,
+                    bracketed,
+                    count_of(count),
+                )
+                .unwrap();
+
+                let budget = budget(1 << 30);
+                let mut held = Held::new(&budget);
+                let mut sink =
+                    MetricSink::new(&query, name, metric_type, bracketed, count_of(count)).unwrap();
+                for (index, inputs) in awkward_inputs(name, count, histogram)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut transformer = Transformer::new(query.transform, since);
+                    for input in inputs {
+                        if let Some(point) = transformer.push(input).unwrap() {
+                            sink.push(point, &mut held).unwrap();
+                        }
+                    }
+                    sink.end_series(i64::try_from(index).unwrap(), &mut held)
+                        .unwrap();
+                }
+                let mut folded = sink.finish(&mut held).unwrap();
+                sort_metric_rows(&mut expected, &query);
+                sort_metric_rows(&mut folded, &query);
+                assert!(
+                    !expected.is_empty(),
+                    "{text} over {count}: nothing to compare"
+                );
+                assert_eq!(
+                    format!("{folded:?}"),
+                    format!("{expected:?}"),
+                    "{text} over {count} series"
+                );
+            }
+        }
+    }
+
+    fn count_of(series: i64) -> usize {
+        usize::try_from(series).unwrap()
+    }
+
+    #[test]
+    fn raw_metric_points_count_against_the_held_budget_and_windows_do_not_grow() {
+        let since = 0;
+        let points = |query: &Query, held: &mut Held<'_>| {
+            let mut sink = MetricSink::new(query, "m", 0, true, 1)?;
+            let mut transformer = Transformer::new(query.transform, since);
+            for round in 0..200 {
+                for input in awkward_inputs("m", 1, false).remove(0) {
+                    let mut input = input;
+                    let at = timestamp(&input.row) + round * 1_000_000_000_000;
+                    input
+                        .row
+                        .record
+                        .insert("timestamp".into(), Value::Signed(at));
+                    if let Some(point) = transformer.push(input)? {
+                        sink.push(point, held)?;
+                    }
+                }
+            }
+            sink.end_series(0, held)?;
+            sink.finish(held).map(|rows| rows.len())
+        };
+        let budget = budget(1 << 20);
+
+        let raw = crate::query_language::parse("METRIC m[] SINCE 1h ago").unwrap();
+        let mut held = Held::new(&budget);
+        assert!(matches!(
+            points(&raw, &mut held),
+            Err(QueryError::HeldLimit)
+        ));
+        drop(held);
+        assert_eq!(budget.used.load(AtomicOrdering::Acquire), 0);
+
+        let windowed = crate::query_language::parse("METRIC m[] SINCE 1h ago AVG_OVER 1h").unwrap();
+        let mut held = Held::new(&budget);
+        assert_eq!(points(&windowed, &mut held).unwrap(), 56);
     }
 
     #[test]
