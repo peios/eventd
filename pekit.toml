@@ -14,8 +14,9 @@ export CARGO_HOME=/tmp/cargo-eventd-vendor
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 mkdir -p "$CARGO_HOME" "$PEKIT_OUT"
 
-# The lock must retain the reviewed libpeios-0.5-compatible peios-rs commit.
-PEIOS_RS_REV=f4309f78fbaa878a14429a5e07d778dba9ddfab7
+# The lock must retain the libpeios-0.5-compatible peios-rs commit the
+# workspace pins: the one libgxwi uses, so eventd-client can share it.
+PEIOS_RS_REV=3dffee949a457509078ffc2f423613de330b5401
 grep -F "peios-rs.git?rev=$PEIOS_RS_REV#$PEIOS_RS_REV" Cargo.lock >/dev/null
 cargo vendor --locked "$PEKIT_OUT/vendor" > "$PEKIT_OUT/cargo-config.toml"
 test -s "$PEKIT_OUT/cargo-config.toml"
