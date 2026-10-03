@@ -272,63 +272,50 @@ fn handle(
         Source::Events { .. } | Source::Metric { .. } => event_commits,
     };
     let mut observed_generation = signal.generation();
-    let (records, mut stream_state) = match if query.stream {
-        executor::start_stream(
-            &query,
-            stores,
-            &authorizer,
-            &Limits {
-                deadline,
-                cross_type_window: tuning.cross_type_window,
-                cross_type_max_lookback: tuning.cross_type_max_lookback,
-                rollups: Some(config.rollups.clone()),
-                adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
-                adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
-                adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
-            },
-        )
-        .map(|(records, state)| (records, Some(state)))
+    let limits = Limits {
+        deadline,
+        cross_type_window: tuning.cross_type_window,
+        cross_type_max_lookback: tuning.cross_type_max_lookback,
+        rollups: Some(config.rollups.clone()),
+        adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
+        adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
+        adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
+    };
+    // The initial result set goes out as it is produced. If the query then
+    // fails, the error that follows tells the client to discard every "ok"
+    // it has had (PSPU §3.16).
+    let mut sender = Sender::new(
+        &mut stream,
+        tuning.response_target_bytes,
+        deadline,
+        if query.stream {
+            distinct_field(&query).map(|field| (field, tuning.max_distinct_stream_values))
+        } else {
+            None
+        },
+    );
+    let outcome = if query.stream {
+        executor::start_stream(&query, stores, &authorizer, &limits, &mut |record| {
+            sender.push(&record)
+        })
+        .map(Some)
     } else {
-        executor::execute(
-            &query,
-            stores,
-            &authorizer,
-            &Limits {
-                deadline,
-                cross_type_window: tuning.cross_type_window,
-                cross_type_max_lookback: tuning.cross_type_max_lookback,
-                rollups: Some(config.rollups.clone()),
-                adaptive_rollup_min_samples: tuning.adaptive_rollup_min_samples,
-                adaptive_rollup_batch_rows: tuning.adaptive_rollup_batch_rows,
-                adaptive_rollup_max_rows: tuning.adaptive_rollup_max_rows,
-            },
-        )
-        .map(|records| (records, None))
-    } {
-        Ok(result) => result,
+        executor::execute(&query, stores, &authorizer, &limits, &mut |record| {
+            sender.push(&record)
+        })
+        .map(|()| None)
+    };
+    let (mut stream_state, mut seen) = match outcome {
+        Ok(state) => (state, sender.finish()?),
+        // The socket itself failed: there is nobody left to tell.
+        Err(executor::QueryError::Delivery(error)) => return Err(*error),
         Err(error) => {
+            drop(sender);
             send_error(&mut stream, &error.to_string())?;
             return Ok(());
         }
     };
-    if query.stream
-        && matches!(
-            query.aggregate,
-            Some(crate::query_language::RecordAggregate::Distinct(_))
-        )
-        && records.len() > tuning.max_distinct_stream_values
-    {
-        send_error(&mut stream, "DISTINCT stream exceeds its seen-value limit")?;
-        return Ok(());
-    }
-    send_records(
-        &mut stream,
-        &records,
-        tuning.response_target_bytes,
-        Some(deadline),
-    )?;
     if query.stream {
-        let mut seen = distinct_values(&query, &records);
         send_status(&mut stream, "watch", Some(deadline))?;
         stream.set_nonblocking(true).map_err(QuerySocketError::Io)?;
         while !stopping.load(Ordering::Acquire) {
@@ -395,17 +382,78 @@ fn distinct_field(query: &crate::query_language::Query) -> Option<&str> {
     }
 }
 
-fn distinct_values(
-    query: &crate::query_language::Query,
-    records: &[value::Record],
-) -> Option<Vec<value::Value>> {
-    let field = distinct_field(query)?;
-    Some(
-        records
-            .iter()
-            .map(|record| record.get(field).cloned().unwrap_or(value::Value::Null))
-            .collect(),
-    )
+/// Sends an initial result set as it is produced, in `ok` messages of
+/// whole records grouped toward the response target (PSPU §3.15–§3.16).
+struct Sender<'a> {
+    stream: &'a mut UnixStream,
+    target: usize,
+    deadline: Instant,
+    chunk: Vec<Vec<u8>>,
+    size: usize,
+    sent: bool,
+    /// For a DISTINCT stream: its field, the values sent so far, which
+    /// seed the watch phase's seen set, and the bound on them.
+    distinct: Option<(&'a str, Vec<value::Value>, usize)>,
+}
+
+/// What an `ok` message costs beyond its records.
+const OK_OVERHEAD: usize = 32;
+
+impl<'a> Sender<'a> {
+    const fn new(
+        stream: &'a mut UnixStream,
+        target: usize,
+        deadline: Instant,
+        distinct: Option<(&'a str, usize)>,
+    ) -> Self {
+        Self {
+            stream,
+            target,
+            deadline,
+            chunk: Vec::new(),
+            size: OK_OVERHEAD,
+            sent: false,
+            distinct: match distinct {
+                Some((field, bound)) => Some((field, Vec::new(), bound)),
+                None => None,
+            },
+        }
+    }
+
+    fn push(&mut self, record: &value::Record) -> Result<(), executor::QueryError> {
+        if let Some((field, seen, bound)) = self.distinct.as_mut() {
+            seen.push(record.get(*field).cloned().unwrap_or(value::Value::Null));
+            if seen.len() > *bound {
+                return Err(executor::QueryError::DistinctStreamLimit);
+            }
+        }
+        let encoded = encode_record(record).map_err(executor::QueryError::delivery)?;
+        // A record never shares a message it would push over the target,
+        // and one larger than the target travels alone.
+        if !self.chunk.is_empty() && self.size.saturating_add(encoded.len()) > self.target {
+            self.flush().map_err(executor::QueryError::delivery)?;
+        }
+        self.size = self.size.saturating_add(encoded.len());
+        self.chunk.push(encoded);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), QuerySocketError> {
+        send_ok(self.stream, &self.chunk, Some(self.deadline))?;
+        self.chunk.clear();
+        self.size = OK_OVERHEAD;
+        self.sent = true;
+        Ok(())
+    }
+
+    /// Sends what is left, or the one empty `ok` that says nothing
+    /// matched, and gives back a DISTINCT stream's seen values.
+    fn finish(mut self) -> Result<Option<Vec<value::Value>>, QuerySocketError> {
+        if !self.chunk.is_empty() || !self.sent {
+            self.flush()?;
+        }
+        Ok(self.distinct.map(|(_, seen, _)| seen))
+    }
 }
 
 enum PeerState {
