@@ -2,7 +2,7 @@
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::Path;
 
@@ -30,7 +30,10 @@ impl Format {
 
 pub struct TransactionalOutput<W> {
     destination: W,
-    spool: File,
+    // Buffered: the text formats write a record a few bytes at a time, and
+    // a system call for each made jsonl about fifty times slower than
+    // msgpack, slow enough for a large result to outlast the query timeout.
+    spool: BufWriter<File>,
     format: Format,
     terminal: bool,
     committed: bool,
@@ -40,7 +43,7 @@ impl<W: Write> TransactionalOutput<W> {
     pub fn new(destination: W, format: Format, terminal: bool) -> io::Result<Self> {
         Ok(Self {
             destination,
-            spool: anonymous_spool(&std::env::temp_dir())?,
+            spool: BufWriter::new(anonymous_spool(&std::env::temp_dir())?),
             format,
             terminal,
             committed: false,
@@ -61,8 +64,10 @@ impl<W: Write> TransactionalOutput<W> {
         if self.committed {
             return Ok(());
         }
-        self.spool.seek(SeekFrom::Start(0))?;
-        io::copy(&mut self.spool, &mut self.destination)?;
+        self.spool.flush()?;
+        let spool = self.spool.get_mut();
+        spool.seek(SeekFrom::Start(0))?;
+        io::copy(spool, &mut self.destination)?;
         self.destination.flush()?;
         self.committed = true;
         Ok(())
