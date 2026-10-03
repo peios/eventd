@@ -14,12 +14,11 @@ crossbeam-utils = "0.8.21"
 hashlink = "0.10.0"
 libc = "0.2.175"
 # Keep the public Peios bindings release-addressable and immutable. The tag
-# predates the libpeios 0.5 ABI. This is the commit after the one the
-# production peiosutils release uses, adding only LogonType::RemoteInteractive,
-# and it is the one libgxwi uses: a program that links eventd-client and
-# libgxwi can hold only one peios-sys, which links libpeios.
-peios = { git = "https://github.com/peios/peios-rs.git", rev = "3dffee949a457509078ffc2f423613de330b5401", package = "peios" }
-peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "3dffee949a457509078ffc2f423613de330b5401", package = "peios-sys" }
+# predates the libpeios 0.5 ABI. This is the one libgxwi uses: a program that
+# links eventd-client and libgxwi can hold only one peios-sys, which links
+# libpeios.
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "fa833541e1837042765072f092140f4af683edc2", package = "peios" }
+peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "fa833541e1837042765072f092140f4af683edc2", package = "peios-sys" }
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]
