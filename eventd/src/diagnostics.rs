@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use eventd_core::MetricTypeMismatch;
 
+use crate::health::Store;
+
 /// How often a rejected log origin may be reported on standard error.
 /// A producer using an unaccepted origin usually uses it for every line
 /// it sends, so the count is the interesting quantity and the text is
@@ -78,6 +80,7 @@ fn state() -> &'static State {
 }
 
 pub fn event_error(error: &impl std::fmt::Display) {
+    crate::health::write_error(Store::Events);
     state()
         .errors
         .write()
@@ -86,6 +89,7 @@ pub fn event_error(error: &impl std::fmt::Display) {
 }
 
 pub fn log_error(error: &impl std::fmt::Display) {
+    crate::health::write_error(Store::Logs);
     state()
         .errors
         .write()
@@ -94,6 +98,7 @@ pub fn log_error(error: &impl std::fmt::Display) {
 }
 
 pub fn metric_error(error: &impl std::fmt::Display) {
+    crate::health::write_error(Store::Metrics);
     state()
         .errors
         .write()
@@ -102,6 +107,7 @@ pub fn metric_error(error: &impl std::fmt::Display) {
 }
 
 pub fn metadata_error(error: &impl std::fmt::Display) {
+    crate::health::write_error(Store::Metadata);
     state()
         .errors
         .write()

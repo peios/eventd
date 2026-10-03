@@ -273,8 +273,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (startup_sender, startup_receiver) = sync_channel(cpu_count);
     let mut drains = Vec::with_capacity(cpu_count);
+    let mut slot_cpus = Vec::with_capacity(cpu_count);
     for (ordinal, attachment) in attachments.into_iter().enumerate() {
         let cpu_id = attachment.cpu_id;
+        slot_cpus.push(cpu_id);
         let context = DrainContext {
             boot_id,
             queues: Arc::clone(&queues),
@@ -297,6 +299,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     drop(startup_sender);
+    let (active_queries, streaming_queries) = query_server.gauges();
+    crate::health::start(crate::health::Layout {
+        shards: shard_count,
+        cpus: slot_cpus,
+        ring_pressure: Arc::clone(&ring_pressure),
+        active_queries,
+        streaming_queries,
+        event_paths: active_paths
+            .iter()
+            .chain(&historical_paths)
+            .cloned()
+            .collect(),
+        log_path: log_path.clone(),
+        metric_path: metric_path.clone(),
+        metadata_path: event_directory.child("eventd-meta.db"),
+    });
     let mut cpu_ids = Vec::with_capacity(cpu_count);
     for _ in 0..cpu_count {
         let cpu_id = startup_receiver

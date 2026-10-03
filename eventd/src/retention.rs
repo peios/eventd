@@ -11,6 +11,7 @@ use eventd_core::{BoundedQueue, Shard};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::config::{Config, SharedConfig};
+use crate::health::{self, Store};
 use crate::log_ingest::LogMaintenance;
 use crate::metric_ingest::MetricMaintenance;
 use crate::writer::{EventMaintenance, WriterMessage};
@@ -127,12 +128,15 @@ fn pass(
         stopping,
     )?;
     for shard in historical_shards.iter_mut() {
-        while !stopping.load(Ordering::Acquire)
-            && shard
+        while !stopping.load(Ordering::Acquire) {
+            let deleted = shard
                 .retain_before(cutoff(now, config.event_age)?, config.batch_rows)
-                .map_err(|error| error.to_string())?
-                == config.batch_rows
-        {}
+                .map_err(|error| error.to_string())?;
+            health::retention_deleted(Store::Events, deleted);
+            if deleted != config.batch_rows {
+                break;
+            }
+        }
     }
     checkpoint_events(event_queues, historical_shards)?;
     if config.event_max_bytes != 0 {
@@ -200,6 +204,7 @@ fn retain_event_age(
     for queue in queues {
         while !stopping.load(Ordering::Acquire) {
             let deleted = event_command(queue, EventMaintenance::DeleteBefore { cutoff, limit })?;
+            health::retention_deleted(Store::Events, deleted);
             if deleted < limit {
                 break;
             }
@@ -273,6 +278,7 @@ fn delete_boot_once(
             .retain_boot(boot_id, limit)
             .map_err(|error| error.to_string())?;
     }
+    health::retention_deleted(Store::Events, deleted);
     Ok(deleted)
 }
 
@@ -328,9 +334,11 @@ fn log_delete(
             response,
         })
         .map_err(|_| "log writer stopped during retention".to_owned())?;
-    receiver
+    let deleted = receiver
         .recv()
-        .map_err(|_| "log writer stopped during retention".to_owned())?
+        .map_err(|_| "log writer stopped during retention".to_owned())??;
+    health::retention_deleted(Store::Logs, deleted);
+    Ok(deleted)
 }
 
 fn checkpoint_log(sender: &Sender<LogMaintenance>) -> Result<(), String> {
@@ -369,9 +377,11 @@ fn metric_delete(
             response,
         })
         .map_err(|_| "metric writer stopped during retention".to_owned())?;
-    receiver
+    let deleted = receiver
         .recv()
-        .map_err(|_| "metric writer stopped during retention".to_owned())?
+        .map_err(|_| "metric writer stopped during retention".to_owned())??;
+    health::retention_deleted(Store::Metrics, deleted);
+    Ok(deleted)
 }
 
 fn checkpoint_metric(sender: &Sender<MetricMaintenance>) -> Result<(), String> {

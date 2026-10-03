@@ -109,6 +109,8 @@ pub fn run(
     let mut last_authorization_error = None;
     let mut type_mismatch_reporter = TypeMismatchReporter::default();
     let mut applied_rollup_max_rows = None;
+    let mut next_health =
+        Instant::now() + Config::read(runtime, |config| config.health_metric_interval);
     while !stopping.load(Ordering::Acquire) {
         let (
             max_batch_size,
@@ -118,6 +120,7 @@ pub fn run(
             next_ceiling,
             next_authorization_cache_size,
             rollup_max_rows,
+            health_interval,
         ) = Config::read(runtime, |config| {
             (
                 config.metric_max_batch_size,
@@ -127,8 +130,31 @@ pub fn run(
                 config.max_metric_datagram_bytes,
                 config.metric_authorization_cache_size,
                 config.adaptive_rollup_max_rows,
+                config.health_metric_interval,
             )
         });
+        // eventd's own health goes straight into its store: no socket, no
+        // token and no EVENTD_PUBLISH check (TRM §5.7).
+        let now = Instant::now();
+        next_health = next_health.min(now + health_interval);
+        if !health_interval.is_zero() && now >= next_health {
+            next_health = now + health_interval;
+            batch.extend(crate::health::sample(
+                boot_id,
+                realtime_nanoseconds()?,
+                store.cache_len(),
+            ));
+            commit_batch(
+                &mut store,
+                &batch,
+                retention_requested,
+                boot_id,
+                error_events,
+                &mut type_mismatch_reporter,
+            )?;
+            batch.clear();
+            started = None;
+        }
         store.configure(checkpoint_pages, cache_size);
         authorizer.configure(next_authorization_cache_size);
         if datagram_ceiling != next_ceiling {
@@ -369,6 +395,7 @@ fn commit_batch(
 ) -> Result<(), MetricIngestError> {
     match store.commit(batch) {
         Ok(stats) => {
+            crate::health::metrics_stored(stats.accepted);
             if stats.type_mismatches != 0 {
                 type_mismatch_reporter.record(&stats);
             }

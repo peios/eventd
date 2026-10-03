@@ -7,6 +7,7 @@ mod config;
 mod datagram;
 mod diagnostics;
 mod directory;
+mod health;
 mod indexing;
 mod kmes;
 mod log_ingest;

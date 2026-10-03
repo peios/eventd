@@ -202,6 +202,7 @@ fn commit_batch(
     match store.commit(batch) {
         Ok(()) => {
             if !batch.is_empty() {
+                crate::health::logs_stored(batch.len());
                 commits.committed();
             }
             Ok(())
