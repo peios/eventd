@@ -198,6 +198,12 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 
 '''
 
+# eventd is part of the trusted computing base: it holds the audit trail,
+# so no process below the TCB tier may signal it, trace it or read its
+# memory and descriptors (TRM §1.1). The tier is selected by the signing key.
+[build.main.sign.pip]
+"usr/sbin/eventd" = "tcb.priv"
+
 [build.main.dependencies.peipkg]
 "org.git.kernel.dash"      = "*"
 "org.gnu.gzip"             = "*"
