@@ -50,6 +50,7 @@ struct MetricTypeDiagnostics {
 struct State {
     errors: RwLock<WriteErrors>,
     started: Instant,
+    reserved_event_types: AtomicU64,
     log_rejected_origins: AtomicU64,
     log_last_rejected_origin: RwLock<Option<String>>,
     log_origin_report_at: AtomicU64,
@@ -67,6 +68,7 @@ fn state() -> &'static State {
     STATE.get_or_init(|| State {
         errors: RwLock::new(WriteErrors::default()),
         started: Instant::now(),
+        reserved_event_types: AtomicU64::new(0),
         log_rejected_origins: AtomicU64::new(0),
         log_last_rejected_origin: RwLock::new(None),
         log_origin_report_at: AtomicU64::new(0),
@@ -119,6 +121,17 @@ pub fn metadata_error(error: &impl std::fmt::Display) {
 /// caller should also report it on standard error. The first rejection
 /// reports, and thereafter one per `ORIGIN_REPORT_INTERVAL`; the count
 /// in the diagnostic dump (§8.5) carries the rest.
+/// Count a KMES event discarded for carrying a type in the namespace eventd
+/// reserves for the records it writes itself (TRM §2.6).
+pub fn reserved_event_type() {
+    state().reserved_event_types.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many KMES events have been discarded for a reserved type.
+pub fn reserved_event_types() -> u64 {
+    state().reserved_event_types.load(Ordering::Relaxed)
+}
+
 pub fn log_rejected_origin(origin: &str) -> bool {
     let state = state();
     state.log_rejected_origins.fetch_add(1, Ordering::Relaxed);
