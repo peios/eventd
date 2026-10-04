@@ -573,6 +573,253 @@ fn fail_control(message: WriterMessage, error: &ShardError) {
 mod tests {
     use super::*;
     use eventd_core::RealEvent;
+    use std::sync::mpsc::sync_channel;
+
+    /// The shared state `run` borrows, as the pipeline gives each writer.
+    struct Harness {
+        stopping: Arc<AtomicBool>,
+        commits: Arc<CommitSignal>,
+        ring_pressure: Arc<[AtomicU8]>,
+        retention_requested: Arc<AtomicBool>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                stopping: Arc::new(AtomicBool::new(false)),
+                commits: Arc::new(CommitSignal::new()),
+                ring_pressure: Arc::from([]),
+                retention_requested: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn run(
+            &self,
+            shard: Shard,
+            queue: &BoundedQueue<WriterMessage>,
+            runtime: &SharedConfig,
+        ) -> Result<(), ShardError> {
+            run(
+                shard,
+                0,
+                [1; 16],
+                queue,
+                runtime,
+                &self.stopping,
+                &self.commits,
+                &self.ring_pressure,
+                &self.retention_requested,
+            )
+        }
+    }
+
+    /// Closes the handoff when dropped, so a failing test still ends the
+    /// writer and its scope can join it.
+    struct CloseOnDrop<'a>(&'a BoundedQueue<WriterMessage>);
+
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    fn real_event(sequence: u64) -> WriterMessage {
+        WriterMessage::Event(IngestItem {
+            gaps: Vec::new(),
+            store_event: true,
+            event: RealEvent {
+                boot_id: [1; 16],
+                timestamp: sequence,
+                cpu_id: 0,
+                sequence,
+                origin_class: 0,
+                effective_token_guid: [2; 16],
+                true_token_guid: [3; 16],
+                process_guid: [4; 16],
+                event_type: "test.event".into(),
+                payload: [0x80].into(),
+            },
+        })
+    }
+
+    fn publish(queue: &BoundedQueue<WriterMessage>, message: WriterMessage) {
+        queue
+            .reserve(core::mem::size_of::<WriterMessage>())
+            .unwrap()
+            .publish(message);
+    }
+
+    fn delete_before(
+        queue: &BoundedQueue<WriterMessage>,
+        cutoff: i64,
+        limit: usize,
+        response: SyncSender<Result<usize, String>>,
+    ) {
+        publish(
+            queue,
+            WriterMessage::Maintenance(EventMaintenance::DeleteBefore { cutoff, limit }, response),
+        );
+    }
+
+    fn handoff() -> BoundedQueue<WriterMessage> {
+        BoundedQueue::new(1_024, 16 * 1024 * 1024).unwrap()
+    }
+
+    /// A configuration whose batches are bounded by size alone.
+    fn batched_by_size(max_batch_size: usize) -> SharedConfig {
+        let mut config = Config::test_defaults();
+        config.max_batch_size = max_batch_size;
+        config.max_batch_latency = Duration::from_mins(1);
+        config.shared()
+    }
+
+    fn stored_events(path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eventd-writer-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_max_batch_size_change_between_batches_bounds_the_next_batch() {
+        let directory = temporary_directory();
+        let shard = Shard::open(directory.join("shard-0000.db"), 1_000).unwrap();
+        let queue = handoff();
+        let runtime = batched_by_size(100);
+        let harness = Harness::new();
+        let (settled, settled_signal) = sync_channel(1);
+        // A rendezvous: the writer cannot go on until the test takes it.
+        let (pause, paused) = sync_channel(0);
+        let (done, done_signal) = sync_channel(1);
+        let mut sequence = 0;
+        for _ in 0..150 {
+            sequence += 1;
+            publish(&queue, real_event(sequence));
+        }
+        publish(&queue, WriterMessage::Barrier(settled));
+        publish(&queue, WriterMessage::Barrier(pause));
+        for _ in 0..300 {
+            sequence += 1;
+            publish(&queue, real_event(sequence));
+        }
+        publish(&queue, WriterMessage::Barrier(done));
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let paused = paused;
+            settled_signal.recv().unwrap().unwrap();
+            assert_eq!(
+                harness.commits.generation(),
+                2,
+                "150 events under MaxBatchSize 100 commit as 100 then 50"
+            );
+            // The writer is now between batches, held at the pause.
+            runtime.write().unwrap().max_batch_size = 150;
+            paused.recv().unwrap().unwrap();
+            done_signal.recv().unwrap().unwrap();
+            assert_eq!(
+                harness.commits.generation() - 2,
+                2,
+                "the next 300 events commit as two batches of the new 150, not three of 100"
+            );
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(stored_events(&directory.join("shard-0000.db")), 450);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn maintenance_runs_after_the_batch_before_it_commits_and_deletes_at_most_its_limit() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = Shard::open(&path, 1_000).unwrap();
+        let queue = handoff();
+        let runtime = batched_by_size(10_000);
+        let harness = Harness::new();
+        let (first, first_result) = sync_channel(1);
+        let (second, second_result) = sync_channel(1);
+        let (rest, rest_result) = sync_channel(1);
+        // Ten events, every one older than the cutoff, then the commands
+        // behind them in the same handoff.
+        for sequence in 1..=10 {
+            publish(&queue, real_event(sequence));
+        }
+        delete_before(&queue, 1_000, 3, first);
+        delete_before(&queue, 1_000, 3, second);
+        delete_before(&queue, 1_000, 100, rest);
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            // Had the command run inside or before the open batch, there
+            // would have been nothing committed for it to delete.
+            assert_eq!(first_result.recv().unwrap(), Ok(3));
+            assert_eq!(second_result.recv().unwrap(), Ok(3));
+            assert_eq!(rest_result.recv().unwrap(), Ok(4));
+            assert_eq!(
+                harness.commits.generation(),
+                1,
+                "the batch was committed once, as its own transaction"
+            );
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(stored_events(&path), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn events_handed_off_while_a_command_runs_commit_before_the_next_command() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = Shard::open(&path, 1_000).unwrap();
+        let queue = handoff();
+        let runtime = batched_by_size(10_000);
+        let harness = Harness::new();
+        // The retention coordinator sends one command and waits for its
+        // answer before sending the next; a rendezvous holds the writer at
+        // the end of the first while the drains hand off more events.
+        let (first, first_result) = sync_channel(0);
+        let (next, next_result) = sync_channel(1);
+        delete_before(&queue, 1_000, 100, first);
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let first_result = first_result;
+            for sequence in 1..=5 {
+                publish(&queue, real_event(sequence));
+            }
+            assert_eq!(first_result.recv().unwrap(), Ok(0));
+            delete_before(&queue, 1_000, 100, next);
+            assert_eq!(
+                next_result.recv().unwrap(),
+                Ok(5),
+                "the five events were committed before the next command ran"
+            );
+            assert_eq!(harness.commits.generation(), 1);
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(stored_events(&path), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn lost_batches_become_merged_per_cpu_gap_ranges() {

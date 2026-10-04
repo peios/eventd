@@ -1294,6 +1294,26 @@ mod tests {
     }
 
     #[test]
+    fn metric_batch_defaults_are_5000_samples_and_1000_milliseconds() {
+        let defaults = Config::test_defaults();
+        assert!(
+            !defaults
+                .raw_values
+                .contains_key(b"MetricMaxBatchSize".as_slice())
+        );
+        assert!(
+            !defaults
+                .raw_values
+                .contains_key(b"MetricMaxBatchLatencyMs".as_slice())
+        );
+        assert_eq!(defaults.metric_max_batch_size, 5_000);
+        assert_eq!(
+            defaults.metric_max_batch_latency,
+            Duration::from_millis(1_000)
+        );
+    }
+
+    #[test]
     fn adaptive_rollup_defaults_are_bounded_and_zero_disables_the_cache() {
         let defaults = Config::test_defaults();
         assert_eq!(defaults.adaptive_rollup_min_samples, 1_000);

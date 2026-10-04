@@ -5613,4 +5613,204 @@ mod tests {
         });
         assert!(matches!(failed, Some(QueryError::HeldLimit)));
     }
+
+    /// An authorizer whose every access check fails, as each does once KACS
+    /// is gone: its token is `/dev/null`, which is no token.
+    fn authorizer_without_kacs(
+        descriptors: Arc<super::super::security::DescriptorCache>,
+    ) -> Authorizer {
+        let token = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        Authorizer::for_token(peios::token::Token::from(token), descriptors)
+    }
+
+    fn readable_by_everyone() -> peios::security::SecurityDescriptor {
+        peios::security::sddl::parse("O:SYG:SYD:P(A;;0x00000001;;;WD)").unwrap()
+    }
+
+    fn query_limits() -> Limits {
+        Limits {
+            deadline: Instant::now() + Duration::from_mins(1),
+            cross_type_window: Duration::from_secs(1),
+            cross_type_max_lookback: Duration::from_hours(1),
+            rollups: None,
+            adaptive_rollup_min_samples: 0,
+            adaptive_rollup_batch_rows: 0,
+            adaptive_rollup_max_rows: 0,
+            held: budget(1 << 20),
+        }
+    }
+
+    /// A real event shard, as the writer keeps it, holding events of type
+    /// `t` with sequences and timestamps `sequences`.
+    fn writer_shard(path: &Path, sequences: core::ops::RangeInclusive<u64>) -> eventd_core::Shard {
+        let mut shard = eventd_core::Shard::open(path, 1_000).unwrap();
+        shard.commit(&ingest_items(sequences)).unwrap();
+        shard
+    }
+
+    fn ingest_items(sequences: core::ops::RangeInclusive<u64>) -> Vec<eventd_core::IngestItem> {
+        sequences
+            .map(|sequence| eventd_core::IngestItem {
+                gaps: Vec::new(),
+                store_event: true,
+                event: eventd_core::RealEvent {
+                    boot_id: [1; 16],
+                    timestamp: sequence,
+                    cpu_id: 0,
+                    sequence,
+                    origin_class: 0,
+                    effective_token_guid: [2; 16],
+                    true_token_guid: [3; 16],
+                    process_guid: [4; 16],
+                    event_type: "t".into(),
+                    payload: [0x80].into(),
+                },
+            })
+            .collect()
+    }
+
+    fn store_directory() -> PathBuf {
+        let sequence = TEST_DATABASE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "eventd-query-store-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    // TRM §9.3: when KACS fails, a query that needs a fresh access check is
+    // denied.
+    #[test]
+    fn a_query_whose_fresh_access_check_fails_is_denied_not_allowed() {
+        let directory = store_directory();
+        let shard_path = directory.join("shard-0000.db");
+        let shard = writer_shard(&shard_path, 1..=3);
+        let stores = Stores {
+            event_paths: vec![shard_path],
+            log_path: directory.join("logs.db"),
+            metric_path: directory.join("metrics.db"),
+        };
+        // The descriptor is already resolved, so the registry plays no part:
+        // the one thing the query still needs is the check itself.
+        let descriptors = Arc::new(super::super::security::DescriptorCache::new());
+        descriptors.resolve_as(Namespace::Events, "t", "*", &readable_by_everyone());
+        let authorizer = authorizer_without_kacs(descriptors);
+
+        let mut emitted = Vec::new();
+        let outcome = execute(
+            &crate::query_language::parse("EVENTS").unwrap(),
+            &stores,
+            &authorizer,
+            &query_limits(),
+            &mut |record| {
+                emitted.push(record);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(outcome, Err(QueryError::Security(_))),
+            "the query is denied: {outcome:?}"
+        );
+        assert!(emitted.is_empty(), "and none of its records were allowed");
+        assert!(
+            authorizer
+                .check(Namespace::Events, "t", &["event_type".to_owned()])
+                .is_err(),
+            "the identifier is denied rather than allowed"
+        );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // TRM §9.3: cached check results stay valid for the duration of the
+    // query that obtained them.
+    #[test]
+    fn a_verdict_is_reused_for_the_rest_of_its_query_without_a_second_check() {
+        let descriptors = Arc::new(super::super::security::DescriptorCache::new());
+        descriptors.resolve_as(Namespace::Events, "t", "*", &readable_by_everyone());
+        let authorizer = authorizer_without_kacs(descriptors);
+        let fields = vec!["event_type".to_owned(), "timestamp".to_owned()];
+        let granted = HashSet::from(["event_type".to_owned(), "timestamp".to_owned()]);
+        let mut cache = AuthorizationCache::new(&authorizer);
+        // The verdicts this query obtained while KACS still answered.
+        cache
+            .identifiers
+            .insert(("t".to_owned(), fields.clone()), true);
+        cache
+            .entries
+            .insert(("t".to_owned(), fields.clone()), Some(granted.clone()));
+
+        // KACS now fails every check, and the query goes on from its verdicts.
+        for _ in 0..3 {
+            assert!(
+                cache
+                    .may_read(&authorizer, Namespace::Events, "t", &fields)
+                    .unwrap()
+            );
+            assert_eq!(
+                cache
+                    .check(&authorizer, Namespace::Events, "t", &fields)
+                    .unwrap(),
+                Some(granted.clone())
+            );
+        }
+        // What it has not yet been told needs a check, which fails.
+        assert!(
+            cache
+                .check(&authorizer, Namespace::Events, "t", &["message".to_owned()])
+                .is_err()
+        );
+    }
+
+    // TRM §9.4: where eventd cannot allocate what an admitted query needs,
+    // it fails that query rather than blocking a writer.
+    #[test]
+    fn a_query_whose_store_cannot_be_opened_fails_without_blocking_a_writer() {
+        let directory = store_directory();
+        let shard_path = directory.join("shard-0000.db");
+        let mut shard = writer_shard(&shard_path, 1..=1);
+        // A shard the query cannot open, as when it has no descriptor left
+        // for the connection: SQLite reports both as CANTOPEN.
+        let stores = Stores {
+            event_paths: vec![shard_path.clone(), directory.join("absent/shard-0001.db")],
+            log_path: directory.join("logs.db"),
+            metric_path: directory.join("metrics.db"),
+        };
+        let authorizer =
+            authorizer_without_kacs(Arc::new(super::super::security::DescriptorCache::new()));
+        let query = crate::query_language::parse("EVENTS").unwrap();
+
+        // The writer commits throughout, never waiting: its connection has
+        // no busy timeout, so a lock the query held would fail a commit.
+        let writer = std::thread::spawn(move || {
+            for sequence in 2..=500 {
+                shard.commit(&ingest_items(sequence..=sequence)).unwrap();
+            }
+            shard
+        });
+        let mut failed = 0;
+        while !writer.is_finished() || failed == 0 {
+            let outcome = execute(&query, &stores, &authorizer, &query_limits(), &mut |_| {
+                panic!("a query that failed sends no records")
+            });
+            let Err(error) = outcome else {
+                panic!("the query cannot succeed without its store")
+            };
+            assert!(
+                matches!(&error, QueryError::Sql(cause)
+                    if cause.sqlite_error_code() == Some(rusqlite::ErrorCode::CannotOpen)),
+                "{error}"
+            );
+            failed += 1;
+        }
+        let shard = writer.join().expect("every commit succeeded");
+        let committed: i64 = Connection::open(&shard_path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(committed, 500);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

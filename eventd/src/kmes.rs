@@ -19,18 +19,31 @@ pub struct Attachment {
 }
 
 pub fn attach_all() -> Result<Vec<Attachment>, KmesError> {
-    let slots = slot_count()?;
+    Ok(
+        attach_slots(slot_count()?, peios::event::attach, |(fd, capacity)| {
+            EventRing::map(fd, capacity)
+        })?
+        .into_iter()
+        .map(|(cpu_id, ring)| Attachment { cpu_id, ring })
+        .collect(),
+    )
+}
+
+/// Walk every slot below `slots`, attaching through `attach` and mapping
+/// through `map`, and skip each `EINVAL` hole.
+fn attach_slots<D, R>(
+    slots: u64,
+    mut attach: impl FnMut(u32) -> Result<D, peios::Error>,
+    mut map: impl FnMut(D) -> Result<R, peios::Error>,
+) -> Result<Vec<(u16, R)>, KmesError> {
     let mut attachments = Vec::new();
     for logical_id in 0..slots {
         let cpu_id = u32::try_from(logical_id).map_err(|_| KmesError::TooManySlots(slots))?;
-        match peios::event::attach(cpu_id) {
-            Ok((fd, capacity)) => {
+        match attach(cpu_id) {
+            Ok(descriptor) => {
                 let external_id =
                     u16::try_from(cpu_id).map_err(|_| KmesError::CpuIdOutOfRange(cpu_id))?;
-                attachments.push(Attachment {
-                    cpu_id: external_id,
-                    ring: EventRing::map(fd, capacity).map_err(KmesError::Peios)?,
-                });
+                attachments.push((external_id, map(descriptor).map_err(KmesError::Peios)?));
             }
             Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
             Err(error) => return Err(KmesError::Peios(error)),
@@ -121,7 +134,7 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             // indistinguishable from a record eventd writes, so it is not
             // stored. It is still handed to the writer, so its sequence is
             // receipted and no restart reports it lost.
-            let reserved = crate::synthetic::is_reserved(&event.event_type);
+            let reserved = crate::synthetic::is_reserved(event.event_type);
             if reserved && observation.store_event {
                 crate::diagnostics::reserved_event_type();
             }
@@ -362,5 +375,47 @@ impl std::error::Error for KmesError {
             | Self::WriterStopped
             | Self::Writer(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot source that answers each slot from `answers`, recording which
+    /// slots were asked about. `true` attaches; `false` is an `EINVAL` hole.
+    type Attached = Result<Vec<(u16, u32)>, KmesError>;
+
+    fn slots(answers: &[bool]) -> (Vec<u32>, Attached) {
+        let mut asked = Vec::new();
+        let result = attach_slots(
+            u64::try_from(answers.len()).unwrap(),
+            |cpu_id| {
+                asked.push(cpu_id);
+                if answers[usize::try_from(cpu_id).unwrap()] {
+                    Ok(cpu_id)
+                } else {
+                    Err(peios::Error::from_raw_os_error(libc::EINVAL))
+                }
+            },
+            Ok,
+        );
+        (asked, result)
+    }
+
+    #[test]
+    fn an_einval_slot_is_a_hole_and_enumeration_continues_past_it() {
+        let (asked, attached) = slots(&[true, false, true]);
+        assert_eq!(asked, [0, 1, 2], "every slot below the count is tried");
+        assert_eq!(attached.unwrap(), [(0, 0), (2, 2)]);
+    }
+
+    #[test]
+    fn discovering_no_attachable_buffer_fails_startup() {
+        let (asked, attached) = slots(&[false, false, false]);
+        assert_eq!(asked, [0, 1, 2]);
+        assert!(matches!(attached, Err(KmesError::NoBuffers)));
+        let (_, attached) = slots(&[]);
+        assert!(matches!(attached, Err(KmesError::NoBuffers)));
     }
 }

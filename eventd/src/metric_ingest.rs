@@ -16,7 +16,7 @@ use peios::msgpack::{Reader, Type};
 use crate::config::{Config, SharedConfig};
 use crate::datagram::{IngestionSocket, SocketError, TokenReceive};
 use crate::query::DescriptorCache;
-use crate::write_security::MetricPublishAuthorizer;
+use crate::write_security::{MetricPublishAuthorizer, MetricPublishError};
 use crate::writer::WriterMessage;
 
 pub enum MetricMaintenance {
@@ -173,25 +173,22 @@ pub fn run(
                 else {
                     continue;
                 };
-                match authorizer.authorize(&token, &mut records) {
-                    Ok(rejected) => crate::diagnostics::metric_unauthorized(rejected),
-                    Err(error) => {
-                        crate::diagnostics::metric_authorization_error();
-                        if last_authorization_error
-                            .is_none_or(|last: Instant| last.elapsed().as_secs() >= 1)
-                        {
-                            eprintln!("eventd: metric datagram rejected: {error}");
-                            last_authorization_error = Some(Instant::now());
-                        }
-                        continue;
-                    }
+                if !admit_authorized(
+                    authorizer.authorize(&token, &mut records),
+                    &mut last_authorization_error,
+                ) {
+                    continue;
                 }
                 for record in records {
                     started.get_or_insert_with(Instant::now);
                     batch.push(record);
-                    if batch.len() == max_batch_size
-                        || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
-                    {
+                    if batch_is_due(
+                        batch.len(),
+                        max_batch_size,
+                        started,
+                        max_batch_latency,
+                        Instant::now(),
+                    ) {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -305,6 +302,43 @@ pub fn run(
         )?;
     }
     Ok(())
+}
+
+/// Count the outcome of a datagram's publication check and say whether its
+/// remaining samples go on to the batch. A failed check drops the datagram
+/// fail-closed and is counted; it never stops ingestion.
+pub fn admit_authorized(
+    authorized: Result<usize, MetricPublishError>,
+    last_error: &mut Option<Instant>,
+) -> bool {
+    match authorized {
+        Ok(rejected) => {
+            crate::diagnostics::metric_unauthorized(rejected);
+            true
+        }
+        Err(error) => {
+            crate::diagnostics::metric_authorization_error();
+            if last_error.is_none_or(|last: Instant| last.elapsed().as_secs() >= 1) {
+                eprintln!("eventd: metric datagram rejected: {error}");
+                *last_error = Some(Instant::now());
+            }
+            false
+        }
+    }
+}
+
+/// Whether an open batch commits after taking a sample: at
+/// `MetricMaxBatchSize` samples, or once `MetricMaxBatchLatencyMs` has
+/// passed since its first.
+fn batch_is_due(
+    samples: usize,
+    max_batch_size: usize,
+    started: Option<Instant>,
+    max_batch_latency: Duration,
+    now: Instant,
+) -> bool {
+    samples == max_batch_size
+        || started.is_some_and(|time| now.duration_since(time) >= max_batch_latency)
 }
 
 fn process_rollups(
@@ -893,6 +927,61 @@ mod tests {
             .write_float(2.5);
         let records = parse_datagram(&writer.to_bytes().unwrap(), [1; 16], 7).unwrap();
         assert!(matches!(records[0].value, MetricValue::Histogram(_)));
+    }
+
+    #[test]
+    fn a_batch_commits_once_its_latency_has_elapsed_since_its_first_sample() {
+        let latency = Duration::from_millis(1_000);
+        let first = Instant::now();
+        // A batch far below MetricMaxBatchSize, with more samples arriving
+        // (the queue is not idle): only the clock can close it.
+        assert!(!batch_is_due(1, 5_000, Some(first), latency, first));
+        assert!(!batch_is_due(
+            4_999,
+            5_000,
+            Some(first),
+            latency,
+            first + Duration::from_millis(999)
+        ));
+        assert!(batch_is_due(
+            2,
+            5_000,
+            Some(first),
+            latency,
+            first + Duration::from_millis(1_000)
+        ));
+        assert!(batch_is_due(
+            2,
+            5_000,
+            Some(first),
+            latency,
+            first + Duration::from_secs(7)
+        ));
+        // The size cap closes a batch whatever the clock says.
+        assert!(batch_is_due(5_000, 5_000, Some(first), latency, first));
+    }
+
+    #[test]
+    fn a_failed_publication_check_is_counted_and_drops_only_its_datagram() {
+        let mut last_error = None;
+        let before = crate::diagnostics::snapshot().2.authorization_errors;
+        // What KACS's absence looks like from here: the token cannot be
+        // inspected, or the check itself fails.
+        assert!(!admit_authorized(
+            Err(MetricPublishError::Token(peios::Error::from_raw_os_error(
+                libc::ENOSYS
+            ))),
+            &mut last_error,
+        ));
+        assert!(!admit_authorized(
+            Err(MetricPublishError::Policy("access check failed".into())),
+            &mut last_error,
+        ));
+        // The counters are process-wide and shared with other tests.
+        assert!(crate::diagnostics::snapshot().2.authorization_errors >= before + 2);
+        assert!(last_error.is_some(), "the failure is reported");
+        // The next datagram whose check succeeds goes on to its batch.
+        assert!(admit_authorized(Ok(0), &mut last_error));
     }
 
     #[test]

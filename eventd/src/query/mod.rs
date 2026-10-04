@@ -252,11 +252,10 @@ fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
 
 #[allow(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "connection ownership and its protocol state remain linear and auditable"
 )]
 fn handle(
-    mut stream: UnixStream,
+    stream: UnixStream,
     stores: &Stores,
     config: &ServerConfig,
     tuning: &QueryTuning,
@@ -267,19 +266,59 @@ fn handle(
     event_commits: &CommitSignal,
     log_commits: &CommitSignal,
 ) -> Result<(), QuerySocketError> {
+    handle_as(
+        stream,
+        stores,
+        config,
+        tuning,
+        streaming_count,
+        per_user,
+        held,
+        stopping,
+        event_commits,
+        log_commits,
+        |socket, descriptors| {
+            let authorizer = security::Authorizer::from_peer(socket, descriptors)?;
+            let user = authorizer.user()?;
+            Ok((authorizer, user))
+        },
+    )
+}
+
+/// Serve one connection as the caller `identify` establishes from its
+/// socket: the peer token's authorizer and user, or the failure to read it.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "connection ownership and its protocol state remain linear and auditable"
+)]
+fn handle_as(
+    mut stream: UnixStream,
+    stores: &Stores,
+    config: &ServerConfig,
+    tuning: &QueryTuning,
+    streaming_count: &Arc<AtomicUsize>,
+    per_user: &PerUser,
+    held: &Arc<AtomicUsize>,
+    stopping: &AtomicBool,
+    event_commits: &CommitSignal,
+    log_commits: &CommitSignal,
+    identify: impl FnOnce(
+        std::os::fd::BorrowedFd<'_>,
+        Arc<security::DescriptorCache>,
+    ) -> Result<(security::Authorizer, Sid), security::SecurityError>,
+) -> Result<(), QuerySocketError> {
     stream
         .set_read_timeout(Some(tuning.timeout))
         .map_err(QuerySocketError::Io)?;
     stream
         .set_write_timeout(Some(tuning.timeout))
         .map_err(QuerySocketError::Io)?;
-    let authorizer =
-        security::Authorizer::from_peer(stream.as_fd(), Arc::clone(&config.descriptors))
-            .map_err(QuerySocketError::Security)?;
     // One caller cannot take every query the machine allows. The slot is
     // taken before the request is read, so a caller holding idle
     // connections holds slots.
-    let user = authorizer.user().map_err(QuerySocketError::Security)?;
+    let (authorizer, user) = identify(stream.as_fd(), Arc::clone(&config.descriptors))
+        .map_err(QuerySocketError::Security)?;
     if user.to_string() == ANONYMOUS_SID {
         send_error(&mut stream, "anonymous callers are not served")?;
         return Ok(());

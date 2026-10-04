@@ -8,7 +8,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
 use peios::file::SecInfo;
-use peios::security::sddl;
+use peios::security::{SecurityDescriptor, sddl};
 use peios::token::Token;
 
 /// The service manager is SYSTEM without the Service-logon group. Every
@@ -53,6 +53,29 @@ impl IngestionSocket {
         datagram_ceiling: usize,
         protection: Protection,
     ) -> Result<Self, SocketError> {
+        Self::bind_with(path, datagram_ceiling, protection, establish_protection)
+    }
+
+    /// A socket for host tests, where no descriptor can be set: bound as
+    /// `bind` binds, with the protection step left out.
+    #[cfg(test)]
+    pub fn unprotected(path: &Path, datagram_ceiling: usize) -> Result<Self, SocketError> {
+        Self::bind_with(
+            path,
+            datagram_ceiling,
+            Protection::PeinitLogBroker,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Bind, establishing the socket's descriptor through `establish` before
+    /// the socket is returned to anything that could receive on it.
+    fn bind_with(
+        path: &Path,
+        datagram_ceiling: usize,
+        protection: Protection,
+        establish: impl FnOnce(&Path, Protection) -> Result<(), SocketError>,
+    ) -> Result<Self, SocketError> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
                 std::fs::remove_file(path).map_err(SocketError::Io)?;
@@ -66,7 +89,7 @@ impl IngestionSocket {
         socket.set_nonblocking(true).map_err(SocketError::Io)?;
         set_receive_buffer(&socket, datagram_ceiling)?;
 
-        establish_protection(path, protection)?;
+        establish(path, protection)?;
         Ok(Self {
             socket,
             path: path.to_owned(),
@@ -159,17 +182,33 @@ impl IngestionSocket {
 }
 
 fn establish_protection(path: &Path, protection: Protection) -> Result<(), SocketError> {
-    let descriptor = sddl::parse(protection.sddl()).map_err(SocketError::Security)?;
-    peios::file::set_sd(
-        None,
+    establish_protection_with(
         path,
-        SecInfo::DACL,
-        &descriptor,
-        libc::AT_SYMLINK_NOFOLLOW,
+        protection,
+        |path, descriptor| {
+            peios::file::set_sd(
+                None,
+                path,
+                SecInfo::DACL,
+                descriptor,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        |path| peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW),
     )
-    .map_err(SocketError::Security)?;
-    let actual = peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW)
-        .map_err(SocketError::Security)?;
+}
+
+/// Set the protection's descriptor through `set`, read it back through
+/// `get`, and refuse the socket unless the two agree.
+fn establish_protection_with(
+    path: &Path,
+    protection: Protection,
+    set: impl FnOnce(&Path, &SecurityDescriptor) -> peios::Result<()>,
+    get: impl FnOnce(&Path) -> peios::Result<SecurityDescriptor>,
+) -> Result<(), SocketError> {
+    let descriptor = sddl::parse(protection.sddl()).map_err(SocketError::Security)?;
+    set(path, &descriptor).map_err(SocketError::Security)?;
+    let actual = get(path).map_err(SocketError::Security)?;
     let actual = sddl::format(actual.as_bytes()).map_err(SocketError::Security)?;
     let expected = sddl::format(descriptor.as_bytes()).map_err(SocketError::Security)?;
     if actual != expected {
@@ -281,6 +320,70 @@ mod tests {
             sddl::format(descriptor.as_bytes()).expect("format descriptor"),
             LOG_BROKER_SDDL
         );
+    }
+
+    fn socket_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eventd-datagram-test-{}-{}-{name}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    /// Establish protection against a stand-in filesystem whose read-back
+    /// returns `stored`, whatever was set.
+    fn establish_reading_back(
+        stored: &str,
+    ) -> impl FnOnce(&Path, Protection) -> Result<(), SocketError> {
+        move |path, protection| {
+            establish_protection_with(path, protection, |_, _| Ok(()), |_| sddl::parse(stored))
+        }
+    }
+
+    #[test]
+    fn a_socket_whose_descriptor_reads_back_differently_is_refused_before_it_can_receive() {
+        for protection in [Protection::PeinitLogBroker, Protection::MetricPublishers] {
+            let path = socket_path("refused");
+            // The read-back is a descriptor that admits everyone.
+            let result = IngestionSocket::bind_with(
+                &path,
+                4_096,
+                protection,
+                establish_reading_back("D:(A;;GA;;;WD)"),
+            );
+            assert!(
+                matches!(&result, Err(SocketError::Protection(refused)) if refused == &path),
+                "{protection:?}: {:?}",
+                result.as_ref().err()
+            );
+            // No socket was handed out, and nothing is receiving at the path.
+            let client = UnixDatagram::unbound().unwrap();
+            assert!(client.send_to(b"probe", &path).is_err());
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_socket_whose_descriptor_reads_back_as_set_is_bound() {
+        for protection in [Protection::PeinitLogBroker, Protection::MetricPublishers] {
+            let path = socket_path("bound");
+            let socket = IngestionSocket::bind_with(
+                &path,
+                4_096,
+                protection,
+                establish_reading_back(protection.sddl()),
+            )
+            .unwrap();
+            let client = UnixDatagram::unbound().unwrap();
+            client.send_to(b"probe", &path).unwrap();
+            let mut buffer = [0_u8; 16];
+            assert_eq!(socket.receive(&mut buffer).unwrap(), Receive::Datagram(5));
+        }
     }
 
     #[test]

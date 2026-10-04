@@ -391,17 +391,22 @@ impl Shard {
     where
         F: FnMut() -> bool + Send + 'static,
     {
+        let material = self.material_indexes()?;
+        self.converge_from_material(desired, &material, cancel)
+    }
+
+    /// Take one convergence step from a material-index set read earlier.
+    fn converge_from_material<F>(
+        &self,
+        desired: &[DesiredIndex],
+        material: &[String],
+        cancel: F,
+    ) -> Result<IndexAction, ShardError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
         let wanted: Vec<_> = desired.iter().filter_map(adaptive_index).collect();
         let wanted_names: Vec<_> = wanted.iter().map(|(name, _)| name.clone()).collect();
-        let mut statement = self.connection.prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'index' \
-             AND name LIKE 'idx_events_%' AND name <> 'idx_events_timestamp' ORDER BY name",
-        )?;
-        let material = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
         if let Some(name) = material
             .iter()
             .rev()
@@ -844,6 +849,8 @@ impl From<rusqlite::Error> for ShardError {
 mod tests {
     use super::*;
     use crate::{Gap, RealEvent};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn event(sequence: u64, event_type: &str) -> IngestItem {
         IngestItem {
@@ -1080,6 +1087,234 @@ mod tests {
         }));
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_new_shard_is_created_with_synchronous_full() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        assert!(!path.exists());
+        let shard = Shard::open(&path, 1_000).unwrap();
+        assert_eq!(synchronous(&shard), FULL);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_active_shard_is_opened_with_synchronous_full() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        shard.commit(&[event(1, "example.test")]).unwrap();
+        drop(shard);
+        assert!(path.exists());
+        let shard = Shard::open(&path, 1_000).unwrap();
+        assert_eq!(synchronous(&shard), FULL);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_real_event_without_identity_stores_the_null_guid_not_null() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let mut anonymous = event(1, "example.anonymous");
+        anonymous.event.effective_token_guid = [0; 16];
+        shard.commit(&[anonymous]).unwrap();
+        let (kind, value): (String, Vec<u8>) = shard
+            .connection
+            .query_row(
+                "SELECT typeof(effective_token_guid), effective_token_guid FROM events \
+                 WHERE event_type = 'example.anonymous'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "blob");
+        assert_eq!(value, [0; 16]);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_index_build_leaves_no_index_and_the_writer_takes_the_next_batch() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = populated(&path, 2_000);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&checks);
+        let action = shard
+            .converge_indexes(&event_type_index(), move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            })
+            .unwrap();
+        assert_eq!(action, IndexAction::Cancelled);
+        assert_eq!(
+            checks.load(Ordering::Relaxed),
+            1,
+            "cancelled at the first check"
+        );
+        assert!(!index_exists(&shard, "idx_events_event_type"));
+        assert!(
+            shard.connection.is_autocommit(),
+            "the build was rolled back"
+        );
+        let integrity: String = shard
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let stats = shard.commit(&[event(2_001, "example.after")]).unwrap();
+        assert_eq!(stats.event_rows, 1);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_index_build_is_created_when_retried() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = populated(&path, 2_000);
+        assert_eq!(
+            shard
+                .converge_indexes(&event_type_index(), || true)
+                .unwrap(),
+            IndexAction::Cancelled
+        );
+        assert_eq!(
+            shard
+                .converge_indexes(&event_type_index(), || false)
+                .unwrap(),
+            IndexAction::Created("idx_events_event_type".into())
+        );
+        assert!(index_exists(&shard, "idx_events_event_type"));
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_index_build_checks_for_cancellation_every_thousand_opcodes() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = populated(&path, 10_000);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&checks);
+        let (name, expression) = adaptive_index(&event_type_index()[0]).unwrap();
+        assert_eq!(
+            shard
+                .converge_indexes(&event_type_index(), move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                })
+                .unwrap(),
+            IndexAction::Created(name.clone())
+        );
+        let checks = checks.load(Ordering::Relaxed);
+
+        // Build the same index over the same rows again, unobserved, and
+        // read how many VM opcodes that statement executes.
+        shard
+            .connection
+            .execute_batch(&format!("DROP INDEX {name}"))
+            .unwrap();
+        let mut statement = shard
+            .connection
+            .prepare(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON events({expression})"
+            ))
+            .unwrap();
+        statement.raw_execute().unwrap();
+        let opcodes =
+            usize::try_from(statement.get_status(rusqlite::StatementStatus::VmStep)).unwrap();
+        drop(statement);
+        assert!(
+            opcodes > 10_000,
+            "a build long enough to measure: {opcodes}"
+        );
+        assert!(
+            (opcodes / 1_000..=opcodes / 1_000 + 1).contains(&checks),
+            "{checks} cancellation checks for {opcodes} opcodes"
+        );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn index_convergence_tolerates_an_index_created_or_dropped_since_its_material_read() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = populated(&path, 100);
+        let (name, expression) = adaptive_index(&event_type_index()[0]).unwrap();
+        let other = Connection::open(&path).unwrap();
+
+        // The writer reads its material set, then another connection creates
+        // the index under the same name before the writer's create runs.
+        let material = shard.material_indexes().unwrap();
+        assert!(material.is_empty());
+        other
+            .execute_batch(&format!("CREATE INDEX {name} ON events({expression})"))
+            .unwrap();
+        assert_eq!(
+            shard
+                .converge_from_material(&event_type_index(), &material, || false)
+                .unwrap(),
+            IndexAction::Created(name.clone())
+        );
+        assert!(index_exists(&shard, &name));
+
+        // Likewise the index disappears between the read and the drop.
+        let material = shard.material_indexes().unwrap();
+        assert_eq!(material, core::slice::from_ref(&name));
+        other.execute_batch(&format!("DROP INDEX {name}")).unwrap();
+        assert_eq!(
+            shard
+                .converge_from_material(&[], &material, || false)
+                .unwrap(),
+            IndexAction::Dropped(name.clone())
+        );
+        assert!(!index_exists(&shard, &name));
+        drop(other);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    const FULL: i64 = 2;
+
+    fn event_type_index() -> [DesiredIndex; 1] {
+        [DesiredIndex {
+            field_path: "event_type".into(),
+            priority: 0,
+            is_expression: false,
+        }]
+    }
+
+    fn synchronous(shard: &Shard) -> i64 {
+        shard
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn populated(path: &Path, rows: u64) -> Shard {
+        let mut shard = Shard::open(path, 1_000).unwrap();
+        let batch: Vec<_> = (1..=rows)
+            .map(|sequence| event(sequence, &format!("example.kind{}", sequence % 7)))
+            .collect();
+        shard.commit(&batch).unwrap();
+        shard
+    }
+
+    fn index_exists(shard: &Shard, name: &str) -> bool {
+        shard
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn temporary_directory() -> PathBuf {

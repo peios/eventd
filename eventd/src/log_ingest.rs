@@ -481,9 +481,244 @@ impl From<LogStoreError> for LogIngestError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc::{Sender, channel, sync_channel};
+    use std::time::Duration;
+
     use peios::msgpack::Writer;
 
     use super::*;
+
+    /// One log thread over a host socket and a temporary store, with the
+    /// handles the pipeline would hold.
+    struct LogThread {
+        directory: PathBuf,
+        socket_path: PathBuf,
+        runtime: SharedConfig,
+        stopping: Arc<AtomicBool>,
+        commits: Arc<CommitSignal>,
+        retention_requested: Arc<AtomicBool>,
+        error_events: BoundedQueue<WriterMessage>,
+    }
+
+    impl LogThread {
+        fn new(max_batch_size: usize) -> Self {
+            let mut directory = std::env::temp_dir();
+            directory.push(format!(
+                "eventd-log-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let mut config = Config::test_defaults();
+            config.log_max_batch_size = max_batch_size;
+            config.log_max_batch_latency = Duration::from_mins(1);
+            Self {
+                socket_path: directory.join("log.sock"),
+                directory,
+                runtime: config.shared(),
+                stopping: Arc::new(AtomicBool::new(false)),
+                commits: Arc::new(CommitSignal::new()),
+                retention_requested: Arc::new(AtomicBool::new(false)),
+                error_events: BoundedQueue::new(16, 1 << 20).unwrap(),
+            }
+        }
+
+        fn store_path(&self) -> PathBuf {
+            self.directory.join("logs.db")
+        }
+
+        fn bind(&self) -> IngestionSocket {
+            IngestionSocket::unprotected(&self.socket_path, PORTABLE_CEILING).unwrap()
+        }
+
+        fn open_store(&self) -> LogStore {
+            LogStore::open(self.store_path(), 1_000).unwrap()
+        }
+
+        fn run(
+            &self,
+            socket: &IngestionSocket,
+            store: LogStore,
+            maintenance: &Receiver<LogMaintenance>,
+        ) -> Result<(), LogIngestError> {
+            run(
+                socket,
+                store,
+                [1; 16],
+                &self.error_events,
+                &self.runtime,
+                &self.stopping,
+                &self.commits,
+                maintenance,
+                &self.retention_requested,
+            )
+        }
+
+        fn send(&self, records: usize, message: &str) {
+            let mut writer = Writer::new();
+            writer.write_array(u32::try_from(records).unwrap());
+            for _ in 0..records {
+                writer
+                    .write_map(3)
+                    .write_str("origin")
+                    .write_str("svc.test")
+                    .write_str("is_error")
+                    .write_bool(false)
+                    .write_str("message")
+                    .write_str(message);
+            }
+            std::os::unix::net::UnixDatagram::unbound()
+                .unwrap()
+                .send_to(&writer.to_bytes().unwrap(), &self.socket_path)
+                .unwrap();
+        }
+
+        fn stored(&self) -> i64 {
+            rusqlite::Connection::open_with_flags(
+                self.store_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .unwrap()
+            .query_row("SELECT count(*) FROM logs", [], |row| row.get(0))
+            .unwrap()
+        }
+
+        fn wait_for_stored(&self, rows: i64) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.stored() != rows {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} of {rows} rows stored",
+                    self.stored()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_generation(&self, generation: u64) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.commits.generation() != generation {
+                assert!(Instant::now() < deadline, "commit generation {generation}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for LogThread {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Stops the log thread when dropped, so a failing test still ends it
+    /// and its scope can join it.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    const PORTABLE_CEILING: usize = crate::config::PORTABLE_INGEST_DATAGRAM_BYTES as usize;
+
+    /// Round-trip a maintenance command. The log thread takes one after
+    /// each receive, so its answer means every commit that receive led to
+    /// has been signalled.
+    fn settle(maintenance: &Sender<LogMaintenance>) {
+        let (response, answer) = sync_channel(1);
+        maintenance
+            .send(LogMaintenance::Checkpoint(response))
+            .unwrap();
+        answer.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn without_kacs_log_ingestion_commits_and_a_failed_metric_check_stops_nothing() {
+        // A host has no KACS: no token, no access check, no descriptor.
+        let log = LogThread::new(5_000);
+        let socket = log.bind();
+        let store = log.open_store();
+        let (_maintenance, commands) = channel();
+        std::thread::scope(|scope| {
+            let (log, socket) = (&log, &socket);
+            let thread = scope.spawn(move || log.run(socket, store, &commands));
+            let _stopping = StopOnDrop(&log.stopping);
+            log.send(3, "without KACS");
+            log.send(2, "still without KACS");
+            log.wait_for_stored(5);
+            log.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+        });
+        assert!(log.commits.generation() >= 1);
+
+        // The metric thread's publication check is a KACS call; failing, it
+        // costs the datagram and a count, never the thread.
+        let mut last_error = None;
+        assert!(!crate::metric_ingest::admit_authorized(
+            Err(crate::write_security::MetricPublishError::Token(
+                peios::Error::from_raw_os_error(libc::ENOSYS)
+            )),
+            &mut last_error,
+        ));
+        assert!(crate::metric_ingest::admit_authorized(
+            Ok(0),
+            &mut last_error
+        ));
+    }
+
+    #[test]
+    #[ignore = "PEI-1315: log_ingest::run rereads LogMaxBatchSize for every datagram, so a change \
+                rebounds the transaction already open"]
+    fn a_log_batch_size_change_applies_only_to_later_transactions() {
+        let log = LogThread::new(100);
+        let socket = log.bind();
+        let (maintenance, commands) = channel();
+        // 130 records: the first transaction commits at 100, and the next
+        // opens with 30 under the same setting.
+        log.send(130, "first");
+        log.send(60, "second");
+        // The writer answers this after taking the first datagram, and
+        // cannot go on until the test has taken the answer.
+        let (pause, paused) = sync_channel(0);
+        maintenance.send(LogMaintenance::Checkpoint(pause)).unwrap();
+        let store = log.open_store();
+        std::thread::scope(|scope| {
+            let (log, socket) = (&log, &socket);
+            let thread = scope.spawn(move || log.run(socket, store, &commands));
+            let _stopping = StopOnDrop(&log.stopping);
+            let paused = paused;
+            log.wait_for_stored(100);
+            log.wait_for_generation(1);
+            // The second transaction is open with 30 records.
+            log.runtime.write().unwrap().log_max_batch_size = 50;
+            paused.recv().unwrap().unwrap();
+            // Its 30 and the next datagram's 60 make 90: under the 100 it
+            // opened with, so it commits whole when the queue empties.
+            log.wait_for_stored(190);
+            settle(&maintenance);
+            assert_eq!(
+                log.commits.generation(),
+                2,
+                "the open transaction kept the threshold it began with"
+            );
+            // A transaction begun after the change is bounded by it.
+            log.send(60, "third");
+            log.wait_for_stored(250);
+            settle(&maintenance);
+            assert_eq!(
+                log.commits.generation(),
+                4,
+                "60 records under 50: 50, then 10"
+            );
+            log.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+        });
+    }
 
     #[test]
     fn parses_one_valid_record() {

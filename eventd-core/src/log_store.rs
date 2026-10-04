@@ -370,6 +370,78 @@ mod tests {
     }
 
     #[test]
+    fn the_origin_insert_runs_once_per_new_origin_per_batch() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        let mut store = LogStore::open(path, 1_000).unwrap();
+        // A BEFORE trigger fires for every row an INSERT OR IGNORE attempts,
+        // including the ones the conflict then discards, so it counts
+        // executions of the catalogue insert rather than rows it added.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TABLE origin_inserts (origin TEXT NOT NULL);\
+                 CREATE TEMP TRIGGER count_origin_inserts BEFORE INSERT ON main.log_origins \
+                 BEGIN INSERT INTO origin_inserts(origin) VALUES (NEW.origin); END;",
+            )
+            .unwrap();
+        let record = |origin: &str, timestamp| LogRecord {
+            boot_id: [1; 16],
+            timestamp,
+            origin: origin.into(),
+            is_error: false,
+            message: "hello".into(),
+            job_id: None,
+        };
+        let batch: Vec<_> = (0..5)
+            .map(|timestamp| record("test.first", timestamp))
+            .chain((5..8).map(|timestamp| record("test.second", timestamp)))
+            .collect();
+        store.commit(&batch).unwrap();
+        let attempts: Vec<(String, u32)> = {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT origin, count(*) FROM origin_inserts GROUP BY origin ORDER BY origin",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            attempts,
+            [("test.first".to_owned(), 1), ("test.second".to_owned(), 1)]
+        );
+        let logs: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logs, 8);
+        // The counter does see an attempt the conflict discards.
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO log_origins(origin) VALUES ('test.first')",
+                [],
+            )
+            .unwrap();
+        let first_attempts: u32 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM origin_inserts WHERE origin = 'test.first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_attempts, 2);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn classifies_sqlite_full_as_capacity_failure() {
         let error = LogStoreError::Sql(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
