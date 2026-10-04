@@ -90,6 +90,13 @@ const QUERY_SOCKET_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FW;;
 /// count: SYSTEM is the machine, not one caller among others.
 const SYSTEM_SID: &str = "S-1-5-18";
 
+/// The user SID of the Anonymous token, which KACS conveys for a client
+/// that connects at the Anonymous impersonation level. eventd has no
+/// anonymous mode (TRM §7.1): a query is answered for a caller it can
+/// identify, so a descriptor granting Everyone never serves a caller that
+/// declined to say who it is.
+const ANONYMOUS_SID: &str = "S-1-5-7";
+
 /// Queries running, by the caller's user SID.
 type PerUser = Arc<Mutex<HashMap<Sid, usize>>>;
 
@@ -273,6 +280,10 @@ fn handle(
     // taken before the request is read, so a caller holding idle
     // connections holds slots.
     let user = authorizer.user().map_err(QuerySocketError::Security)?;
+    if user.to_string() == ANONYMOUS_SID {
+        send_error(&mut stream, "anonymous callers are not served")?;
+        return Ok(());
+    }
     let Some(_user_slot) = UserSlot::take(per_user, user, tuning.max_per_user) else {
         health::query_refused(Refusal::User);
         send_error(&mut stream, "too many concurrent queries from this user")?;
