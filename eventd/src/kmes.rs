@@ -117,6 +117,14 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             let observation = candidate
                 .observe(event.sequence, event.timestamp, observed_at)
                 .map_err(KmesError::Sequence)?;
+            // An event typed in eventd's own namespace would be
+            // indistinguishable from a record eventd writes, so it is not
+            // stored. It is still handed to the writer, so its sequence is
+            // receipted and no restart reports it lost.
+            let reserved = crate::synthetic::is_reserved(&event.event_type);
+            if reserved && observation.store_event {
+                crate::diagnostics::reserved_event_type();
+            }
             let needs_handoff = observation.store_event || !observation.gaps.is_empty();
             if !needs_handoff {
                 if ring.tail_pos() > read_position {
@@ -163,7 +171,7 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             let sequence = owned.sequence;
             permit.publish(WriterMessage::Event(eventd_core::IngestItem {
                 gaps: observation.gaps,
-                store_event: observation.store_event,
+                store_event: observation.store_event && !reserved,
                 event: owned,
             }));
             context.router.advance();

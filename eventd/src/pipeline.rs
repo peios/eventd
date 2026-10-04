@@ -713,6 +713,10 @@ fn diagnostic_dump(
     eprintln!("  queries: active={active_queries} streaming={streaming_queries}");
     eprintln!("  metric_series_cache: {metric_series}");
     eprintln!(
+        "  event_ingress: reserved_types={}",
+        crate::diagnostics::reserved_event_types()
+    );
+    eprintln!(
         "  log_ingress: rejected_origins={}",
         log_ingress.rejected_origins
     );

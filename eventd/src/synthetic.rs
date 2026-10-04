@@ -4,6 +4,16 @@ use eventd_core::{Guid, SyntheticEvent};
 
 use crate::config::AppliedChange;
 
+/// The event-type namespace eventd writes its own records under (TRM §2.6).
+/// No KMES event in it is stored, so `event_type` alone tells a record
+/// eventd wrote from one any emitter sent (TRM §3.1).
+pub const RESERVED_PREFIX: &str = "synthetic.";
+
+/// Whether a KMES event's type falls in the reserved namespace.
+pub fn is_reserved(event_type: &str) -> bool {
+    event_type.starts_with(RESERVED_PREFIX)
+}
+
 pub fn startup(
     boot_id: Guid,
     canonical_boot_id: &str,
