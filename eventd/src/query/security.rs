@@ -427,6 +427,16 @@ impl DescriptorCache {
         namespace: Namespace,
         identifier: &str,
     ) -> Result<Option<(String, Arc<SecurityDescriptor>)>, SecurityError> {
+        self.resolve_with(namespace, identifier, resolve_descriptor)
+    }
+
+    /// `resolve`, reading the registry through `load`.
+    fn resolve_with(
+        &self,
+        namespace: Namespace,
+        identifier: &str,
+        load: impl Fn(Namespace, &str) -> Result<Option<(String, SecurityDescriptor)>, SecurityError>,
+    ) -> Result<Option<(String, Arc<SecurityDescriptor>)>, SecurityError> {
         let key = (namespace, identifier.to_owned());
         loop {
             let (generation, healthy) = {
@@ -444,12 +454,11 @@ impl DescriptorCache {
             if !healthy {
                 return Ok(None);
             }
-            let loaded = resolve_descriptor(namespace, identifier)?.map(|(pattern, descriptor)| {
-                ResolvedDescriptor {
+            let loaded =
+                load(namespace, identifier)?.map(|(pattern, descriptor)| ResolvedDescriptor {
                     pattern,
                     descriptor: Arc::new(descriptor),
-                }
-            });
+                });
             let mut state = self
                 .state
                 .write()
@@ -464,6 +473,14 @@ impl DescriptorCache {
     }
 
     fn admin(&self) -> Result<Option<Arc<SecurityDescriptor>>, SecurityError> {
+        self.admin_with(load_admin_descriptor)
+    }
+
+    /// `admin`, reading the registry through `load`.
+    fn admin_with(
+        &self,
+        load: impl Fn() -> Result<Option<SecurityDescriptor>, SecurityError>,
+    ) -> Result<Option<Arc<SecurityDescriptor>>, SecurityError> {
         loop {
             let (generation, healthy) = {
                 let state = self
@@ -480,7 +497,7 @@ impl DescriptorCache {
             if !healthy {
                 return Ok(None);
             }
-            let loaded = load_admin_descriptor()?.map(Arc::new);
+            let loaded = load()?.map(Arc::new);
             let mut state = self
                 .state
                 .write()
@@ -672,8 +689,168 @@ impl std::error::Error for SecurityError {
 }
 
 #[cfg(test)]
+impl Authorizer {
+    /// A caller holding `token`. No socket on a test host conveys a KACS
+    /// peer token, so tests that need an authorizer open the token
+    /// themselves.
+    pub(super) const fn for_token(token: Token, descriptors: Arc<DescriptorCache>) -> Self {
+        Self { token, descriptors }
+    }
+}
+
+#[cfg(test)]
+impl DescriptorCache {
+    /// Hold `descriptor` as `identifier`'s, found under `pattern`, as a
+    /// resolution from the registry would.
+    pub(super) fn resolve_as(
+        &self,
+        namespace: Namespace,
+        identifier: &str,
+        pattern: &str,
+        descriptor: &SecurityDescriptor,
+    ) {
+        let resolved = self
+            .resolve_with(namespace, identifier, |_, _| {
+                Ok(Some((pattern.to_owned(), descriptor.clone())))
+            })
+            .expect("a resolution that reads nothing cannot fail");
+        assert!(resolved.is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+    use core::sync::atomic::AtomicUsize;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::mpsc::{Receiver, sync_channel};
+
+    use peios::msgpack::Writer;
+
+    use crate::commit_signal::CommitSignal;
+    use crate::config::Config;
+    use crate::indexing::{PolicyMessage, Tracker};
+    use crate::metric_ingest::RollupMaintenance;
+    use crate::query::{
+        PerUser, QuerySocketError, QueryTuning, ServerConfig, Stores, handle, handle_as,
+    };
+    use peios::security::Sid;
+
+    const READABLE: &str = "O:SYG:SYD:P(A;;0x00000001;;;AU)";
+
+    /// A registry that answers every identifier with `READABLE`, counting
+    /// the reads it is asked for.
+    fn registry(
+        reads: &Cell<usize>,
+    ) -> impl Fn(Namespace, &str) -> Result<Option<(String, SecurityDescriptor)>, SecurityError> + '_
+    {
+        move |_, identifier| {
+            reads.set(reads.get() + 1);
+            Ok(Some((
+                identifier.to_owned(),
+                peios::security::sddl::parse(READABLE).unwrap(),
+            )))
+        }
+    }
+
+    fn admin_registry(
+        reads: &Cell<usize>,
+    ) -> impl Fn() -> Result<Option<SecurityDescriptor>, SecurityError> + '_ {
+        move || {
+            reads.set(reads.get() + 1);
+            Ok(Some(peios::security::sddl::parse(READABLE).unwrap()))
+        }
+    }
+
+    /// What one query connection came to when eventd could not read its
+    /// peer's token: `handle`'s outcome, the bytes of the request it left
+    /// unread, and every byte the client was sent.
+    struct Unanswered {
+        outcome: Result<(), QuerySocketError>,
+        left_unread: Vec<u8>,
+        answered: Vec<u8>,
+        per_user: PerUser,
+        streaming: Arc<AtomicUsize>,
+        held: Arc<AtomicUsize>,
+        policy: Receiver<PolicyMessage>,
+        rollups: Receiver<RollupMaintenance>,
+    }
+
+    /// Serve `request` on one end of a socket pair. A socket pair carries no
+    /// captured identity, so reading its peer token fails (on Peios with
+    /// `ENODATA`; a host without KACS has no such socket option at all).
+    fn serve_without_a_peer_token(request: &[u8]) -> Unanswered {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(request).unwrap();
+        // A second handle on eventd's end, to see afterwards what it left.
+        let mut observer = server.try_clone().unwrap();
+        let config = Config::test_defaults();
+        let tuning = QueryTuning::from(&config);
+        let runtime = config.shared();
+        let (index_policy, policy) = sync_channel(1);
+        let (rollup_sender, rollups) = sync_channel(1);
+        let server_config = ServerConfig {
+            runtime: Arc::clone(&runtime),
+            index_tracker: Arc::new(Tracker::from_persisted(Vec::new(), runtime)),
+            index_policy,
+            rollups: rollup_sender,
+            descriptors: Arc::new(DescriptorCache::new()),
+        };
+        let stores = Stores {
+            event_paths: Vec::new(),
+            log_path: PathBuf::from("/nonexistent/logs.db"),
+            metric_path: PathBuf::from("/nonexistent/metrics.db"),
+        };
+        let streaming = Arc::new(AtomicUsize::new(0));
+        let per_user = PerUser::default();
+        let held = Arc::new(AtomicUsize::new(0));
+        let outcome = handle(
+            server,
+            &stores,
+            &server_config,
+            &tuning,
+            &streaming,
+            &per_user,
+            &held,
+            &AtomicBool::new(false),
+            &CommitSignal::new(),
+            &CommitSignal::new(),
+        );
+        observer.set_nonblocking(true).unwrap();
+        let mut left_unread = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match observer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => left_unread.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("reading eventd's end: {error}"),
+            }
+        }
+        drop(observer);
+        // eventd's end is closed now, so this reads everything it sent.
+        let mut answered = Vec::new();
+        client.read_to_end(&mut answered).unwrap();
+        Unanswered {
+            outcome,
+            left_unread,
+            answered,
+            per_user,
+            streaming,
+            held,
+            policy,
+            rollups,
+        }
+    }
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut frame = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+        frame.extend_from_slice(payload);
+        frame
+    }
 
     #[test]
     fn uuid_v5_matches_rfc_example() {
@@ -723,6 +900,213 @@ mod tests {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .healthy
+        );
+    }
+
+    // TRM §7.5: a failed watch discards the cache and fails closed for new
+    // resolutions until the watch is re-established.
+    #[test]
+    fn a_failed_watch_discards_the_cache_and_fails_closed_without_reading_the_registry() {
+        let cache = DescriptorCache::new();
+        let reads = Cell::new(0);
+        assert!(
+            cache
+                .resolve_with(Namespace::Events, "kacs.denied", registry(&reads))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reads.get(), 1, "a healthy cache reads a new identifier");
+
+        cache.fail_watch();
+        for identifier in ["service.started", "kacs.denied"] {
+            assert!(
+                cache
+                    .resolve_with(Namespace::Events, identifier, registry(&reads))
+                    .unwrap()
+                    .is_none(),
+                "{identifier} resolves to nothing"
+            );
+        }
+        assert!(cache.admin_with(admin_registry(&reads)).unwrap().is_none());
+        assert_eq!(
+            reads.get(),
+            1,
+            "and the registry was not read for any of it"
+        );
+
+        // Re-establishing the watch ends the fail-closed state.
+        cache.invalidate();
+        assert!(
+            cache
+                .resolve_with(Namespace::Events, "service.started", registry(&reads))
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.admin_with(admin_registry(&reads)).unwrap().is_some());
+        assert_eq!(reads.get(), 3);
+    }
+
+    // TRM §7.1, §9.3: if reading the peer token fails, the query is denied
+    // entirely; there is no fallback identity.
+    #[test]
+    fn a_failed_peer_token_read_ends_the_connection_without_evaluating_its_query() {
+        let mut request = Writer::new();
+        request.write_map(1).write_str("query").write_str("EVENTS");
+        let request = framed(&request.to_bytes().unwrap());
+        let served = serve_without_a_peer_token(&request);
+
+        assert!(
+            matches!(served.outcome, Err(QuerySocketError::Security(_))),
+            "the connection is refused for its identity: {:?}",
+            served.outcome
+        );
+        assert!(
+            served.answered.is_empty(),
+            "the client is sent nothing, neither records nor a status: {:?}",
+            served.answered
+        );
+        assert_eq!(
+            served.left_unread, request,
+            "the query never left the socket, so nothing evaluated it"
+        );
+        assert!(
+            served
+                .per_user
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(served.streaming.load(Ordering::Acquire), 0);
+        assert_eq!(served.held.load(Ordering::Acquire), 0);
+        assert!(served.policy.try_recv().is_err());
+        assert!(served.rollups.try_recv().is_err());
+    }
+
+    /// How a test establishes a connection's caller in place of reading its
+    /// peer token.
+    type Identify<'a> = &'a dyn Fn(
+        BorrowedFd<'_>,
+        Arc<DescriptorCache>,
+    ) -> Result<(Authorizer, Sid), SecurityError>;
+
+    // TRM §9.3: query service resumes when KACS does. A refused connection
+    // leaves nothing behind, so the next one whose peer token can be read is
+    // served as if nothing had failed.
+    #[test]
+    fn a_connection_after_a_failed_peer_token_read_is_served_once_the_read_succeeds() {
+        let config = Config::test_defaults();
+        let tuning = QueryTuning::from(&config);
+        let runtime = config.shared();
+        let (index_policy, _policy) = sync_channel(1);
+        let (rollup_sender, _rollups) = sync_channel(1);
+        let server_config = ServerConfig {
+            runtime: Arc::clone(&runtime),
+            index_tracker: Arc::new(Tracker::from_persisted(Vec::new(), runtime)),
+            index_policy,
+            rollups: rollup_sender,
+            descriptors: Arc::new(DescriptorCache::new()),
+        };
+        // An empty event store: answering EVENTS needs no access check.
+        let stores = Stores {
+            event_paths: Vec::new(),
+            log_path: PathBuf::from("/nonexistent/logs.db"),
+            metric_path: PathBuf::from("/nonexistent/metrics.db"),
+        };
+        let streaming = Arc::new(AtomicUsize::new(0));
+        let per_user = PerUser::default();
+        let held = Arc::new(AtomicUsize::new(0));
+        let (event_commits, log_commits) = (CommitSignal::new(), CommitSignal::new());
+        let mut request = Writer::new();
+        request.write_map(1).write_str("query").write_str("EVENTS");
+        let request = framed(&request.to_bytes().unwrap());
+        let serve = |identify: Identify<'_>| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.write_all(&request).unwrap();
+            let outcome = handle_as(
+                server,
+                &stores,
+                &server_config,
+                &tuning,
+                &streaming,
+                &per_user,
+                &held,
+                &AtomicBool::new(false),
+                &event_commits,
+                &log_commits,
+                identify,
+            );
+            let mut answered = Vec::new();
+            // Closing a socket whose request was never read resets it.
+            match client.read_to_end(&mut answered) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(error) => panic!("reading the answer: {error}"),
+            }
+            (outcome, answered)
+        };
+
+        // KACS is gone: the peer token cannot be read.
+        let (outcome, answered) = serve(&|_, _| {
+            Err(SecurityError::Peios(peios::Error::from_raw_os_error(
+                libc::ENOSYS,
+            )))
+        });
+        assert!(matches!(outcome, Err(QuerySocketError::Security(_))));
+        assert!(answered.is_empty());
+
+        // KACS is back: the next connection's token is read, and it is
+        // served.
+        let (outcome, answered) = serve(&|_, descriptors| {
+            let token = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+            Ok((
+                Authorizer::for_token(peios::token::Token::from(token), descriptors),
+                "S-1-5-21-1-2-3-1001".parse::<Sid>().unwrap(),
+            ))
+        });
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let status = |status: &str| {
+            let mut frame = Writer::new();
+            frame.write_map(1).write_str("status").write_str(status);
+            framed(&frame.to_bytes().unwrap())
+        };
+        assert!(
+            answered.ends_with(&status("end")),
+            "an ordinary, empty result: {answered:?}"
+        );
+        assert!(
+            !answered.windows(5).any(|window| window == b"error"),
+            "and no error: {answered:?}"
+        );
+        assert!(
+            per_user
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "neither connection still holds a slot"
+        );
+    }
+
+    // TRM §7.4 step 1: the token is obtained before anything else, and
+    // failing to obtain it denies the query.
+    #[test]
+    fn the_peer_token_is_read_before_the_request_and_a_failed_read_answers_nothing() {
+        // A request eventd would refuse with an error the moment it read
+        // it: its length prefix exceeds MaxQueryRequestBytes, and its body
+        // is not a map.
+        let mut request = u32::MAX.to_le_bytes().to_vec();
+        request.extend_from_slice(b"\xa3not a map");
+        let served = serve_without_a_peer_token(&request);
+
+        assert!(
+            matches!(served.outcome, Err(QuerySocketError::Security(_))),
+            "the token read failed first, before any protocol check: {:?}",
+            served.outcome
+        );
+        assert_eq!(served.left_unread, request, "the request was never read");
+        assert!(
+            served.answered.is_empty(),
+            "and no error about it was sent: {:?}",
+            served.answered
         );
     }
 }

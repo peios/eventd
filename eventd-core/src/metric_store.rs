@@ -461,6 +461,11 @@ impl MetricStore {
     }
 }
 
+/// The one `SELECT` a series-cache miss costs.
+const RESOLVE_SERIES: &str = "SELECT id, labels, type, boundaries FROM series \
+     WHERE name = ?1 AND label_hash = ?2 \
+     AND ((?3 IS NULL AND boundaries_hash IS NULL) OR boundaries_hash = ?3)";
+
 fn resolve_or_insert(
     transaction: &Transaction<'_>,
     record: &MetricRecord,
@@ -468,11 +473,7 @@ fn resolve_or_insert(
 ) -> Result<SeriesInfo, MetricStoreError> {
     let label_hash = hash_for_sql(record.labels.as_bytes());
     let boundary_hash = key.boundaries.as_deref().map(hash_for_sql);
-    let mut statement = transaction.prepare_cached(
-        "SELECT id, labels, type, boundaries FROM series \
-         WHERE name = ?1 AND label_hash = ?2 \
-         AND ((?3 IS NULL AND boundaries_hash IS NULL) OR boundaries_hash = ?3)",
-    )?;
+    let mut statement = transaction.prepare_cached(RESOLVE_SERIES)?;
     let mut rows = statement.query(params![record.name.as_ref(), label_hash, boundary_hash])?;
     while let Some(row) = rows.next()? {
         let labels: String = row.get(1)?;
@@ -868,6 +869,48 @@ mod tests {
             .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
             .unwrap();
         assert_eq!(series, 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_cache_miss_costs_one_select_and_evicts_the_lru_entry_when_full() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 2).unwrap();
+        let named = |name: &str| MetricRecord {
+            name: name.into(),
+            ..record(MetricType::Gauge, MetricValue::Number(1.0))
+        };
+        // How many times the resolution SELECT has run on this connection.
+        let selects = |store: &MetricStore| {
+            store
+                .connection
+                .prepare_cached(RESOLVE_SERIES)
+                .unwrap()
+                .get_status(rusqlite::StatementStatus::Run)
+        };
+
+        store.commit(&[named("a"), named("a"), named("a")]).unwrap();
+        assert_eq!(
+            selects(&store),
+            1,
+            "a miss costs one SELECT, however many samples"
+        );
+        store.commit(&[named("a")]).unwrap();
+        assert_eq!(selects(&store), 1, "a hit costs none");
+        store.commit(&[named("b")]).unwrap();
+        assert_eq!(selects(&store), 2);
+        // `a` is now the more recently used; the cache is full.
+        store.commit(&[named("a")]).unwrap();
+        assert_eq!(selects(&store), 2);
+        store.commit(&[named("c")]).unwrap();
+        assert_eq!(selects(&store), 3);
+        assert_eq!(store.cache_len(), 2, "the cache stays at its bound");
+        // `b` was least recently used, so it went; `a` stayed.
+        store.commit(&[named("a")]).unwrap();
+        assert_eq!(selects(&store), 3, "a, used more recently, was kept");
+        store.commit(&[named("b")]).unwrap();
+        assert_eq!(selects(&store), 4, "b, least recently used, was evicted");
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

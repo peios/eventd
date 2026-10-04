@@ -292,21 +292,31 @@ pub enum Readable {
 /// still count: this says what the policy allows, not what is there.
 #[must_use]
 pub fn readable(namespace: Namespace) -> Readable {
-    let patterns = match patterns(namespace) {
+    readable_from(patterns(namespace), |pattern| {
+        match descriptor(namespace, pattern) {
+            Ok(Some(descriptor)) => {
+                access(&descriptor, namespace, &[]).map(|access| access.records)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+/// [`readable`]'s verdict from the patterns the policy lists, or why they
+/// could not be listed, and whether the caller may read records under each.
+fn readable_from(
+    patterns: Result<Vec<String>, peios::Error>,
+    mut granted: impl FnMut(&str) -> Result<bool, peios::Error>,
+) -> Readable {
+    let patterns = match patterns {
         Ok(patterns) => patterns,
         Err(error) => return Readable::Unknown(format!("its policy can't be read ({error})")),
     };
     let mut hidden = Vec::new();
     let mut visible = 0;
     for pattern in patterns {
-        let granted = match descriptor(namespace, &pattern) {
-            Ok(Some(descriptor)) => {
-                access(&descriptor, namespace, &[]).map(|access| access.records)
-            }
-            Ok(None) => Ok(false),
-            Err(error) => Err(error),
-        };
-        match granted {
+        match granted(&pattern) {
             Ok(true) => visible += 1,
             Ok(false) => hidden.push(pattern),
             Err(error) => {
@@ -550,6 +560,101 @@ mod tests {
         assert_eq!(
             descriptor_path(Namespace::Events, "kacs"),
             r"Machine\System\eventd\Security\Events\kacs"
+        );
+    }
+
+    /// `readable` over `patterns`, the caller reading records under those
+    /// in `granting` and no others, and the patterns it asked about.
+    fn readable_over(patterns: &[&str], granting: &[&str]) -> (Readable, Vec<String>) {
+        let mut asked = Vec::new();
+        let verdict = readable_from(
+            Ok(patterns
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect()),
+            |pattern| {
+                asked.push(pattern.to_owned());
+                Ok(granting.contains(&pattern))
+            },
+        );
+        (verdict, asked)
+    }
+
+    #[test]
+    fn readable_weighs_every_pattern_not_only_the_wildcard() {
+        // Logs\x grants what Logs\* denies: some, not nothing.
+        let (verdict, asked) = readable_over(&["*", "x"], &["x"]);
+        assert_eq!(
+            verdict,
+            Readable::Some {
+                hidden: vec!["*".to_owned()]
+            }
+        );
+        assert_eq!(asked, ["*", "x"]);
+        // And the other way round: x denies what * grants.
+        let (verdict, asked) = readable_over(&["*", "x"], &["*"]);
+        assert_eq!(
+            verdict,
+            Readable::Some {
+                hidden: vec!["x".to_owned()]
+            }
+        );
+        assert_eq!(asked, ["*", "x"]);
+        assert_eq!(
+            readable_over(&["*", "x"], &["*", "x"]).0,
+            Readable::Everything
+        );
+        assert_eq!(readable_over(&["*", "x"], &[]).0, Readable::Nothing);
+    }
+
+    #[test]
+    fn a_policy_that_cannot_be_read_is_unknown_with_its_reason_never_nothing() {
+        // Denied ENUMERATE_SUB_KEYS on Security\Logs: the patterns can't
+        // be listed.
+        let verdict = readable_from(Err(peios::Error::from_raw_os_error(libc::EACCES)), |_| {
+            panic!("no pattern can be asked about when none could be listed")
+        });
+        let Readable::Unknown(reason) = verdict else {
+            panic!("expected Unknown, got {verdict:?}")
+        };
+        assert!(
+            reason.contains(&peios::Error::from_raw_os_error(libc::EACCES).to_string()),
+            "the reason says why: {reason}"
+        );
+        // A pattern whose descriptor can't be read or checked is the same.
+        let verdict = readable_from(Ok(vec!["*".to_owned(), "x".to_owned()]), |pattern| {
+            if pattern == "x" {
+                Err(peios::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                Ok(false)
+            }
+        });
+        assert!(
+            matches!(verdict, Readable::Unknown(ref reason) if reason.contains("for x ")),
+            "expected Unknown naming the pattern, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn eventd_clear_is_bit_1_value_0x0002() {
+        assert_eq!(EVENTD_CLEAR, 0x0002);
+        assert_eq!(EVENTD_CLEAR, 1 << 1);
+        assert_eq!(
+            RIGHTS
+                .iter()
+                .find(|right| right.mask == EVENTD_CLEAR)
+                .map(|right| right.name),
+            Some("Clear")
+        );
+    }
+
+    #[test]
+    fn generic_write_already_grants_eventd_clear() {
+        assert_eq!(GENERIC_WRITE & EVENTD_CLEAR, EVENTD_CLEAR);
+        assert_eq!(
+            generic_mapping(),
+            GenericMapping::new(GENERIC_READ, GENERIC_WRITE, GENERIC_EXECUTE, GENERIC_ALL),
+            "and GENERIC_WRITE is what the mapping eventd checks with maps it to"
         );
     }
 

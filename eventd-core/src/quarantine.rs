@@ -10,6 +10,11 @@ pub fn database(path: &Path) -> Result<PathBuf, std::io::Error> {
         .duration_since(UNIX_EPOCH)
         .map_err(std::io::Error::other)?
         .as_nanos();
+    database_at(path, timestamp)
+}
+
+/// Quarantine under the suffix for `timestamp`, nanoseconds since the epoch.
+fn database_at(path: &Path, timestamp: u128) -> Result<PathBuf, std::io::Error> {
     let sources = [
         path.to_owned(),
         sidecar(path, "-wal"),
@@ -102,6 +107,49 @@ mod tests {
             std::fs::read(append(&sidecar(&path, "-shm"), &suffix)).unwrap(),
             b"shm"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_taken_quarantine_name_gets_the_lowest_free_positive_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let timestamp = 1_700_000_000_123_456_789_u128;
+        let base = format!(".corrupt.{timestamp}");
+        std::fs::write(&path, b"db").unwrap();
+        std::fs::write(sidecar(&path, "-wal"), b"wal").unwrap();
+        // The bare name and .1 are taken; .3 is taken too, so the lowest
+        // free suffix is .2, not one past the highest.
+        for taken in [base.clone(), format!("{base}.1"), format!("{base}.3")] {
+            std::fs::write(append(&path, &taken), b"earlier").unwrap();
+        }
+
+        let quarantined = database_at(&path, timestamp).unwrap();
+        let expected = format!("{base}.2");
+        assert_eq!(quarantined, append(&path, &expected));
+        assert_eq!(std::fs::read(&quarantined).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(append(&sidecar(&path, "-wal"), &expected)).unwrap(),
+            b"wal"
+        );
+        for taken in [base.clone(), format!("{base}.1"), format!("{base}.3")] {
+            assert_eq!(std::fs::read(append(&path, &taken)).unwrap(), b"earlier");
+        }
+
+        // A sidecar's target being taken moves all three, not only it.
+        std::fs::write(&path, b"db2").unwrap();
+        std::fs::write(sidecar(&path, "-wal"), b"wal2").unwrap();
+        let later = timestamp + 1;
+        let later_base = format!(".corrupt.{later}");
+        std::fs::write(append(&sidecar(&path, "-wal"), &later_base), b"earlier").unwrap();
+        let quarantined = database_at(&path, later).unwrap();
+        let expected = format!("{later_base}.1");
+        assert_eq!(quarantined, append(&path, &expected));
+        assert_eq!(
+            std::fs::read(append(&sidecar(&path, "-wal"), &expected)).unwrap(),
+            b"wal2"
+        );
+        assert!(!append(&path, &later_base).exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

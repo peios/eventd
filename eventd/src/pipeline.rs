@@ -152,10 +152,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         ))?;
     }
 
-    let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..shard_count)
-        .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
-        .collect::<Result<Vec<_>, _>>()?
-        .into();
+    let queues = handoff_queues(shard_count)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let descriptors = Arc::new(DescriptorCache::new());
     let descriptor_thread_cache = Arc::clone(&descriptors);
@@ -280,10 +277,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let context = DrainContext {
             boot_id,
             queues: Arc::clone(&queues),
-            router: StripeRouter::new(
-                assigned_shards(ordinal, cpu_count, shard_count),
-                STRIPE_LENGTH,
-            ),
+            router: drain_router(ordinal, cpu_count, shard_count),
             coverage: Arc::clone(&coverage),
             stopping: Arc::clone(&stopping),
             startup: startup_sender.clone(),
@@ -442,6 +436,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &canonical_boot_id,
         &cpu_ids,
         &index_policy_sender,
+    )
+}
+
+/// One drain-to-writer handoff per active shard, bounded by the
+/// startup-fixed slot and byte limits rather than by any reloadable setting.
+fn handoff_queues(
+    shard_count: usize,
+) -> Result<Arc<[BoundedQueue<WriterMessage>]>, eventd_core::QueueConfigError> {
+    Ok((0..shard_count)
+        .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
+        .collect::<Result<Vec<_>, _>>()?
+        .into())
+}
+
+/// The shards a drain routes to, chosen by its attachment's dense ordinal,
+/// never by its logical CPU ID.
+fn drain_router(ordinal: usize, cpu_count: usize, shard_count: usize) -> StripeRouter {
+    StripeRouter::new(
+        assigned_shards(ordinal, cpu_count, shard_count),
+        STRIPE_LENGTH,
     )
 }
 
@@ -617,18 +631,7 @@ fn supervise(
     drop(query_server);
     drop(log_socket);
     drop(metric_socket);
-    let mut mapped_rings = Vec::with_capacity(drains.len());
-    for drain in drains {
-        match drain.join() {
-            Ok(Ok(attachment)) => mapped_rings.push(attachment),
-            Ok(Err(error)) => {
-                first_error.get_or_insert(error);
-            }
-            Err(_) => {
-                first_error.get_or_insert_with(|| "eventd drain panicked".to_owned());
-            }
-        }
-    }
+    let mapped_rings = join_drains(drains, &mut first_error);
 
     if let Err(error) = flush_event_queues(queues) {
         first_error.get_or_insert(error);
@@ -691,6 +694,27 @@ fn supervise(
     join_worker(index_handle, &mut first_error);
     drop(mapped_rings);
     first_error.map_or_else(|| Ok(()), |error| Err(error.into()))
+}
+
+/// Join every drain, keeping each returned attachment (its ring still
+/// mapped) for the caller to release at the end of shutdown.
+fn join_drains<A>(
+    drains: Vec<JoinHandle<Result<A, String>>>,
+    first_error: &mut Option<String>,
+) -> Vec<A> {
+    let mut mapped_rings = Vec::with_capacity(drains.len());
+    for drain in drains {
+        match drain.join() {
+            Ok(Ok(attachment)) => mapped_rings.push(attachment),
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| "eventd drain panicked".to_owned());
+            }
+        }
+    }
+    mapped_rings
 }
 
 fn diagnostic_dump(
@@ -824,6 +848,182 @@ fn join_worker(handle: JoinHandle<Result<(), String>>, first_error: &mut Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slot and byte bounds a handoff enforces, measured by filling it.
+    fn handoff_limits(queue: &BoundedQueue<WriterMessage>) -> (usize, usize) {
+        let mut held = Vec::new();
+        while let Ok(permit) = queue.try_reserve(1) {
+            held.push(permit);
+        }
+        let slots = held.len();
+        drop(held);
+        // The consumer reclaims the cancelled slots.
+        assert!(matches!(queue.pop(), eventd_core::Pop::Empty));
+        let whole = queue
+            .try_reserve(HANDOFF_BYTES)
+            .expect("the byte bound admits its size");
+        assert!(matches!(
+            queue.try_reserve(1),
+            Err(eventd_core::ReserveError::Full)
+        ));
+        drop(whole);
+        assert!(matches!(queue.pop(), eventd_core::Pop::Empty));
+        assert!(matches!(
+            queue.try_reserve(HANDOFF_BYTES + 1),
+            Err(eventd_core::ReserveError::TooLarge)
+        ));
+        (slots, HANDOFF_BYTES)
+    }
+
+    #[test]
+    fn a_live_max_batch_size_change_leaves_the_handoff_limits_unchanged() {
+        let runtime = Config::test_defaults().shared();
+        let queues = handoff_queues(2).unwrap();
+        for queue in queues.iter() {
+            assert_eq!(handoff_limits(queue), (HANDOFF_SLOTS, HANDOFF_BYTES));
+        }
+        for max_batch_size in [100, 100_000] {
+            // What the configuration watch does with a reloaded MaxBatchSize.
+            runtime.write().unwrap().max_batch_size = max_batch_size;
+            for queue in queues.iter() {
+                assert_eq!(
+                    handoff_limits(queue),
+                    (HANDOFF_SLOTS, HANDOFF_BYTES),
+                    "MaxBatchSize {max_batch_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_cpus_route_by_dense_ordinal_but_store_their_logical_id() {
+        // What KMES attachment yields when slots 1, 3 and 4 are holes.
+        let logical = [0_u16, 2, 5];
+        let shard_count = 3;
+        let routers: Vec<_> = (0..logical.len())
+            .map(|ordinal| drain_router(ordinal, logical.len(), shard_count))
+            .collect();
+        assert_eq!(
+            routers
+                .iter()
+                .map(|router| router.shards().to_vec())
+                .collect::<Vec<_>>(),
+            [vec![0], vec![1], vec![2]],
+            "ordinals 0..2, not logical IDs 0, 2 and 5, choose the shards"
+        );
+
+        let mut directory = std::env::temp_dir();
+        directory.push(format!(
+            "eventd-pipeline-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for (router, cpu_id) in routers.iter().zip(logical) {
+            let path = directory.join(format!("shard-{:04}.db", router.current_shard()));
+            let mut shard = Shard::open(&path, 1_000).unwrap();
+            // An event and the gap before it, stamped as a drain stamps them:
+            // with its attachment's logical CPU ID.
+            shard
+                .commit(&[eventd_core::IngestItem {
+                    gaps: vec![eventd_core::Gap {
+                        timestamp: 10,
+                        first_sequence: 1,
+                        last_sequence: 2,
+                        preceding_timestamp: None,
+                        revealing_timestamp: 30,
+                    }],
+                    store_event: true,
+                    event: eventd_core::RealEvent {
+                        boot_id: [1; 16],
+                        timestamp: 30,
+                        cpu_id,
+                        sequence: 3,
+                        origin_class: 0,
+                        effective_token_guid: [2; 16],
+                        true_token_guid: [3; 16],
+                        process_guid: [4; 16],
+                        event_type: "test.event".into(),
+                        payload: [0x80].into(),
+                    },
+                }])
+                .unwrap();
+            let receipts = shard.receipts().unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(
+                receipts[0].1, cpu_id,
+                "the receipt range keeps the logical ID"
+            );
+            drop(shard);
+
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let rows: Vec<(String, u16, Vec<u8>)> = connection
+                .prepare("SELECT event_type, cpu_id, payload FROM events ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            for (event_type, stored_cpu, _) in &rows {
+                assert_eq!(
+                    *stored_cpu, cpu_id,
+                    "the {event_type} row keeps the logical ID"
+                );
+            }
+            let gap = &rows[0];
+            assert_eq!(gap.0, "synthetic.gap");
+            // The gap record's first field is `cpu_id`, a positive fixint.
+            assert_eq!(&gap.2[1..8], b"\xa6cpu_id");
+            assert_eq!(gap.2[8], u8::try_from(cpu_id).unwrap());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shutdown_joins_every_drain_and_releases_each_ring_it_returns() {
+        use std::sync::atomic::AtomicUsize;
+
+        /// Stands for a mapped ring: dropping it is what unmaps the ring
+        /// and closes its descriptor (`EventRing`'s drop).
+        struct Ring(Arc<AtomicUsize>);
+
+        impl Drop for Ring {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let drains: Vec<JoinHandle<Result<Ring, String>>> = (0..3)
+            .map(|cpu| {
+                let ring = Ring(Arc::clone(&released));
+                std::thread::spawn(move || {
+                    if cpu == 1 {
+                        // A drain that fails releases its own ring as it ends.
+                        drop(ring);
+                        Err("drain 1 failed".to_owned())
+                    } else {
+                        Ok(ring)
+                    }
+                })
+            })
+            .collect();
+        let mut first_error = None;
+        let mapped = join_drains(drains, &mut first_error);
+        assert_eq!(mapped.len(), 2, "every drain was joined and its ring kept");
+        assert_eq!(first_error.as_deref(), Some("drain 1 failed"));
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "the returned rings stay mapped until shutdown releases them"
+        );
+        drop(mapped);
+        assert_eq!(released.load(Ordering::SeqCst), 3, "every ring is released");
+    }
 
     #[test]
     fn shard_names_are_exact() {

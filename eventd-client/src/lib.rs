@@ -234,8 +234,29 @@ mod tests {
         frame
     }
 
-    /// A query socket that reads one request and answers with `messages`.
-    fn eventd(messages: Vec<Vec<u8>>) -> (PathBuf, std::thread::JoinHandle<()>) {
+    /// A live batch of one record, `n`, padded well past what a socket
+    /// buffers, so a write of it completes only while the far end reads.
+    fn bulky(value: i64) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer
+            .write_map(2)
+            .write_str("status")
+            .write_str("ok")
+            .write_str("records")
+            .write_array(1)
+            .write_map(2)
+            .write_str("n")
+            .write_int(value)
+            .write_str("pad")
+            .write_bin(&vec![0; 2 << 20]);
+        frame(&writer.to_bytes().unwrap())
+    }
+
+    /// A query socket listening, and accepting one connection whose
+    /// request it reads, on a thread running `serve` with the stream.
+    fn stand_in<T: Send + 'static>(
+        serve: impl FnOnce(UnixStream) -> T + Send + 'static,
+    ) -> (PathBuf, std::thread::JoinHandle<T>) {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
             "eventd-client-{}-{}.sock",
@@ -251,14 +272,36 @@ mod tests {
             stream.read_exact(&mut prefix).unwrap();
             let mut request = vec![0; u32::from_le_bytes(prefix) as usize];
             stream.read_exact(&mut request).unwrap();
+            let _ = std::fs::remove_file(&served);
+            serve(stream)
+        });
+        (path, thread)
+    }
+
+    /// A query socket that reads one request and answers with `messages`.
+    fn eventd(messages: Vec<Vec<u8>>) -> (PathBuf, std::thread::JoinHandle<()>) {
+        stand_in(|mut stream| {
             for message in messages {
                 if stream.write_all(&message).is_err() {
                     break;
                 }
             }
-            let _ = std::fs::remove_file(&served);
-        });
-        (path, thread)
+        })
+    }
+
+    /// A query socket that writes `messages` until one has been blocked for
+    /// `patience`, then closes the connection, as eventd ends a query whose
+    /// reader has stopped (§6.6). It gives how many it wrote whole.
+    fn impatient_eventd(
+        messages: impl Iterator<Item = Vec<u8>> + Send + 'static,
+        patience: Duration,
+    ) -> (PathBuf, std::thread::JoinHandle<usize>) {
+        stand_in(move |mut stream| {
+            stream.set_write_timeout(Some(patience)).unwrap();
+            messages
+                .take_while(|message| stream.write_all(message).is_ok())
+                .count()
+        })
     }
 
     fn numbers(records: &[Record]) -> Vec<i64> {
@@ -319,6 +362,46 @@ mod tests {
             Tailed::Ended(Error::Refused(_))
         ));
         eventd.join().unwrap();
+    }
+
+    #[test]
+    fn a_tail_reads_its_socket_on_its_own_thread_until_capacity_reports_wait() {
+        const CAPACITY: usize = 3;
+        let messages = std::iter::once(status("watch")).chain((0..16).map(bulky));
+        let (path, eventd) = impatient_eventd(messages, Duration::from_secs(1));
+        let tail = Tail::start(&path, "LOGS STREAM", CAPACITY).unwrap();
+        // Nobody calls updates() until eventd is done writing, so only the
+        // tail's own thread reads. It reads the watch and the first batches
+        // as eventd writes them, until `capacity` reports wait in the
+        // channel and it holds one more; then it stops reading, and the
+        // next write never completes.
+        let written = eventd.join().unwrap();
+        assert_eq!(written, CAPACITY + 1);
+        let wait = || tail.updates().recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(wait(), Tailed::Initial(ref records) if records.is_empty()));
+        for expected in 0..i64::try_from(CAPACITY).unwrap() {
+            assert!(matches!(wait(), Tailed::Live(ref records) if numbers(records) == [expected]));
+        }
+    }
+
+    #[test]
+    fn a_tail_its_program_stops_reading_is_ended_by_eventd_and_says_so() {
+        let messages = std::iter::once(status("watch")).chain((0..64).map(bulky));
+        let (path, eventd) = impatient_eventd(messages, Duration::from_secs(1));
+        let tail = Tail::start(&path, "LOGS STREAM", 1).unwrap();
+        // The program takes nothing; eventd's write blocks and it ends the
+        // query, having written only what one waiting report and the one
+        // in the thread's hand hold, of the 65 it had.
+        assert_eq!(eventd.join().unwrap(), 2);
+        let wait = || tail.updates().recv_timeout(Duration::from_secs(5));
+        assert!(matches!(wait(), Ok(Tailed::Initial(ref records)) if records.is_empty()));
+        assert!(matches!(wait(), Ok(Tailed::Live(ref records)) if numbers(records) == [0]));
+        // The next report is that the tail ended, and it is the last.
+        assert!(matches!(wait(), Ok(Tailed::Ended(Error::Channel(_)))));
+        assert!(matches!(
+            wait(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     #[test]

@@ -195,4 +195,31 @@ mod tests {
             [make_gap(2, 3, Some(10), 40, 41)]
         );
     }
+
+    #[test]
+    fn an_uncovered_sequence_below_the_next_expected_one_is_a_regression() {
+        let boot = [1; 16];
+        let coverage = Coverage::from_receipts([(boot, 0, Interval::new(2, 2).unwrap())]);
+        let mut reconciler = Reconciler::new(&coverage, boot, 0);
+        assert!(reconciler.observe(5, 50, 51).unwrap().store_event);
+        // A receipted duplicate met while scanning is skipped, not fatal.
+        let duplicate = reconciler.observe(2, 20, 52).unwrap();
+        assert!(!duplicate.store_event);
+        assert!(duplicate.gaps.is_empty());
+        // An unreceipted one below the next expected sequence is fatal.
+        assert_eq!(
+            reconciler.observe(4, 40, 53),
+            Err(ReconcileError::Regression {
+                expected_at_least: 6,
+                observed: 4,
+            })
+        );
+        assert_eq!(
+            reconciler.observe(5, 50, 54),
+            Err(ReconcileError::Regression {
+                expected_at_least: 6,
+                observed: 5,
+            })
+        );
+    }
 }
