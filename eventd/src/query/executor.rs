@@ -2342,23 +2342,29 @@ fn apply_record_sort(rows: &mut [Row], query: &Query) {
         return;
     }
     rows.sort_by(|left, right| {
-        query
-            .sort
-            .iter()
-            .find_map(|key| {
-                let ordering = language_cmp(
-                    left.record.get(&key.field).unwrap_or(&Value::Null),
-                    right.record.get(&key.field).unwrap_or(&Value::Null),
-                );
-                let ordering = if key.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
-                (ordering != Ordering::Equal).then_some(ordering)
-            })
-            .unwrap_or_else(|| left.tie.cmp(&right.tie))
+        sort_key_order(left, right, query).then_with(|| left.tie.cmp(&right.tie))
     });
+}
+
+/// How the query's SORT keys order two rows, `Equal` when they tie on
+/// every key.
+fn sort_key_order(left: &Row, right: &Row, query: &Query) -> Ordering {
+    query
+        .sort
+        .iter()
+        .find_map(|key| {
+            let ordering = language_cmp(
+                left.record.get(&key.field).unwrap_or(&Value::Null),
+                right.record.get(&key.field).unwrap_or(&Value::Null),
+            );
+            let ordering = if key.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            (ordering != Ordering::Equal).then_some(ordering)
+        })
+        .unwrap_or(Ordering::Equal)
 }
 
 fn apply_pagination<T>(rows: &mut Vec<T>, query: &Query) {
@@ -4015,17 +4021,41 @@ fn set_metric_result(record: &mut Record, value: Value, overflow: bool) {
     }
 }
 
+/// The SORT keys, then the metric tiebreakers of TRM §6.2: timestamp,
+/// name, canonical labels and sample id, all ascending.
 fn sort_metric_rows(rows: &mut [Row], query: &Query) {
-    if query.sort.is_empty() {
-        rows.sort_by(|left, right| {
-            timestamp(left)
-                .cmp(&timestamp(right))
-                .then_with(|| left.identifier.cmp(&right.identifier))
-                .then_with(|| left.tie.cmp(&right.tie))
-        });
-    } else {
-        apply_record_sort(rows, query);
-    }
+    rows.sort_by(|left, right| {
+        sort_key_order(left, right, query)
+            .then_with(|| timestamp(left).cmp(&timestamp(right)))
+            .then_with(|| left.identifier.cmp(&right.identifier))
+            .then_with(|| canonical_labels(left).cmp(canonical_labels(right)))
+            .then_with(|| left.tie.cmp(&right.tie))
+    });
+}
+
+/// The fields of a metric record that are not labels (PSPU §3.22).
+const METRIC_FIELDS: [&str; 6] = ["timestamp", "boot_id", "name", "type", "value", "overflow"];
+
+/// The bytes of a metric row's canonical label string: its labels sorted
+/// by key, each `key=value`, joined with commas (PSPU §3.13). A record's
+/// map is already in key byte order.
+fn canonical_labels(row: &Row) -> impl Iterator<Item = u8> + '_ {
+    row.record
+        .iter()
+        .filter(|(key, _)| !METRIC_FIELDS.contains(&key.as_str()))
+        .enumerate()
+        .flat_map(|(index, (key, value))| {
+            let value: &[u8] = match value {
+                Value::String(value) => value.as_bytes(),
+                _ => &[],
+            };
+            (index != 0)
+                .then_some(b',')
+                .into_iter()
+                .chain(key.bytes())
+                .chain(core::iter::once(b'='))
+                .chain(value.iter().copied())
+        })
 }
 
 fn parse_labels(canonical: &str) -> Record {
@@ -5339,6 +5369,55 @@ mod tests {
             [5_000],
             "a window takes it by its time"
         );
+    }
+
+    // PEI-1295, TRM §6.2: metric rows tie-break on timestamp, name,
+    // canonical labels and sample id, all ascending, after any SORT keys.
+    #[test]
+    fn metric_ties_are_broken_by_canonical_labels_before_sample_id() {
+        let sample = |name: &str, labels: &[(&str, &str)], at: i64, id: i64| {
+            let mut row = test_row(at, Value::Float(1.0));
+            row.identifier = name.into();
+            row.record.insert("name".into(), Value::String(name.into()));
+            for (key, value) in labels {
+                row.record
+                    .insert((*key).into(), Value::String((*value).into()));
+            }
+            row.tie = Tie::Single(id);
+            row
+        };
+        let order = |query: &str, mut rows: Vec<Row>| {
+            sort_metric_rows(&mut rows, &crate::query_language::parse(query).unwrap());
+            rows.iter().map(row_id).collect::<Vec<_>>()
+        };
+        // k=b was written first, so its sample id is the lower.
+        let tied = || {
+            vec![
+                sample("m", &[("k", "b")], 5, 1),
+                sample("m", &[("k", "a")], 5, 2),
+            ]
+        };
+        assert_eq!(order("METRIC m[]", tied()), [2, 1], "k=a before k=b");
+        assert_eq!(
+            order("METRIC m[] SORT value", tied()),
+            [2, 1],
+            "under a SORT too"
+        );
+        // Canonical labels compare as the joined string, where `,` (0x2c)
+        // sorts after `+` (0x2b): "k=a+" < "k=a,l=x".
+        let joined = vec![
+            sample("m", &[("k", "a"), ("l", "x")], 5, 1),
+            sample("m", &[("k", "a+")], 5, 2),
+        ];
+        assert_eq!(order("METRIC m[]", joined), [2, 1]);
+        // Timestamp, then name, come first, and the sample id last.
+        let rows = vec![
+            sample("n", &[("k", "a")], 5, 1),
+            sample("m", &[("k", "b")], 5, 2),
+            sample("m", &[("k", "c")], 4, 3),
+            sample("m", &[("k", "b")], 5, 0),
+        ];
+        assert_eq!(order("METRIC m[] SORT value", rows), [3, 0, 2, 1]);
     }
 
     fn test_histogram(total_count: u64, final_count: u64) -> Vec<u8> {
