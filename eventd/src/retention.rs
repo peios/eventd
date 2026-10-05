@@ -284,14 +284,16 @@ fn delete_boot_once(
 
 fn checkpoint_events(
     queues: &[BoundedQueue<WriterMessage>],
-    historical_shards: &[Shard],
+    historical_shards: &mut [Shard],
 ) -> Result<(), String> {
     for queue in queues {
         event_command(queue, EventMaintenance::Checkpoint)?;
     }
     for shard in historical_shards {
+        // A historical shard takes no ingestion to yield to.
         shard
-            .passive_checkpoint()
+            .remove_orphan_types(|| false)
+            .and_then(|_| shard.passive_checkpoint())
             .map_err(|error| error.to_string())?;
     }
     Ok(())

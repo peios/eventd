@@ -53,6 +53,8 @@ pub struct Shard {
     connection: Connection,
     path: PathBuf,
     known_types: HashSet<Box<str>>,
+    /// Types a committed retention delete touched, awaiting an orphan check.
+    orphan_candidates: HashSet<Box<str>>,
     checkpoint_pages: u32,
     page_size: u64,
 }
@@ -137,6 +139,7 @@ impl Shard {
             connection,
             path: path.to_owned(),
             known_types,
+            orphan_candidates: HashSet::new(),
             checkpoint_pages,
             page_size,
         })
@@ -370,27 +373,65 @@ impl Shard {
 
     /// Delete at most `limit` event rows older than `cutoff`.
     pub fn retain_before(&mut self, cutoff: i64, limit: usize) -> Result<usize, ShardError> {
-        self.delete_bounded(
+        self.delete_events(
             "DELETE FROM events WHERE id IN (SELECT id FROM events \
-             WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2)",
-            cutoff,
-            limit,
+             WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2) RETURNING event_type",
+            params![cutoff, sqlite_limit(limit)?],
         )
     }
 
     /// Delete at most `limit` rows belonging to one complete boot.
     pub fn retain_boot(&mut self, boot_id: &Guid, limit: usize) -> Result<usize, ShardError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = transaction.execute(
+        self.delete_events(
             "DELETE FROM events WHERE id IN (SELECT id FROM events \
-             WHERE boot_id = ?1 ORDER BY timestamp, id LIMIT ?2)",
+             WHERE boot_id = ?1 ORDER BY timestamp, id LIMIT ?2) RETURNING event_type",
             params![&boot_id[..], sqlite_limit(limit)?],
-        )?;
-        transaction.commit()?;
+        )
+    }
+
+    /// Remove catalogued types that retention's deletes left with no event.
+    ///
+    /// The candidates are the distinct types the committed delete batches
+    /// touched. Each is rechecked with `NOT EXISTS` inside the deletion
+    /// transaction, and uninterned only once that commits (§3.1). A stale
+    /// catalogue row is safe, so the check is skipped, keeping its
+    /// candidates for a later offer, when `idx_events_event_type` is not
+    /// material (the recheck would scan the events table) or when `cancel`
+    /// reports work waiting: cleanup never delays ingestion. Returns the
+    /// number of types removed.
+    pub fn remove_orphan_types<F>(&mut self, mut cancel: F) -> Result<usize, ShardError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        if self.orphan_candidates.is_empty()
+            || cancel()
+            || !self
+                .material_indexes()?
+                .iter()
+                .any(|name| name == "idx_events_event_type")
+        {
+            return Ok(0);
+        }
+        let candidates: Vec<Box<str>> = self.orphan_candidates.iter().cloned().collect();
+        self.connection.progress_handler(1_000, Some(cancel));
+        let result = delete_orphans(&mut self.connection, &candidates);
+        self.connection.progress_handler(0, None::<fn() -> bool>);
+        let removed = match result {
+            Ok(removed) => removed,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                return Ok(0);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Every candidate was rechecked: the rest still have events.
+        self.orphan_candidates.clear();
+        for event_type in &removed {
+            self.known_types.remove(event_type);
+        }
         self.checkpoint_if_needed()?;
-        Ok(deleted)
+        Ok(removed.len())
     }
 
     /// Ask the sole writer connection to perform a passive checkpoint.
@@ -496,17 +537,34 @@ impl Shard {
             .map_err(ShardError::Sql)
     }
 
-    fn delete_bounded(
+    /// Run one bounded `DELETE … RETURNING event_type`, recording the
+    /// distinct types it touched as orphan candidates once it commits.
+    fn delete_events(
         &mut self,
         sql: &str,
-        cutoff: i64,
-        limit: usize,
+        parameters: impl rusqlite::Params,
     ) -> Result<usize, ShardError> {
+        let mut deleted = 0;
+        let mut touched = HashSet::<Box<str>>::new();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = transaction.execute(sql, params![cutoff, sqlite_limit(limit)?])?;
+        {
+            let mut statement = transaction.prepare(sql)?;
+            let mut rows = statement.query(parameters)?;
+            while let Some(row) = rows.next()? {
+                deleted += 1;
+                let event_type = row
+                    .get_ref(0)?
+                    .as_str()
+                    .map_err(|_| ShardError::InvalidSchema("event_type is not text"))?;
+                if !touched.contains(event_type) {
+                    touched.insert(event_type.into());
+                }
+            }
+        }
         transaction.commit()?;
+        self.orphan_candidates.extend(touched);
         self.checkpoint_if_needed()?;
         Ok(deleted)
     }
@@ -619,6 +677,30 @@ fn adaptive_index(index: &DesiredIndex) -> Option<(String, String)> {
         Some((name.to_owned(), format!("{column}{collation}")))
     }
 }
+
+/// Delete each candidate type still without an event, in one transaction.
+/// `COLLATE NOCASE` lets the recheck use `idx_events_event_type`; a type
+/// that differs from a stored one only in case is kept, which is safe.
+fn delete_orphans(
+    connection: &mut Connection,
+    candidates: &[Box<str>],
+) -> rusqlite::Result<Vec<Box<str>>> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut removed = Vec::new();
+    {
+        let mut delete = transaction.prepare(ORPHAN_DELETE)?;
+        for candidate in candidates {
+            if delete.execute([candidate.as_ref()])? != 0 {
+                removed.push(candidate.clone());
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(removed)
+}
+
+const ORPHAN_DELETE: &str = "DELETE FROM event_types WHERE event_type = ?1 \
+     AND NOT EXISTS (SELECT 1 FROM events WHERE event_type = ?1 COLLATE NOCASE)";
 
 fn read_receipts(connection: &Connection) -> Result<Vec<(Guid, u16, Interval)>, ShardError> {
     let mut statement = connection
@@ -1104,6 +1186,115 @@ mod tests {
                 ("synthetic.startup".to_owned(), 1)
             ]
         );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn catalogued(shard: &Shard, event_type: &str) -> bool {
+        shard
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_types WHERE event_type = ?1)",
+                [event_type],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Events at timestamp 1 of `old.type` and of `orphans` more types, and
+    /// of `kept.type` at timestamps 1 and 100000, in that id order.
+    fn shard_with_orphans_to_be(path: &Path, orphans: u64) -> Shard {
+        let mut shard = Shard::open(path, 1_000).unwrap();
+        let mut items: Vec<_> = core::iter::once("old.type".to_owned())
+            .chain((0..orphans).map(|index| format!("old.type{index}")))
+            .chain(["kept.type".to_owned()])
+            .enumerate()
+            .map(|(index, event_type)| {
+                let mut item = event(index as u64 + 1, &event_type);
+                item.event.timestamp = 1;
+                item
+            })
+            .collect();
+        items.push(event(100_000, "kept.type"));
+        shard.commit(&items).unwrap();
+        shard
+    }
+
+    #[test]
+    fn retention_removes_a_type_its_deletes_orphaned_and_uninterns_it_after_commit() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = shard_with_orphans_to_be(&path, 0);
+        shard
+            .converge_indexes(&event_type_index(), || false)
+            .unwrap();
+        // The recheck is answered from the index, not by scanning events.
+        let plan = {
+            let mut statement = shard
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {ORPHAN_DELETE}"))
+                .unwrap();
+            statement
+                .query_map(["old.type"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("; ")
+        };
+        assert!(plan.contains("idx_events_event_type"), "{plan}");
+
+        assert_eq!(shard.retain_before(10, 100).unwrap(), 2);
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 1);
+        assert!(!catalogued(&shard, "old.type"));
+        assert!(
+            catalogued(&shard, "kept.type"),
+            "a type with an event left stays"
+        );
+        // Uninterned: its next event catalogues it again.
+        shard.commit(&[event(200, "old.type")]).unwrap();
+        assert!(catalogued(&shard, "old.type"));
+        // The candidates were all checked; nothing is left to offer.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 0);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_unindexed_or_interrupted_orphan_check_is_skipped_and_offered_again() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        // Enough candidates for the deletion transaction to reach the
+        // progress handler.
+        let mut shard = shard_with_orphans_to_be(&path, 300);
+        assert_eq!(shard.retain_boot(&[1; 16], 302).unwrap(), 302);
+        // No idx_events_event_type: skipped.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 0);
+        assert!(catalogued(&shard, "old.type"));
+        shard
+            .converge_indexes(&event_type_index(), || false)
+            .unwrap();
+        // Work waiting: skipped.
+        assert_eq!(shard.remove_orphan_types(|| true).unwrap(), 0);
+        assert!(catalogued(&shard, "old.type"));
+        // Interrupted part-way through the deletion transaction: rolled back.
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&checks);
+        assert_eq!(
+            shard
+                .remove_orphan_types(move || counter.fetch_add(1, Ordering::Relaxed) > 0)
+                .unwrap(),
+            0
+        );
+        assert!(
+            checks.load(Ordering::Relaxed) > 1,
+            "the progress handler ran"
+        );
+        assert!(catalogued(&shard, "old.type"));
+        assert!(shard.connection.is_autocommit());
+        // Still candidates, so the next offer removes them all.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 301);
+        assert!(!catalogued(&shard, "old.type"));
+        assert!(catalogued(&shard, "kept.type"));
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }

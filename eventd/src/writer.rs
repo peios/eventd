@@ -527,7 +527,16 @@ fn handle_maintenance(
     let result = match command {
         EventMaintenance::DeleteBefore { cutoff, limit } => shard.retain_before(*cutoff, *limit),
         EventMaintenance::DeleteBoot { boot_id, limit } => shard.retain_boot(boot_id, *limit),
-        EventMaintenance::Checkpoint => shard.passive_checkpoint().map(|()| 0),
+        // Retention checkpoints after its deletes, and that is when it
+        // offers the orphan-type checks they made due (§3.1); waiting
+        // ingestion skips them.
+        EventMaintenance::Checkpoint => {
+            let queue = context.queue.clone();
+            shard
+                .remove_orphan_types(move || !queue.is_empty())
+                .and_then(|_| shard.passive_checkpoint())
+                .map(|()| 0)
+        }
     };
     match result {
         Ok(deleted) => {
