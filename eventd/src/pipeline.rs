@@ -143,13 +143,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let query_server = Arc::new(QueryServer::bind(&config.query_socket_path)?);
 
     for (store, shard_index, error) in startup_storage_errors {
-        shards[0].commit_synthetic(&crate::synthetic::storage_error(
+        let event = crate::synthetic::storage_error(
             boot_id,
             store,
             shard_index,
             &error,
             realtime_nanoseconds()?,
-        ))?;
+        );
+        match commit_direct_fallback(&mut shards, &event) {
+            Ok(()) => {}
+            Err(write_error) if write_error.is_capacity() => eprintln!(
+                "eventd: no event shard is writable; synthetic.storage_error for the {store} \
+                 store skipped: {write_error}"
+            ),
+            Err(write_error) => return Err(write_error.into()),
+        }
     }
 
     let queues = handoff_queues(shard_count)?;
@@ -327,17 +335,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect();
-    commit_synthetic(
-        &queues[0],
-        crate::synthetic::startup(
-            boot_id,
-            &canonical_boot_id,
-            restart,
-            shard_count,
-            &resume_points,
-            realtime_nanoseconds()?,
-        ),
-    )?;
+    let startup = crate::synthetic::startup(
+        boot_id,
+        &canonical_boot_id,
+        restart,
+        shard_count,
+        &resume_points,
+        realtime_nanoseconds()?,
+    );
+    if let Err(error) = commit_synthetic_fallback(&queues, &startup) {
+        eprintln!("eventd: cannot persist synthetic.startup: {error}");
+    }
 
     let query_stores = Arc::new(crate::query::Stores {
         event_paths: active_paths
@@ -397,7 +405,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     notify_ready()?;
     let config_stopping = Arc::clone(&stopping);
     let config_runtime = Arc::clone(&runtime);
-    let config_event_queue = queues[0].clone();
+    let config_event_queues = Arc::clone(&queues);
     let config_retention_requested = Arc::clone(&retention_requested);
     let config_index_policy = index_policy_sender.clone();
     let config_handle = std::thread::Builder::new()
@@ -408,7 +416,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &config_stopping,
                 &SIGNAL_RELOAD,
                 boot_id,
-                &config_event_queue,
+                &config_event_queues,
                 &config_retention_requested,
                 &config_index_policy,
             );
@@ -501,18 +509,23 @@ fn load_receipts(
     Ok(receipts)
 }
 
-fn commit_synthetic(
-    queue: &BoundedQueue<WriterMessage>,
-    event: eventd_core::SyntheticEvent,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (sender, receiver) = sync_channel(1);
-    queue
-        .reserve(core::mem::size_of::<WriterMessage>())?
-        .publish(WriterMessage::Synthetic(event, sender));
-    receiver
-        .recv()
-        .map_err(|_| "event writer stopped before synthetic event commit")??;
-    Ok(())
+/// Commit a daemon-wide event before the writers own the shards: shard 0,
+/// else the lowest-numbered shard with room (TRM §2.6). Only a full shard
+/// is passed over; any other failure is returned as it was met.
+fn commit_direct_fallback(
+    shards: &mut [Shard],
+    event: &eventd_core::SyntheticEvent,
+) -> Result<(), eventd_core::ShardError> {
+    let mut full = None;
+    for shard in shards {
+        match shard.commit_synthetic(event) {
+            Err(error) if error.is_capacity() => full = Some(error),
+            result => return result,
+        }
+    }
+    Err(full.unwrap_or_else(|| {
+        eventd_core::ShardError::Io(std::io::Error::other("no active event shard"))
+    }))
 }
 
 fn realtime_nanoseconds() -> Result<u64, Box<dyn std::error::Error>> {
@@ -807,7 +820,10 @@ fn flush_event_queues(queues: &[BoundedQueue<WriterMessage>]) -> Result<(), Stri
     Ok(())
 }
 
-fn commit_synthetic_fallback(
+/// Commit a daemon-wide synthetic event to shard 0, else to the lowest-
+/// numbered active shard that takes it (TRM §2.6). An error means no shard
+/// could; the caller logs it and goes on.
+pub(crate) fn commit_synthetic_fallback(
     queues: &[BoundedQueue<WriterMessage>],
     event: &eventd_core::SyntheticEvent,
 ) -> Result<(), String> {
@@ -1023,6 +1039,54 @@ mod tests {
         );
         drop(mapped);
         assert_eq!(released.load(Ordering::SeqCst), 3, "every ring is released");
+    }
+
+    // PEI-1292: a storage error found at startup goes to shard 0, else to
+    // the lowest-numbered shard with room, else is skipped (TRM §2.6).
+    #[test]
+    fn a_startup_storage_error_passes_over_a_full_shard_0() {
+        let mut directory = std::env::temp_dir();
+        directory.push(format!(
+            "eventd-pipeline-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let full = |path: PathBuf| {
+            let mut shard = Shard::open(path, 1_000).unwrap();
+            shard.cap_pages_for_test().unwrap();
+            let filler = crate::synthetic::shutdown([1; 16], &[(0, 1)], 1);
+            while shard.commit_synthetic(&filler).is_ok() {}
+            shard
+        };
+        let event = crate::synthetic::storage_error([1; 16], "log", None, "corrupt", 5);
+        let stored = |shard: &Shard| -> i64 {
+            rusqlite::Connection::open(shard.path())
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM events WHERE event_type = 'synthetic.storage_error'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        let mut shards = [
+            full(directory.join("shard-0000.db")),
+            Shard::open(directory.join("shard-0001.db"), 1_000).unwrap(),
+        ];
+        commit_direct_fallback(&mut shards, &event).unwrap();
+        assert_eq!(stored(&shards[0]), 0);
+        assert_eq!(stored(&shards[1]), 1, "the record went to shard 1");
+
+        let mut both_full = [full(directory.join("shard-0002.db"))];
+        let error = commit_direct_fallback(&mut both_full, &event).unwrap_err();
+        assert!(error.is_capacity(), "no shard had room: {error}");
+        drop((shards, both_full));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

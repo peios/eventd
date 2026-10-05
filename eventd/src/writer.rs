@@ -486,8 +486,10 @@ fn handle_synthetic(
             Ok(())
         }
         Err(error) if error.is_capacity() => {
+            // Not stored: say so, and the sender tries the next shard
+            // (TRM §2.6). The writer itself carries on.
             request_retention(context.retention_requested, "event", &error);
-            let _ = sender.send(Ok(()));
+            let _ = sender.send(Err(error.to_string()));
             Ok(())
         }
         Err(error) if error.is_corruption() => {
@@ -503,6 +505,11 @@ fn handle_synthetic(
                 Ok(()) => {
                     context.commits.committed();
                     let _ = sender.send(Ok(()));
+                    Ok(())
+                }
+                Err(retry) if retry.is_capacity() => {
+                    request_retention(context.retention_requested, "event", &retry);
+                    let _ = sender.send(Err(retry.to_string()));
                     Ok(())
                 }
                 Err(retry) => {
@@ -818,6 +825,118 @@ mod tests {
             writer.join().unwrap().unwrap();
         });
         assert_eq!(stored_events(&path), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A shard with no room left for another row.
+    fn full_shard(path: &std::path::Path) -> Shard {
+        let mut shard = Shard::open(path, 1_000).unwrap();
+        shard.cap_pages_for_test().unwrap();
+        let filler = crate::synthetic::shutdown([1; 16], &[(0, 1)], 1);
+        for _ in 0..100_000 {
+            match shard.commit_synthetic(&filler) {
+                Ok(()) => {}
+                Err(error) if error.is_capacity() => return shard,
+                Err(error) => panic!("filling the shard: {error}"),
+            }
+        }
+        panic!("the shard did not fill");
+    }
+
+    // PEI-1292: a daemon-wide record the shard has no room for is reported
+    // to its sender, which then tries the next shard, rather than being
+    // acknowledged as stored and dropped. The writer carries on.
+    #[test]
+    fn a_synthetic_event_refused_for_space_is_reported_to_its_sender() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = full_shard(&path);
+        let queue = handoff();
+        let runtime = batched_by_size(100);
+        let harness = Harness::new();
+        let (sent, result) = sync_channel(1);
+        let (after, after_result) = sync_channel(1);
+        publish(
+            &queue,
+            WriterMessage::Synthetic(crate::synthetic::shutdown([1; 16], &[], 2), sent),
+        );
+        publish(&queue, WriterMessage::Barrier(after));
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let reply = result.recv().unwrap();
+            assert!(
+                reply.as_ref().is_err_and(|error| error.contains("full")),
+                "the sender learns the record was not stored: {reply:?}"
+            );
+            assert_eq!(after_result.recv().unwrap(), Ok(()), "the writer carries on");
+            assert!(harness.retention_requested.load(Ordering::Acquire));
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1292 (TRM §2.6): daemon-wide events go to shard 0, else to the
+    // lowest-numbered writable active shard.
+    #[test]
+    fn a_daemon_wide_record_goes_to_the_next_writable_shard_when_shard_0_is_full() {
+        let directory = temporary_directory();
+        let paths = [
+            directory.join("shard-0000.db"),
+            directory.join("shard-0001.db"),
+        ];
+        let shards = [
+            full_shard(&paths[0]),
+            Shard::open(&paths[1], 1_000).unwrap(),
+        ];
+        let queues = [handoff(), handoff()];
+        let runtime = batched_by_size(100);
+        let harnesses = [Harness::new(), Harness::new()];
+        let change = crate::config::AppliedChange {
+            key: "LogRetentionDays",
+            old_value_type: "REG_DWORD",
+            old_value: Some("14".into()),
+            new_value_type: "REG_DWORD",
+            new_value: Some("9".into()),
+        };
+        let event = crate::synthetic::config_change([1; 16], &change, 5);
+
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = shards
+                .into_iter()
+                .zip(&queues)
+                .zip(&harnesses)
+                .map(|((shard, queue), harness)| {
+                    let runtime = &runtime;
+                    scope.spawn(move || harness.run(shard, queue, runtime))
+                })
+                .collect();
+            let _closing = (CloseOnDrop(&queues[0]), CloseOnDrop(&queues[1]));
+            assert_eq!(
+                crate::pipeline::commit_synthetic_fallback(&queues, &event),
+                Ok(())
+            );
+            for queue in &queues {
+                queue.close();
+            }
+            for writer in writers {
+                writer.join().unwrap().unwrap();
+            }
+        });
+        let config_changes = |path: &std::path::Path| -> i64 {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM events WHERE event_type = 'synthetic.config_change'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(config_changes(&paths[0]), 0, "not in the full shard 0");
+        assert_eq!(config_changes(&paths[1]), 1, "but in shard 1");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

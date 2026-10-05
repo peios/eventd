@@ -12,7 +12,7 @@ use eventd_core::BoundedQueue;
 use peios::registry::{Key, KeyAccess, NotifyFilter, OpenFlags, ValueRecord, ValueType};
 
 use crate::indexing::PolicyMessage;
-use crate::writer::{WriterMessage, WriterMessage::Synthetic};
+use crate::writer::WriterMessage;
 
 const ROOT_KEY: &str = r"Machine\System\eventd";
 
@@ -911,14 +911,14 @@ impl ConfigWatch {
         stopping: &AtomicBool,
         forced: &AtomicBool,
         boot_id: [u8; 16],
-        event_queue: &BoundedQueue<WriterMessage>,
+        event_queues: &[BoundedQueue<WriterMessage>],
         retention_requested: &AtomicBool,
         index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
     ) {
         apply_reload(
             shared,
             boot_id,
-            event_queue,
+            event_queues,
             retention_requested,
             index_policy,
         );
@@ -933,7 +933,7 @@ impl ConfigWatch {
                     apply_reload(
                         shared,
                         boot_id,
-                        event_queue,
+                        event_queues,
                         retention_requested,
                         index_policy,
                     );
@@ -948,7 +948,7 @@ impl ConfigWatch {
                                 apply_reload(
                                     shared,
                                     boot_id,
-                                    event_queue,
+                                    event_queues,
                                     retention_requested,
                                     index_policy,
                                 );
@@ -959,7 +959,7 @@ impl ConfigWatch {
                                     apply_reload(
                                         shared,
                                         boot_id,
-                                        event_queue,
+                                        event_queues,
                                         retention_requested,
                                         index_policy,
                                     );
@@ -1019,7 +1019,7 @@ fn watch_ready(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool, std::io::Err
 fn apply_reload(
     shared: &SharedConfig,
     boot_id: [u8; 16],
-    queue: &BoundedQueue<WriterMessage>,
+    queues: &[BoundedQueue<WriterMessage>],
     retention_requested: &AtomicBool,
     index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
 ) {
@@ -1042,15 +1042,7 @@ fn apply_reload(
     let _ = index_policy.try_send(PolicyMessage::Recompute);
     for change in changes {
         let event = crate::synthetic::config_change(boot_id, &change, realtime_nanoseconds());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let result = queue
-            .reserve(core::mem::size_of::<WriterMessage>())
-            .map(|permit| permit.publish(Synthetic(event, sender)));
-        if let Err(error) = result {
-            eprintln!("eventd: cannot enqueue configuration change: {error}");
-            continue;
-        }
-        if let Ok(Err(error)) = receiver.recv() {
+        if let Err(error) = crate::pipeline::commit_synthetic_fallback(queues, &event) {
             eprintln!("eventd: cannot persist configuration change: {error}");
         }
     }
