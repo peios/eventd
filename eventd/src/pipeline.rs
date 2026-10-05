@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -14,10 +14,11 @@ use eventd_core::{
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, ConfigWatch, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
-use crate::datagram::{IngestionSocket, Protection};
+use crate::datagram::{IngestionSocket, Protection, waking_channel};
 use crate::directory::StoreDirectory;
 use crate::indexing::{PolicyMessage, SequenceCheckpoint, Tracker};
 use crate::kmes::{self, DrainContext};
+use crate::metric_ingest::rollup_channel;
 use crate::query::{DescriptorCache, QueryServer, ServerConfig};
 use crate::writer::WriterMessage;
 
@@ -234,7 +235,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_runtime = Arc::clone(&runtime);
     let log_writer_commits = Arc::clone(&log_commits);
     let log_retention_requested = Arc::clone(&retention_requested);
-    let (log_maintenance_sender, log_maintenance_receiver) = channel();
+    let (log_maintenance_sender, log_maintenance_receiver) = waking_channel(log_socket.waker());
     let log_thread_socket = Arc::clone(&log_socket);
     let log_error_events = queues[0].clone();
     let log_handle = std::thread::Builder::new()
@@ -256,8 +257,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metric_stopping = Arc::clone(&stopping);
     let metric_runtime = Arc::clone(&runtime);
     let metric_retention_requested = Arc::clone(&retention_requested);
-    let (metric_maintenance_sender, metric_maintenance_receiver) = channel();
-    let (rollup_sender, rollup_receiver) = sync_channel(8);
+    let (metric_maintenance_sender, metric_maintenance_receiver) =
+        waking_channel(metric_socket.waker());
+    let (rollup_sender, rollup_receiver) = rollup_channel(8, metric_socket.waker());
     let metric_thread_socket = Arc::clone(&metric_socket);
     let metric_error_events = queues[0].clone();
     let metric_descriptors = Arc::clone(&descriptors);

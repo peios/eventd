@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::MetricRollup;
@@ -16,7 +15,7 @@ use super::security::{Authorizer, Namespace};
 use super::value::{
     Record, Value, ascii_equal, flatten_event_payload, guid_string, is_nan, language_cmp,
 };
-use crate::metric_ingest::RollupMaintenance;
+use crate::metric_ingest::{RollupMaintenance, RollupSender};
 use crate::query_language::{
     AggregateFunction, CrossFilter, Expr, GroupFunction, Literal, MetricAggregate, Operator, Query,
     RecordAggregate, Source, TimeExpr, Transform,
@@ -32,7 +31,7 @@ pub struct Limits {
     pub deadline: Instant,
     pub cross_type_window: Duration,
     pub cross_type_max_lookback: Duration,
-    pub rollups: Option<SyncSender<RollupMaintenance>>,
+    pub rollups: Option<RollupSender>,
     pub adaptive_rollup_min_samples: usize,
     pub adaptive_rollup_batch_rows: usize,
     pub adaptive_rollup_max_rows: usize,

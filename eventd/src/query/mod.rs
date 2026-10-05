@@ -24,7 +24,7 @@ use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
 use crate::health::{self, Failure, Refusal};
 use crate::indexing::{PolicyMessage, Tracker};
-use crate::metric_ingest::RollupMaintenance;
+use crate::metric_ingest::RollupSender;
 use crate::query_language::{RecordAggregate, Source};
 
 pub use executor::{Limits, Stores};
@@ -42,7 +42,7 @@ pub struct ServerConfig {
     pub runtime: SharedConfig,
     pub index_tracker: Arc<Tracker>,
     pub index_policy: SyncSender<PolicyMessage>,
-    pub rollups: SyncSender<RollupMaintenance>,
+    pub rollups: RollupSender,
     pub descriptors: Arc<DescriptorCache>,
 }
 

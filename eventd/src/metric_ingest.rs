@@ -14,10 +14,13 @@ use eventd_core::{
 use peios::msgpack::{Reader, Type};
 
 use crate::config::{Config, SharedConfig};
-use crate::datagram::{IngestionSocket, SocketError, TokenReceive};
+use crate::datagram::{IngestionSocket, SocketError, TokenReceive, Waker, WakingSender};
 use crate::query::DescriptorCache;
 use crate::write_security::{MetricPublishAuthorizer, MetricPublishError};
 use crate::writer::WriterMessage;
+
+/// Maintenance for the metric thread, which wakes it to take each command.
+pub type MetricMaintenanceSender = WakingSender<MetricMaintenance>;
 
 pub enum MetricMaintenance {
     DeleteOldest {
@@ -30,6 +33,33 @@ pub enum MetricMaintenance {
 
 pub struct RollupMaintenance {
     pub rows: Vec<MetricRollup>,
+}
+
+/// The bounded channel queries hand computed rollups to the metric thread
+/// by. A rollup that does not fit is dropped; one that does wakes the
+/// thread, which takes it only while idle.
+#[derive(Clone)]
+pub struct RollupSender {
+    sender: SyncSender<RollupMaintenance>,
+    waker: Waker,
+}
+
+/// A rollup channel holding at most `bound` rollups, whose sends wake the
+/// thread `waker` belongs to.
+pub fn rollup_channel(bound: usize, waker: Waker) -> (RollupSender, Receiver<RollupMaintenance>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(bound);
+    (RollupSender { sender, waker }, receiver)
+}
+
+impl RollupSender {
+    pub fn try_send(
+        &self,
+        rollup: RollupMaintenance,
+    ) -> Result<(), std::sync::mpsc::TrySendError<RollupMaintenance>> {
+        self.sender.try_send(rollup)?;
+        self.waker.wake();
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -951,6 +981,110 @@ mod tests {
             .write_float(2.5);
         let records = parse_datagram(&writer.to_bytes().unwrap(), [1; 16], 7).unwrap();
         assert!(matches!(records[0].value, MetricValue::Histogram(_)));
+    }
+
+    /// One metric thread over a host socket and a temporary store, with the
+    /// handles the pipeline would hold.
+    struct MetricThread {
+        directory: std::path::PathBuf,
+        runtime: SharedConfig,
+        stopping: Arc<AtomicBool>,
+        retention_requested: Arc<AtomicBool>,
+        error_events: BoundedQueue<WriterMessage>,
+    }
+
+    impl MetricThread {
+        fn new() -> Self {
+            let mut directory = std::env::temp_dir();
+            directory.push(format!(
+                "eventd-metric-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let mut config = Config::test_defaults();
+            config.health_metric_interval = Duration::ZERO;
+            Self {
+                directory,
+                runtime: config.shared(),
+                stopping: Arc::new(AtomicBool::new(false)),
+                retention_requested: Arc::new(AtomicBool::new(false)),
+                error_events: BoundedQueue::new(16, 1 << 20).unwrap(),
+            }
+        }
+
+        fn socket_path(&self) -> std::path::PathBuf {
+            self.directory.join("metric.sock")
+        }
+
+        fn bind(&self) -> IngestionSocket {
+            let ceiling = crate::config::PORTABLE_INGEST_DATAGRAM_BYTES as usize;
+            IngestionSocket::unprotected(&self.socket_path(), ceiling).unwrap()
+        }
+
+        fn run(
+            &self,
+            socket: &IngestionSocket,
+            maintenance: &Receiver<MetricMaintenance>,
+            rollups: &Receiver<RollupMaintenance>,
+        ) -> Result<(), MetricIngestError> {
+            let store = MetricStore::open(self.directory.join("metrics.db"), 1_000, 1_000).unwrap();
+            run(
+                socket,
+                store,
+                [1; 16],
+                &self.error_events,
+                &self.runtime,
+                &self.stopping,
+                maintenance,
+                rollups,
+                &self.retention_requested,
+                Arc::new(DescriptorCache::new()),
+            )
+        }
+    }
+
+    impl Drop for MetricThread {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn checkpoint(maintenance: &MetricMaintenanceSender) {
+        let (response, answer) = std::sync::mpsc::sync_channel(1);
+        maintenance
+            .send(MetricMaintenance::Checkpoint(response))
+            .unwrap();
+        answer.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn an_idle_metric_thread_takes_each_maintenance_command_at_once() {
+        let metric = MetricThread::new();
+        let socket = metric.bind();
+        let (maintenance, commands) = crate::datagram::waking_channel(socket.waker());
+        let (_rollups, rollup_commands) = rollup_channel(1, socket.waker());
+        std::thread::scope(|scope| {
+            let (metric, socket) = (&metric, &socket);
+            let thread = scope.spawn(move || metric.run(socket, &commands, &rollup_commands));
+            // Let the thread find the socket empty and settle into its wait.
+            checkpoint(&maintenance);
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            for _ in 0..5 {
+                checkpoint(&maintenance);
+            }
+            let took = started.elapsed();
+            metric.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+            assert!(
+                took < Duration::from_millis(500),
+                "five commands to an idle thread took {took:?}"
+            );
+        });
     }
 
     #[test]

@@ -738,8 +738,9 @@ mod tests {
 
     use crate::commit_signal::CommitSignal;
     use crate::config::Config;
+    use crate::datagram::Waker;
     use crate::indexing::{PolicyMessage, Tracker};
-    use crate::metric_ingest::RollupMaintenance;
+    use crate::metric_ingest::{RollupMaintenance, rollup_channel};
     use crate::query::{
         PerUser, QuerySocketError, QueryTuning, ServerConfig, Stores, handle, handle_as,
     };
@@ -797,7 +798,7 @@ mod tests {
         let tuning = QueryTuning::from(&config);
         let runtime = config.shared();
         let (index_policy, policy) = sync_channel(1);
-        let (rollup_sender, rollups) = sync_channel(1);
+        let (rollup_sender, rollups) = rollup_channel(1, Waker::new().unwrap());
         let server_config = ServerConfig {
             runtime: Arc::clone(&runtime),
             index_tracker: Arc::new(Tracker::from_persisted(Vec::new(), runtime)),
@@ -1040,7 +1041,7 @@ mod tests {
         let tuning = QueryTuning::from(&config);
         let runtime = config.shared();
         let (index_policy, _policy) = sync_channel(1);
-        let (rollup_sender, _rollups) = sync_channel(1);
+        let (rollup_sender, _rollups) = rollup_channel(1, Waker::new().unwrap());
         let server_config = ServerConfig {
             runtime: Arc::clone(&runtime),
             index_tracker: Arc::new(Tracker::from_persisted(Vec::new(), runtime)),

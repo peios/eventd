@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{BoundedQueue, Shard};
@@ -12,8 +12,8 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::config::{Config, SharedConfig};
 use crate::health::{self, Store};
-use crate::log_ingest::LogMaintenance;
-use crate::metric_ingest::MetricMaintenance;
+use crate::log_ingest::{LogMaintenance, LogMaintenanceSender};
+use crate::metric_ingest::{MetricMaintenance, MetricMaintenanceSender};
 use crate::writer::{EventMaintenance, WriterMessage};
 
 #[derive(Debug, Clone, Copy)]
@@ -44,8 +44,8 @@ pub fn run(
     runtime: SharedConfig,
     mut stores: Stores,
     event_queues: Arc<[BoundedQueue<WriterMessage>]>,
-    log_sender: Sender<LogMaintenance>,
-    metric_sender: Sender<MetricMaintenance>,
+    log_sender: LogMaintenanceSender,
+    metric_sender: MetricMaintenanceSender,
     boot_id: [u8; 16],
     stopping: Arc<AtomicBool>,
     requested: Arc<AtomicBool>,
@@ -168,8 +168,8 @@ fn pass(
     stores: &Stores,
     event_queues: &[BoundedQueue<WriterMessage>],
     historical_shards: &mut [Shard],
-    log_sender: &Sender<LogMaintenance>,
-    metric_sender: &Sender<MetricMaintenance>,
+    log_sender: &LogMaintenanceSender,
+    metric_sender: &MetricMaintenanceSender,
     boot_id: &[u8; 16],
     stopping: &AtomicBool,
 ) -> Result<(), String> {
@@ -265,7 +265,7 @@ fn retain_events(
 fn retain_logs(
     current: Current<'_>,
     path: &Path,
-    log_sender: &Sender<LogMaintenance>,
+    log_sender: &LogMaintenanceSender,
     stopping: &AtomicBool,
     now: i64,
 ) -> Result<(), String> {
@@ -291,7 +291,7 @@ fn retain_logs(
 fn retain_metrics(
     current: Current<'_>,
     path: &Path,
-    metric_sender: &Sender<MetricMaintenance>,
+    metric_sender: &MetricMaintenanceSender,
     stopping: &AtomicBool,
     now: i64,
 ) -> Result<(), String> {
@@ -445,7 +445,7 @@ fn event_command(
 }
 
 fn log_delete(
-    sender: &Sender<LogMaintenance>,
+    sender: &LogMaintenanceSender,
     older_than: Option<i64>,
     limit: usize,
 ) -> Result<usize, String> {
@@ -464,7 +464,7 @@ fn log_delete(
     Ok(deleted)
 }
 
-fn checkpoint_log(sender: &Sender<LogMaintenance>) -> Result<(), String> {
+fn checkpoint_log(sender: &LogMaintenanceSender) -> Result<(), String> {
     let (response, receiver) = sync_channel(1);
     sender
         .send(LogMaintenance::Checkpoint(response))
@@ -476,7 +476,7 @@ fn checkpoint_log(sender: &Sender<LogMaintenance>) -> Result<(), String> {
 }
 
 fn metric_delete(
-    sender: &Sender<MetricMaintenance>,
+    sender: &MetricMaintenanceSender,
     older_than: Option<i64>,
     limit: usize,
 ) -> Result<usize, String> {
@@ -495,7 +495,7 @@ fn metric_delete(
     Ok(deleted)
 }
 
-fn checkpoint_metric(sender: &Sender<MetricMaintenance>) -> Result<(), String> {
+fn checkpoint_metric(sender: &MetricMaintenanceSender) -> Result<(), String> {
     let (response, receiver) = sync_channel(1);
     sender
         .send(MetricMaintenance::Checkpoint(response))
@@ -580,11 +580,11 @@ fn cutoff(now: i64, age: Duration) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::mpsc::channel;
 
     use eventd_core::Pop;
 
     use super::*;
+    use crate::datagram::{Waker, waking_channel};
 
     fn temporary_directory() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -660,8 +660,8 @@ mod tests {
         let log_commits = Arc::new(CommitSignal::new());
         let ring_pressure: Arc<[AtomicU8]> = Arc::from([AtomicU8::new(0)]);
         let retention_requested = Arc::new(AtomicBool::new(false));
-        let (log_sender, log_commands) = channel();
-        let (metric_sender, metric_commands) = channel();
+        let (log_sender, log_commands) = waking_channel(log_socket.waker());
+        let (metric_sender, metric_commands) = waking_channel(metric_socket.waker());
         let (_rollup_sender, rollups) = std::sync::mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
@@ -819,8 +819,8 @@ mod tests {
         let directory = temporary_directory();
         let bad = directory.join("shard-0007.db");
         std::fs::write(&bad, b"not a sqlite database").unwrap();
-        let (log_sender, _log_commands) = channel();
-        let (metric_sender, _metric_commands) = channel();
+        let (log_sender, _log_commands) = waking_channel(Waker::new().unwrap());
+        let (metric_sender, _metric_commands) = waking_channel(Waker::new().unwrap());
         let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from(Vec::new());
         // It returns, rather than failing, once it has opened its shards.
         run(
@@ -908,7 +908,7 @@ mod tests {
                     }
                 });
             }
-            let (log_sender, log_commands) = channel();
+            let (log_sender, log_commands) = waking_channel(Waker::new().unwrap());
             scope.spawn(|| {
                 for command in log_commands {
                     match command {
@@ -932,7 +932,7 @@ mod tests {
                     }
                 }
             });
-            let (metric_sender, metric_commands) = channel();
+            let (metric_sender, metric_commands) = waking_channel(Waker::new().unwrap());
             scope.spawn(|| {
                 for command in metric_commands {
                     match command {

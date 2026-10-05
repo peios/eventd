@@ -12,8 +12,11 @@ use peios::msgpack::{Reader, Type};
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
-use crate::datagram::{IngestionSocket, Receive, SocketError};
+use crate::datagram::{IngestionSocket, Receive, SocketError, WakingSender};
 use crate::writer::WriterMessage;
+
+/// Maintenance for the log thread, which wakes it to take each command.
+pub type LogMaintenanceSender = WakingSender<LogMaintenance>;
 
 pub enum LogMaintenance {
     DeleteOldest {
@@ -504,12 +507,13 @@ impl From<LogStoreError> for LogIngestError {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::mpsc::{Sender, channel, sync_channel};
+    use std::sync::mpsc::{channel, sync_channel};
     use std::time::Duration;
 
     use peios::msgpack::Writer;
 
     use super::*;
+    use crate::datagram::waking_channel;
 
     /// One log thread over a host socket and a temporary store, with the
     /// handles the pipeline would hold.
@@ -651,7 +655,7 @@ mod tests {
     /// Round-trip a maintenance command. The log thread takes one after
     /// each receive, so its answer means every commit that receive led to
     /// has been signalled.
-    fn settle(maintenance: &Sender<LogMaintenance>) {
+    fn settle(maintenance: &LogMaintenanceSender) {
         let (response, answer) = sync_channel(1);
         maintenance
             .send(LogMaintenance::Checkpoint(response))
@@ -691,6 +695,33 @@ mod tests {
             Ok(0),
             &mut last_error
         ));
+    }
+
+    #[test]
+    fn an_idle_log_thread_takes_each_maintenance_command_at_once() {
+        let log = LogThread::new(5_000);
+        let socket = log.bind();
+        let store = log.open_store();
+        let (maintenance, commands) = waking_channel(socket.waker());
+        std::thread::scope(|scope| {
+            let (log, socket) = (&log, &socket);
+            let thread = scope.spawn(move || log.run(socket, store, &commands));
+            let _stopping = StopOnDrop(&log.stopping);
+            // Let the thread find the socket empty and settle into its wait.
+            settle(&maintenance);
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            for _ in 0..5 {
+                settle(&maintenance);
+            }
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_millis(500),
+                "five commands to an idle thread took {took:?}"
+            );
+            log.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+        });
     }
 
     #[test]
@@ -754,7 +785,7 @@ mod tests {
     fn a_log_batch_size_change_applies_only_to_later_transactions() {
         let log = LogThread::new(100);
         let socket = log.bind();
-        let (maintenance, commands) = channel();
+        let (maintenance, commands) = waking_channel(socket.waker());
         // 130 records: the first transaction commits at 100, and the next
         // opens with 30 under the same setting.
         log.send(130, "first");
