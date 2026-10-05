@@ -15,6 +15,7 @@ use peios::msgpack::{Reader, Type};
 
 use crate::config::{Config, SharedConfig};
 use crate::datagram::{IngestionSocket, SocketError, TokenReceive, Waker, WakingSender};
+use crate::pipeline::SyntheticReporter;
 use crate::query::DescriptorCache;
 use crate::write_security::{MetricPublishAuthorizer, MetricPublishError};
 use crate::writer::WriterMessage;
@@ -115,7 +116,7 @@ pub fn run(
     socket: &IngestionSocket,
     mut store: MetricStore,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    event_queues: &Arc<[BoundedQueue<WriterMessage>]>,
     runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     maintenance: &Receiver<MetricMaintenance>,
@@ -123,6 +124,9 @@ pub fn run(
     retention_requested: &Arc<AtomicBool>,
     descriptors: Arc<DescriptorCache>,
 ) -> Result<(), MetricIngestError> {
+    // Where a storage error found while running goes: dropped as the
+    // thread ends, on any path, once what it was handed is committed.
+    let error_events = &mut SyntheticReporter::new(Arc::clone(event_queues));
     crate::diagnostics::metric_series(store.cache_len());
     let (initial_batch_size, mut datagram_ceiling, authorization_cache_size) =
         Config::read(runtime, |config| {
@@ -405,7 +409,7 @@ fn process_rollups(
     limit_changed: bool,
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
 ) -> Result<bool, MetricIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) if max_rows != 0 => Some(command),
@@ -440,7 +444,7 @@ fn process_maintenance(
     receiver: &Receiver<MetricMaintenance>,
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
 ) -> Result<(), MetricIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) => command,
@@ -481,7 +485,7 @@ fn commit_batch(
     batch: &[MetricRecord],
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
     type_mismatch_reporter: &mut TypeMismatchReporter,
 ) -> Result<(), MetricIngestError> {
     match store.commit(batch) {
@@ -516,7 +520,7 @@ fn request_retention(requested: &AtomicBool, error: &MetricStoreError) {
 fn recover_corruption(
     store: &mut MetricStore,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
     error: &MetricStoreError,
 ) -> Result<(), MetricIngestError> {
     let description = error.to_string();
@@ -528,8 +532,11 @@ fn recover_corruption(
     Ok(())
 }
 
+/// Report a storage error as the daemon-wide `synthetic.storage_error`:
+/// shard 0, else the lowest-numbered shard that takes it (TRM §2.6),
+/// committed off this thread.
 fn emit_storage_error(
-    queue: &BoundedQueue<WriterMessage>,
+    reporter: &mut SyntheticReporter,
     boot_id: [u8; 16],
     store: &str,
     error: &str,
@@ -540,16 +547,9 @@ fn emit_storage_error(
         eprintln!("eventd: cannot timestamp {store} storage error");
         return;
     };
-    let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
-    match queue.reserve(core::mem::size_of::<WriterMessage>()) {
-        Ok(permit) => permit.publish(WriterMessage::Synthetic(
-            crate::synthetic::storage_error(boot_id, store, None, error, timestamp),
-            sender,
-        )),
-        Err(queue_error) => {
-            eprintln!("eventd: cannot enqueue {store} storage error: {queue_error}");
-        }
-    }
+    reporter.report(crate::synthetic::storage_error(
+        boot_id, store, None, error, timestamp,
+    ));
 }
 
 pub fn parse_datagram(
@@ -993,7 +993,7 @@ mod tests {
         runtime: SharedConfig,
         stopping: Arc<AtomicBool>,
         retention_requested: Arc<AtomicBool>,
-        error_events: BoundedQueue<WriterMessage>,
+        error_events: Arc<[BoundedQueue<WriterMessage>]>,
     }
 
     impl MetricThread {
@@ -1015,7 +1015,7 @@ mod tests {
                 runtime: config.shared(),
                 stopping: Arc::new(AtomicBool::new(false)),
                 retention_requested: Arc::new(AtomicBool::new(false)),
-                error_events: BoundedQueue::new(16, 1 << 20).unwrap(),
+                error_events: Arc::from([BoundedQueue::new(16, 1 << 20).unwrap()]),
             }
         }
 
