@@ -16,7 +16,7 @@ use crate::commit_signal::CommitSignal;
 use crate::config::{Config, ConfigWatch, HANDOFF_BYTES, HANDOFF_SLOTS, STRIPE_LENGTH};
 use crate::datagram::{IngestionSocket, Protection};
 use crate::directory::StoreDirectory;
-use crate::indexing::{PolicyMessage, Tracker};
+use crate::indexing::{PolicyMessage, SequenceCheckpoint, Tracker};
 use crate::kmes::{self, DrainContext};
 use crate::query::{DescriptorCache, QueryServer, ServerConfig};
 use crate::writer::WriterMessage;
@@ -665,22 +665,30 @@ fn supervise(
             first_error.get_or_insert_with(|| error.to_string());
         }
     }
-    match realtime_nanoseconds() {
-        Ok(timestamp) => {
-            let (sender, receiver) = sync_channel(1);
-            if index_policy
-                .send(PolicyMessage::Checkpoint {
+    let timestamp = realtime_nanoseconds();
+    // The final policy run, then the sequence checkpoints once policy
+    // activity has stopped (TRM §3.5), then the policy thread exits.
+    let (sender, receiver) = sync_channel(1);
+    if index_policy
+        .send(PolicyMessage::Stop {
+            checkpoint: timestamp
+                .as_ref()
+                .ok()
+                .map(|&updated_at| SequenceCheckpoint {
                     boot_id,
                     sequences: sequences.clone(),
-                    updated_at: timestamp,
-                    reply: sender,
-                })
-                .is_err()
-            {
-                first_error.get_or_insert_with(|| "index policy thread stopped".to_owned());
-            } else if let Ok(Err(error)) = receiver.recv() {
-                first_error.get_or_insert(error);
-            }
+                    updated_at,
+                }),
+            reply: sender,
+        })
+        .is_err()
+    {
+        first_error.get_or_insert_with(|| "index policy thread stopped".to_owned());
+    } else if let Ok(Err(error)) = receiver.recv() {
+        first_error.get_or_insert(error);
+    }
+    match timestamp {
+        Ok(timestamp) => {
             let shutdown = crate::synthetic::shutdown(boot_id, &sequences, timestamp);
             if let Err(error) = commit_synthetic_fallback(queues, &shutdown) {
                 eprintln!("eventd: cannot persist synthetic.shutdown: {error}");
@@ -697,12 +705,6 @@ fn supervise(
     }
     for writer in event_writers {
         join_worker(writer, &mut first_error);
-    }
-    let (sender, receiver) = sync_channel(1);
-    if index_policy.send(PolicyMessage::Stop(sender)).is_ok()
-        && let Ok(Err(error)) = receiver.recv()
-    {
-        first_error.get_or_insert(error);
     }
     join_worker(index_handle, &mut first_error);
     drop(mapped_rings);
