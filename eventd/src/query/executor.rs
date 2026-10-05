@@ -2092,9 +2092,10 @@ impl<'q> Groups<'q> {
         Ok(())
     }
 
-    /// The result rows: `COUNT BY` and `TOP N BY` by count descending,
-    /// `DISTINCT` by value, `GROUP` in the order its groups appeared.
-    fn finish(self) -> Result<Vec<Row>, QueryError> {
+    /// The result rows: `COUNT BY`, `TOP N BY` and `GROUP … COUNT` by
+    /// count descending, `DISTINCT` by value, any other `GROUP` in the
+    /// order its groups appeared.
+    fn finish(mut self) -> Result<Vec<Row>, QueryError> {
         let records = match self.aggregate {
             RecordAggregate::CountBy(field) => counted(field, self.seen, None),
             RecordAggregate::TopBy { count, field } => counted(field, self.seen, Some(*count)),
@@ -2111,6 +2112,22 @@ impl<'q> Groups<'q> {
                     .collect()
             }
             RecordAggregate::Group { fields, function } => {
+                // Counted groups come by count descending, then TAKE (TRM
+                // §6.4); ties go by the group keys in GROUP order under the
+                // value ordering, as COUNT BY's do (PSPU §3.21). Distinct
+                // groups differ in some key, so the order is total.
+                if matches!(function, GroupFunction::Count) {
+                    self.seen.sort_by(|left, right| {
+                        right.count.cmp(&left.count).then_with(|| {
+                            left.keys
+                                .iter()
+                                .zip(&right.keys)
+                                .map(|(left, right)| language_cmp(left, right))
+                                .find(|ordering| ordering.is_ne())
+                                .unwrap_or(Ordering::Equal)
+                        })
+                    });
+                }
                 let mut records = Vec::with_capacity(self.seen.len());
                 for group in self.seen {
                     let (name, value) = match function {
@@ -5550,6 +5567,22 @@ mod tests {
                 groups.push((keys, vec![row]));
             }
         }
+        if let RecordAggregate::Group {
+            function: GroupFunction::Count,
+            ..
+        } = aggregate
+        {
+            groups.sort_by(|left, right| {
+                right.1.len().cmp(&left.1.len()).then_with(|| {
+                    left.0
+                        .iter()
+                        .zip(&right.0)
+                        .map(|(left, right)| language_cmp(left, right))
+                        .find(|ordering| ordering.is_ne())
+                        .unwrap_or(Ordering::Equal)
+                })
+            });
+        }
         let records: Vec<Record> = match aggregate {
             RecordAggregate::CountBy(field) | RecordAggregate::TopBy { field, .. } => {
                 let mut counted: Vec<_> = groups
@@ -5858,6 +5891,70 @@ mod tests {
         assert_eq!(budget.used.load(AtomicOrdering::Acquire), HELD_GRANULE);
         drop(first);
         assert_eq!(budget.used.load(AtomicOrdering::Acquire), 0);
+    }
+
+    // PEI-1295, TRM §6.4: GROUP … COUNT's groups are sorted by count
+    // descending and then taken, whatever order they were read in; ties
+    // go by the group keys under the value ordering (PSPU §3.21).
+    #[test]
+    fn grouped_counts_come_by_count_descending_then_key_whatever_the_read_order() {
+        let grouped = |query: &str, values: &[(&str, i64)]| {
+            let query = crate::query_language::parse(query).unwrap();
+            let budget = budget(usize::MAX);
+            let mut held = Held::new(&budget);
+            let mut groups = Groups::new(query.aggregate.as_ref().unwrap());
+            for (index, (v, w)) in values.iter().enumerate() {
+                let row = Row {
+                    record: BTreeMap::from([
+                        ("v".into(), Value::String((*v).into())),
+                        ("w".into(), Value::Signed(*w)),
+                    ]),
+                    identifier: "t".into(),
+                    at: 0,
+                    tie: Tie::Single(i64::try_from(index).unwrap()),
+                };
+                groups.add(&row, &mut held).unwrap();
+            }
+            let mut rows = groups.finish().unwrap();
+            apply_record_sort(&mut rows, &query);
+            apply_pagination(&mut rows, &query);
+            rows.iter()
+                .map(|row| {
+                    let Some(Value::String(v)) = row.record.get("v") else {
+                        panic!("a group has its key")
+                    };
+                    let w = match row.record.get("w") {
+                        Some(Value::Signed(w)) => format!("{w}"),
+                        _ => String::new(),
+                    };
+                    format!("{v}{w}")
+                })
+                .collect::<Vec<_>>()
+        };
+        // a once, b three times, c twice, d once; a and d tie, d read first.
+        let read = [
+            ("d", 0),
+            ("a", 0),
+            ("b", 0),
+            ("c", 0),
+            ("b", 0),
+            ("c", 0),
+            ("b", 0),
+        ];
+        assert_eq!(grouped("EVENTS GROUP v COUNT", &read), ["b", "c", "a", "d"]);
+        let mut reversed = read;
+        reversed.reverse();
+        assert_eq!(
+            grouped("EVENTS GROUP v COUNT", &reversed),
+            ["b", "c", "a", "d"]
+        );
+        assert_eq!(grouped("EVENTS GROUP v COUNT TAKE 2", &read), ["b", "c"]);
+        // Two keys: ties go by the first, then the second.
+        let read = [("b", 2), ("a", 2), ("b", 1), ("a", 1), ("a", 1)];
+        assert_eq!(
+            grouped("EVENTS GROUP v, w COUNT", &read),
+            ["a1", "a2", "b1", "b2"]
+        );
     }
 
     #[test]
