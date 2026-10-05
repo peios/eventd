@@ -12,7 +12,7 @@ use eventd_core::BoundedQueue;
 use peios::registry::{Key, KeyAccess, NotifyFilter, OpenFlags, ValueRecord, ValueType};
 
 use crate::indexing::PolicyMessage;
-use crate::writer::{WriterMessage, WriterMessage::Synthetic};
+use crate::writer::WriterMessage;
 
 const ROOT_KEY: &str = r"Machine\System\eventd";
 
@@ -135,17 +135,26 @@ impl Config {
         reason = "the registry schema remains visible as one configuration literal"
     )]
     fn from_values(values: &HashMap<Vec<u8>, ValueRecord>) -> Result<Self, ConfigError> {
-        let adaptive_index_create_threshold = u64::from(dword(
+        let mut adaptive_index_create_threshold = u64::from(dword(
             values,
             b"AdaptiveIndexCreateThreshold",
             100,
             10,
             10_000,
         ));
-        let adaptive_index_drop_threshold =
+        let mut adaptive_index_drop_threshold =
             u64::from(dword(values, b"AdaptiveIndexDropThreshold", 10, 1, 1_000));
+        // A reload keeps the pair already in use when the new pair is out of
+        // relation; it reaches here already corrected. At startup the pair
+        // in use is the defaults, so the same rule keeps those.
         if adaptive_index_drop_threshold >= adaptive_index_create_threshold {
-            return Err(ConfigError::Invalid(b"AdaptiveIndexDropThreshold"));
+            eprintln!(
+                "eventd: ignoring AdaptiveIndexDropThreshold {adaptive_index_drop_threshold} \
+                 with AdaptiveIndexCreateThreshold {adaptive_index_create_threshold}: the drop \
+                 threshold must be below the create threshold; using 10 and 100"
+            );
+            adaptive_index_create_threshold = 100;
+            adaptive_index_drop_threshold = 10;
         }
 
         Ok(Self {
@@ -902,14 +911,14 @@ impl ConfigWatch {
         stopping: &AtomicBool,
         forced: &AtomicBool,
         boot_id: [u8; 16],
-        event_queue: &BoundedQueue<WriterMessage>,
+        event_queues: &[BoundedQueue<WriterMessage>],
         retention_requested: &AtomicBool,
         index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
     ) {
         apply_reload(
             shared,
             boot_id,
-            event_queue,
+            event_queues,
             retention_requested,
             index_policy,
         );
@@ -924,7 +933,7 @@ impl ConfigWatch {
                     apply_reload(
                         shared,
                         boot_id,
-                        event_queue,
+                        event_queues,
                         retention_requested,
                         index_policy,
                     );
@@ -939,7 +948,7 @@ impl ConfigWatch {
                                 apply_reload(
                                     shared,
                                     boot_id,
-                                    event_queue,
+                                    event_queues,
                                     retention_requested,
                                     index_policy,
                                 );
@@ -950,7 +959,7 @@ impl ConfigWatch {
                                     apply_reload(
                                         shared,
                                         boot_id,
-                                        event_queue,
+                                        event_queues,
                                         retention_requested,
                                         index_policy,
                                     );
@@ -1010,7 +1019,7 @@ fn watch_ready(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool, std::io::Err
 fn apply_reload(
     shared: &SharedConfig,
     boot_id: [u8; 16],
-    queue: &BoundedQueue<WriterMessage>,
+    queues: &[BoundedQueue<WriterMessage>],
     retention_requested: &AtomicBool,
     index_policy: &std::sync::mpsc::SyncSender<PolicyMessage>,
 ) {
@@ -1033,15 +1042,7 @@ fn apply_reload(
     let _ = index_policy.try_send(PolicyMessage::Recompute);
     for change in changes {
         let event = crate::synthetic::config_change(boot_id, &change, realtime_nanoseconds());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let result = queue
-            .reserve(core::mem::size_of::<WriterMessage>())
-            .map(|permit| permit.publish(Synthetic(event, sender)));
-        if let Err(error) = result {
-            eprintln!("eventd: cannot enqueue configuration change: {error}");
-            continue;
-        }
-        if let Ok(Err(error)) = receiver.recv() {
+        if let Err(error) = crate::pipeline::commit_synthetic_fallback(queues, &event) {
             eprintln!("eventd: cannot persist configuration change: {error}");
         }
     }
@@ -1233,6 +1234,49 @@ mod tests {
         assert_eq!(
             required_path(&values, b"EventStorePath").unwrap(),
             PathBuf::from("/var/state/eventd/events/")
+        );
+    }
+
+    #[test]
+    fn a_threshold_pair_out_of_relation_at_startup_keeps_the_defaults() {
+        let mut values = Config::test_defaults().raw_values;
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 500),
+        );
+        let config = Config::from_values(&values).expect("a tuning pair does not fail startup");
+        assert_eq!(config.adaptive_index_create_threshold, 100);
+        assert_eq!(config.adaptive_index_drop_threshold, 10);
+
+        values.insert(
+            b"AdaptiveIndexCreateThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexCreateThreshold", 50),
+        );
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 50),
+        );
+        let config = Config::from_values(&values).expect("equal thresholds do not fail startup");
+        assert_eq!(
+            (
+                config.adaptive_index_create_threshold,
+                config.adaptive_index_drop_threshold
+            ),
+            (100, 10)
+        );
+
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 20),
+        );
+        let config = Config::from_values(&values).expect("configuration");
+        assert_eq!(
+            (
+                config.adaptive_index_create_threshold,
+                config.adaptive_index_drop_threshold
+            ),
+            (50, 20),
+            "a pair in relation is used as configured"
         );
     }
 
