@@ -165,27 +165,41 @@ pub fn run(
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
+        // The latency cap holds whatever arrives: datagrams that yield no
+        // sample never reach the commit check below, and never empty the
+        // queue either.
+        if open.is_some_and(|(started, _, latency_cap)| started.elapsed() >= latency_cap) {
+            commit_batch(
+                &mut store,
+                &batch,
+                retention_requested,
+                boot_id,
+                error_events,
+                &mut type_mismatch_reporter,
+            )?;
+            batch.clear();
+            open = None;
+        }
         let idle = match socket.receive_token(&mut buffer)? {
             TokenReceive::Datagram {
                 length,
                 token: Some(token),
             } => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(mut records) =
-                    parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
-                else {
-                    continue;
-                };
-                if !admit_authorized(
-                    authorizer.authorize(&token, &mut records),
-                    &mut last_authorization_error,
-                ) {
-                    continue;
-                }
+                // An unusable or refused datagram yields nothing and goes
+                // on, like any other, to the maintenance step.
+                let records = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                    .and_then(|mut records| {
+                        admit_authorized(
+                            authorizer.authorize(&token, &mut records),
+                            &mut last_authorization_error,
+                        )
+                        .then_some(records)
+                    })
+                    .unwrap_or_default();
                 for record in records {
-                    let (started, size_cap, latency_cap) = *open.get_or_insert_with(|| {
-                        (Instant::now(), max_batch_size, max_batch_latency)
-                    });
+                    let (started, size_cap, latency_cap) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, max_batch_latency));
                     batch.push(record);
                     if batch_is_due(
                         batch.len(),
@@ -277,9 +291,8 @@ pub fn run(
                     continue;
                 }
                 for record in records {
-                    let (_, size_cap, _) = *open.get_or_insert_with(|| {
-                        (Instant::now(), max_batch_size, Duration::MAX)
-                    });
+                    let (_, size_cap, _) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, Duration::MAX));
                     batch.push(record);
                     if batch.len() >= size_cap {
                         commit_batch(
