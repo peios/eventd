@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{BoundedQueue, LogRecord, LogStore, LogStoreError};
 use peios::msgpack::{Reader, Type};
@@ -45,7 +45,10 @@ pub fn run(
     });
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(initial_batch_size);
-    let mut started = None;
+    // The open transaction: when its first record arrived, and the size and
+    // latency caps in force then. A live change to either bounds only the
+    // transactions opened after it (TRM §8.3).
+    let mut open: Option<(Instant, usize, Duration)> = None;
     while !stopping.load(Ordering::Acquire) {
         let (max_batch_size, max_batch_latency, checkpoint_pages, next_ceiling) =
             Config::read(runtime, |config| {
@@ -62,19 +65,33 @@ pub fn run(
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
+        // The latency cap holds whatever arrives: datagrams that yield no
+        // record never reach the commit check below, and never empty the
+        // queue either.
+        if open.is_some_and(|(started, _, latency_cap)| started.elapsed() >= latency_cap) {
+            commit_batch(
+                &mut store,
+                &batch,
+                commits,
+                retention_requested,
+                boot_id,
+                error_events,
+            )?;
+            batch.clear();
+            open = None;
+        }
         match socket.receive(&mut buffer)? {
             Receive::Datagram(length) => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(records) = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
-                else {
-                    continue;
-                };
+                // An unusable datagram yields nothing and goes on, like any
+                // other, to the maintenance step.
+                let records = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                    .unwrap_or_default();
                 for record in records {
-                    started.get_or_insert_with(Instant::now);
+                    let (started, size_cap, latency_cap) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, max_batch_latency));
                     batch.push(record);
-                    if batch.len() == max_batch_size
-                        || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
-                    {
+                    if batch.len() >= size_cap || started.elapsed() >= latency_cap {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -84,7 +101,7 @@ pub fn run(
                             error_events,
                         )?;
                         batch.clear();
-                        started = None;
+                        open = None;
                     }
                 }
             }
@@ -100,7 +117,7 @@ pub fn run(
                     error_events,
                 )?;
                 batch.clear();
-                started = None;
+                open = None;
             }
         }
         process_maintenance(
@@ -111,6 +128,8 @@ pub fn run(
             error_events,
         )?;
     }
+    // The queue left at shutdown drains without the latency cap, the open
+    // transaction keeping the size cap it began with.
     loop {
         let max_batch_size = Config::read(runtime, |config| config.log_max_batch_size);
         match socket.receive(&mut buffer)? {
@@ -121,8 +140,10 @@ pub fn run(
                     continue;
                 };
                 for record in records {
+                    let (_, size_cap, _) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, Duration::MAX));
                     batch.push(record);
-                    if batch.len() == max_batch_size {
+                    if batch.len() >= size_cap {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -132,6 +153,7 @@ pub fn run(
                             error_events,
                         )?;
                         batch.clear();
+                        open = None;
                     }
                 }
             }
@@ -672,8 +694,63 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PEI-1315: log_ingest::run rereads LogMaxBatchSize for every datagram, so a change \
-                rebounds the transaction already open"]
+    fn a_transaction_commits_at_its_latency_while_only_unusable_datagrams_arrive() {
+        let log = LogThread::new(5_000);
+        log.runtime.write().unwrap().log_max_batch_latency = Duration::from_millis(100);
+        let socket = log.bind();
+        let store = log.open_store();
+        let (_maintenance, commands) = channel();
+        // Well-formed MessagePack that is not a record: slow for the thread
+        // to validate and quick to send, so blocked senders refill the
+        // receive queue faster than it drains and no receive finds it empty.
+        let mut writer = Writer::new();
+        writer.write_array(50_000);
+        for _ in 0..50_000 {
+            writer.write_uint(1);
+        }
+        let unusable = writer.to_bytes().unwrap();
+        let flood_over = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (log, socket) = (&log, &socket);
+            let thread = scope.spawn(move || log.run(socket, store, &commands));
+            let _stopping = StopOnDrop(&log.stopping);
+            let flooders: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+                        sender
+                            .set_write_timeout(Some(Duration::from_millis(100)))
+                            .unwrap();
+                        while !flood_over.load(Ordering::Acquire) {
+                            let _ = sender.send_to(&unusable, &log.socket_path);
+                        }
+                    })
+                })
+                .collect();
+            let _flood_over = StopOnDrop(&flood_over);
+            std::thread::sleep(Duration::from_millis(100));
+            // One record opens a transaction in the middle of the flood.
+            log.send(1, "under the flood");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while log.commits.generation() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let committed = log.commits.generation();
+            flood_over.store(true, Ordering::Release);
+            for flooder in flooders {
+                flooder.join().unwrap();
+            }
+            assert_eq!(
+                committed, 1,
+                "the transaction committed at LogMaxBatchLatencyMs, while the flood went on"
+            );
+            log.wait_for_stored(1);
+            log.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
     fn a_log_batch_size_change_applies_only_to_later_transactions() {
         let log = LogThread::new(100);
         let socket = log.bind();

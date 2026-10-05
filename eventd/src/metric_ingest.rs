@@ -105,7 +105,10 @@ pub fn run(
     let mut authorizer = MetricPublishAuthorizer::new(descriptors, authorization_cache_size);
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(initial_batch_size);
-    let mut started = None;
+    // The open transaction: when its first sample arrived, and the size and
+    // latency caps in force then. A live change to either bounds only the
+    // transactions opened after it (TRM §8.3).
+    let mut open: Option<(Instant, usize, Duration)> = None;
     let mut last_authorization_error = None;
     let mut type_mismatch_reporter = TypeMismatchReporter::default();
     let mut applied_rollup_max_rows = None;
@@ -153,7 +156,7 @@ pub fn run(
                 &mut type_mismatch_reporter,
             )?;
             batch.clear();
-            started = None;
+            open = None;
         }
         store.configure(checkpoint_pages, cache_size);
         authorizer.configure(next_authorization_cache_size);
@@ -162,31 +165,47 @@ pub fn run(
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
+        // The latency cap holds whatever arrives: datagrams that yield no
+        // sample never reach the commit check below, and never empty the
+        // queue either.
+        if open.is_some_and(|(started, _, latency_cap)| started.elapsed() >= latency_cap) {
+            commit_batch(
+                &mut store,
+                &batch,
+                retention_requested,
+                boot_id,
+                error_events,
+                &mut type_mismatch_reporter,
+            )?;
+            batch.clear();
+            open = None;
+        }
         let idle = match socket.receive_token(&mut buffer)? {
             TokenReceive::Datagram {
                 length,
                 token: Some(token),
             } => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(mut records) =
-                    parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
-                else {
-                    continue;
-                };
-                if !admit_authorized(
-                    authorizer.authorize(&token, &mut records),
-                    &mut last_authorization_error,
-                ) {
-                    continue;
-                }
+                // An unusable or refused datagram yields nothing and goes
+                // on, like any other, to the maintenance step.
+                let records = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                    .and_then(|mut records| {
+                        admit_authorized(
+                            authorizer.authorize(&token, &mut records),
+                            &mut last_authorization_error,
+                        )
+                        .then_some(records)
+                    })
+                    .unwrap_or_default();
                 for record in records {
-                    started.get_or_insert_with(Instant::now);
+                    let (started, size_cap, latency_cap) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, max_batch_latency));
                     batch.push(record);
                     if batch_is_due(
                         batch.len(),
-                        max_batch_size,
-                        started,
-                        max_batch_latency,
+                        size_cap,
+                        Some(started),
+                        latency_cap,
                         Instant::now(),
                     ) {
                         commit_batch(
@@ -198,7 +217,7 @@ pub fn run(
                             &mut type_mismatch_reporter,
                         )?;
                         batch.clear();
-                        started = None;
+                        open = None;
                     }
                 }
                 false
@@ -225,7 +244,7 @@ pub fn run(
                     &mut type_mismatch_reporter,
                 )?;
                 batch.clear();
-                started = None;
+                open = None;
                 true
             }
         };
@@ -250,6 +269,8 @@ pub fn run(
             applied_rollup_max_rows = Some(rollup_max_rows);
         }
     }
+    // The queue left at shutdown drains without the latency cap, the open
+    // transaction keeping the size cap it began with.
     loop {
         let max_batch_size = Config::read(runtime, |config| config.metric_max_batch_size);
         match socket.receive_token(&mut buffer)? {
@@ -270,8 +291,10 @@ pub fn run(
                     continue;
                 }
                 for record in records {
+                    let (_, size_cap, _) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, Duration::MAX));
                     batch.push(record);
-                    if batch.len() == max_batch_size {
+                    if batch.len() >= size_cap {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -281,6 +304,7 @@ pub fn run(
                             &mut type_mismatch_reporter,
                         )?;
                         batch.clear();
+                        open = None;
                     }
                 }
             }
@@ -337,7 +361,7 @@ fn batch_is_due(
     max_batch_latency: Duration,
     now: Instant,
 ) -> bool {
-    samples == max_batch_size
+    samples >= max_batch_size
         || started.is_some_and(|time| now.duration_since(time) >= max_batch_latency)
 }
 
@@ -959,6 +983,9 @@ mod tests {
         ));
         // The size cap closes a batch whatever the clock says.
         assert!(batch_is_due(5_000, 5_000, Some(first), latency, first));
+        // A batch already past the cap it is measured against closes too,
+        // rather than growing until the queue empties.
+        assert!(batch_is_due(5_001, 5_000, Some(first), latency, first));
     }
 
     #[test]
