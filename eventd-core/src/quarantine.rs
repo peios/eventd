@@ -69,6 +69,97 @@ fn database_at(path: &Path, timestamp: u128) -> Result<PathBuf, std::io::Error> 
     Ok(append(path, &suffix))
 }
 
+/// Byte-for-byte copies of a database's `-wal` and `-shm`, taken before any
+/// connection opens it.
+///
+/// Opening runs `SQLite` against the sidecars: it rebuilds the `-shm`, and
+/// when the failed connection closes it deletes both. Quarantine after a
+/// failed open therefore moves these copies, not whatever the attempt left.
+/// Dropping the value discards the copies.
+pub struct Preserved {
+    path: PathBuf,
+    sidecars: Vec<(PathBuf, Saved)>,
+    failure: Option<String>,
+}
+
+enum Saved {
+    /// The sidecar did not exist before the open.
+    Absent,
+    /// The sidecar's contents as they were before the open.
+    Taken(PathBuf),
+    /// Copying failed; the sidecar is quarantined as the open left it.
+    Failed,
+}
+
+impl Preserved {
+    /// Copy whichever sidecars exist. Best effort: a copy that fails, on a
+    /// full disk say, must not itself stop the store opening, so it is
+    /// recorded and reported only if the store turns out to need quarantine.
+    pub fn take(path: &Path) -> Self {
+        let mut failure = None;
+        let sidecars = ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let source = sidecar(path, suffix);
+                let copy = append(&source, ".preserved");
+                let state = match std::fs::copy(&source, &copy) {
+                    Ok(_) => Saved::Taken(copy),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Saved::Absent,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&copy);
+                        failure = Some(format!(
+                            "{} could not be preserved before opening: {error}",
+                            source.display()
+                        ));
+                        Saved::Failed
+                    }
+                };
+                (source, state)
+            })
+            .collect();
+        Self {
+            path: path.to_owned(),
+            sidecars,
+            failure,
+        }
+    }
+
+    /// Put the sidecars back as they were before the open, then quarantine
+    /// all three. Returns a note when a sidecar could not be preserved.
+    pub fn quarantine(mut self) -> Result<Option<String>, std::io::Error> {
+        for (source, state) in &mut self.sidecars {
+            match std::mem::replace(state, Saved::Absent) {
+                Saved::Taken(copy) => std::fs::rename(copy, &*source)?,
+                // Anything there now was made by the failed open.
+                Saved::Absent => match std::fs::remove_file(&*source) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error);
+                    }
+                    _ => {}
+                },
+                Saved::Failed => {}
+            }
+        }
+        database(&self.path)?;
+        Ok(self.failure.take())
+    }
+}
+
+/// The recovery reason for a quarantine, with any preservation note.
+pub fn reason(error: &dyn std::fmt::Display, note: Option<String>) -> String {
+    note.map_or_else(|| error.to_string(), |note| format!("{error} ({note})"))
+}
+
+impl Drop for Preserved {
+    fn drop(&mut self) {
+        for (_, state) in &self.sidecars {
+            if let Saved::Taken(copy) = state {
+                let _ = std::fs::remove_file(copy);
+            }
+        }
+    }
+}
+
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     append(path, suffix)
 }
