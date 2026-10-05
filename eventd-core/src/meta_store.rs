@@ -72,25 +72,52 @@ impl MetaStore {
 
     /// Open the reconstructible database, replacing malformed state with defaults.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, MetaStoreError> {
+        Self::open_recovering(path, checkpoint_pages).map(|(store, _)| store)
+    }
+
+    /// Open the database, replacing malformed state with defaults, and say
+    /// why when an existing database was thrown away (§3.5).
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        checkpoint_pages: u32,
+    ) -> Result<(Self, Option<String>), MetaStoreError> {
         let path = path.as_ref();
         let existed = path.try_exists().map_err(MetaStoreError::Io)?;
-        let mut connection = open_connection(path)?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
-        } else if validate_schema(&connection).is_err() {
-            drop(connection);
-            remove_database(path)?;
-            connection = open_connection(path)?;
-            connection.execute_batch(CREATE_SCHEMA)?;
-        }
+        let mut recreated = None;
+        let connection = match open_connection(path) {
+            // No schema at all, as a power cut leaves a database whose
+            // creating transaction never reached the disk, is new too.
+            Ok(connection) if !existed || is_empty(&connection)? => {
+                connection.execute_batch(CREATE_SCHEMA)?;
+                connection
+            }
+            Ok(connection) => match validate_schema(&connection) {
+                Ok(()) => connection,
+                Err(error) => {
+                    recreated = Some(error.to_string());
+                    drop(connection);
+                    recreate(path)?
+                }
+            },
+            // A file SQLite cannot read at all is as invalid as one with a
+            // bad schema, and as reconstructible.
+            Err(error) if existed && error.is_corruption() => {
+                recreated = Some(error.to_string());
+                recreate(path)?
+            }
+            Err(error) => return Err(error),
+        };
         validate_schema(&connection)?;
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-        Ok(Self {
-            connection,
-            path: path.to_owned(),
-            checkpoint_pages,
-            page_size,
-        })
+        Ok((
+            Self {
+                connection,
+                path: path.to_owned(),
+                checkpoint_pages,
+                page_size,
+            },
+            recreated,
+        ))
     }
 
     /// Persist diagnostic sequence coverage after all event writers have flushed.
@@ -272,6 +299,19 @@ fn validate_schema(connection: &Connection) -> Result<(), MetaStoreError> {
     Ok(())
 }
 
+fn is_empty(connection: &Connection) -> Result<bool, MetaStoreError> {
+    let objects: i64 =
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    Ok(objects == 0)
+}
+
+fn recreate(path: &Path) -> Result<Connection, MetaStoreError> {
+    remove_database(path)?;
+    let connection = open_connection(path)?;
+    connection.execute_batch(CREATE_SCHEMA)?;
+    Ok(connection)
+}
+
 fn remove_database(path: &Path) -> Result<(), MetaStoreError> {
     remove_if_present(path)?;
     for suffix in ["-wal", "-shm"] {
@@ -317,6 +357,20 @@ pub enum MetaStoreError {
     UnknownVersion(Vec<u8>),
     /// A u64 cannot be represented by `SQLite`'s signed integer.
     IntegerRange,
+}
+
+impl MetaStoreError {
+    /// Whether `SQLite` has declared the database image corrupt.
+    const fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    }
 }
 
 impl fmt::Display for MetaStoreError {
@@ -367,6 +421,57 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn a_file_sqlite_cannot_read_is_recreated() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        std::fs::write(&path, "this is not a database ".repeat(400)).unwrap();
+        let store = MetaStore::open(&path, 1_000).unwrap();
+        assert_eq!(store.load_index_state().unwrap(), (vec![], vec![]));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_recreation_is_reported_and_a_creation_or_valid_open_is_not() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recreated, None, "a database created where none was");
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(
+            recreated, None,
+            "a database whose creation a power cut took"
+        );
+        drop(store);
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recreated, None, "a valid database");
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM meta WHERE key = 'schema_version';")
+            .unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert!(
+            recreated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("schema_version")),
+            "{recreated:?}"
+        );
+        drop(store);
+        std::fs::write(&path, "this is not a database ".repeat(400)).unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert!(recreated.is_some());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
