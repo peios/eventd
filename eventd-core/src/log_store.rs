@@ -104,6 +104,7 @@ impl LogStore {
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=NORMAL;\
              PRAGMA wal_autocheckpoint=0;\
+             PRAGMA journal_size_limit=0;\
              PRAGMA temp_store=MEMORY;",
         )?;
         match crate::schema::contents(&connection)? {
@@ -223,6 +224,9 @@ impl LogStore {
         Ok(())
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), LogStoreError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -520,6 +524,35 @@ mod tests {
             message: message.into(),
             job_id: None,
         }
+    }
+
+    /// The WAL header's salt, which changes whenever a writer restarts the
+    /// log after a checkpoint.
+    fn wal_salt(path: &Path) -> Vec<u8> {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::read(PathBuf::from(wal)).unwrap()[16..24].to_vec()
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        let mut store = LogStore::open(&path, 10).unwrap();
+        let big: Vec<_> = (0..100).map(|_| record(&"m".repeat(500))).collect();
+        let first = wal_salt(&path);
+        while wal_salt(&path) == first {
+            store.commit(&big).unwrap();
+        }
+        // The log has been checkpointed and restarted. Small commits far
+        // below the threshold must now leave it alone.
+        store.commit(&[record("one")]).unwrap();
+        let restarted = wal_salt(&path);
+        store.commit(&[record("two")]).unwrap();
+        store.commit(&[record("three")]).unwrap();
+        assert_eq!(wal_salt(&path), restarted);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

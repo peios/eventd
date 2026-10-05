@@ -112,6 +112,7 @@ impl Shard {
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=FULL;\
              PRAGMA wal_autocheckpoint=0;\
+             PRAGMA journal_size_limit=0;\
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
@@ -563,6 +564,9 @@ impl Shard {
         &self.path
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), ShardError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -1105,6 +1109,50 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("shard-0000.db.corrupt.")
         }));
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The WAL header's salt, which changes whenever a writer restarts the
+    /// log after a checkpoint.
+    fn wal_salt(path: &Path) -> Vec<u8> {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::read(PathBuf::from(wal)).unwrap()[16..24].to_vec()
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 10).unwrap();
+        let mut sequence = 0;
+        let mut batch = |count: u64| -> Vec<IngestItem> {
+            (0..count)
+                .map(|_| {
+                    sequence += 1;
+                    let mut item = event(sequence, "example.test");
+                    item.event.payload = [0xc4, 200].into_iter().chain([0; 200]).collect();
+                    item
+                })
+                .collect()
+        };
+        let first = wal_salt(&path);
+        while wal_salt(&path) == first {
+            shard.commit(&batch(100)).unwrap();
+        }
+        shard.commit(&batch(1)).unwrap();
+        let restarted = wal_salt(&path);
+        shard.commit(&batch(1)).unwrap();
+        shard
+            .commit_synthetic(&SyntheticEvent {
+                boot_id: [1; 16],
+                timestamp: 1,
+                event_type: "synthetic.startup".into(),
+                payload: [0x80].into(),
+            })
+            .unwrap();
+        assert_eq!(wal_salt(&path), restarted);
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }
