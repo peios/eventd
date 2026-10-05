@@ -166,6 +166,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let queues = handoff_queues(shard_count)?;
     let stopping = Arc::new(AtomicBool::new(false));
+    // The log and metric threads stop later than the rest: they go on
+    // reading their sockets through shutdown step 1 (TRM §8.4).
+    let ingest_stopping = Arc::new(AtomicBool::new(false));
     let descriptors = Arc::new(DescriptorCache::new());
     let descriptor_thread_cache = Arc::clone(&descriptors);
     let descriptor_thread_stopping = Arc::clone(&stopping);
@@ -231,7 +234,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(|error| error.to_string())
         })?;
-    let log_stopping = Arc::clone(&stopping);
+    let log_stopping = Arc::clone(&ingest_stopping);
     let log_runtime = Arc::clone(&runtime);
     let log_writer_commits = Arc::clone(&log_commits);
     let log_retention_requested = Arc::clone(&retention_requested);
@@ -254,7 +257,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(|error| error.to_string())
         })?;
-    let metric_stopping = Arc::clone(&stopping);
+    let metric_stopping = Arc::clone(&ingest_stopping);
     let metric_runtime = Arc::clone(&runtime);
     let metric_retention_requested = Arc::clone(&retention_requested);
     let (metric_maintenance_sender, metric_maintenance_receiver) =
@@ -441,6 +444,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_handle,
         &queues,
         &stopping,
+        &ingest_stopping,
         query_server,
         log_socket,
         metric_socket,
@@ -600,6 +604,7 @@ fn supervise(
     config_handle: JoinHandle<Result<(), String>>,
     queues: &[BoundedQueue<WriterMessage>],
     stopping: &Arc<AtomicBool>,
+    ingest_stopping: &AtomicBool,
     query_server: Arc<QueryServer>,
     log_socket: Arc<IngestionSocket>,
     metric_socket: Arc<IngestionSocket>,
@@ -645,6 +650,14 @@ fn supervise(
     join_worker(query_handle, &mut first_error);
     join_worker(descriptor_handle, &mut first_error);
     join_worker(config_handle, &mut first_error);
+    // Step 2. Until now the log and metric threads have gone on reading
+    // the descriptors behind their unlinked paths, through every query
+    // handler's end, as an earlier connection may still send (TRM §8.4).
+    // Each now shuts its socket for reading, drains what is queued and
+    // commits it.
+    ingest_stopping.store(true, Ordering::Release);
+    log_socket.waker().wake();
+    metric_socket.waker().wake();
     join_worker(log_handle, &mut first_error);
     join_worker(metric_handle, &mut first_error);
     drop(query_server);

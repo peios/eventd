@@ -132,7 +132,12 @@ pub fn run(
         )?;
     }
     // The queue left at shutdown drains without the latency cap, the open
-    // transaction keeping the size cap it began with.
+    // transaction keeping the size cap it began with. The socket is shut
+    // for reading first, so the drain ends with nothing left to arrive: a
+    // later sender is refused and keeps its datagram (peinit replays the
+    // records to the next eventd), rather than having it queued behind the
+    // drain and freed unread when the descriptor closes.
+    socket.shut_for_reading()?;
     loop {
         let max_batch_size = Config::read(runtime, |config| config.log_max_batch_size);
         match socket.receive(&mut buffer)? {
@@ -722,6 +727,30 @@ mod tests {
             log.stopping.store(true, Ordering::Release);
             thread.join().unwrap().unwrap();
         });
+    }
+
+    // PEI-1297: a datagram that arrived after the final drain was queued on
+    // a descriptor nothing read again, and freed unread when it closed,
+    // while its sender counted it as delivered.
+    #[test]
+    fn once_the_log_thread_has_drained_its_socket_a_send_is_refused_not_lost() {
+        let log = LogThread::new(5_000);
+        let socket = log.bind();
+        let store = log.open_store();
+        let (_maintenance, commands) = channel();
+        // Connected before the stop, as peinit's forwarding socket is.
+        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        sender.connect(&log.socket_path).unwrap();
+        log.send(2, "before the stop");
+        log.stopping.store(true, Ordering::Release);
+        log.run(&socket, store, &commands).unwrap();
+        assert_eq!(log.stored(), 2, "what was queued at the stop is stored");
+        let refused = sender.send(b"after the drain").unwrap_err();
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::EPIPE),
+            "a send after the drain is refused, so the sender keeps it: {refused}"
+        );
     }
 
     #[test]
