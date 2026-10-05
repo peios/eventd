@@ -242,7 +242,7 @@ fn open_connection(path: &Path) -> Result<Connection, MetaStoreError> {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    connection.busy_timeout(std::time::Duration::ZERO)?;
+    crate::writer_lock::configure(&connection)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;\
          PRAGMA synchronous=NORMAL;\

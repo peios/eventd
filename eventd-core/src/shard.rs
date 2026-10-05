@@ -109,7 +109,7 @@ impl Shard {
         // Until the shard is verified, closing must not checkpoint the WAL
         // into a database that may be quarantined (§3.3).
         connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        connection.busy_timeout(std::time::Duration::ZERO)?;
+        crate::writer_lock::configure(&connection)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=FULL;\
@@ -1703,6 +1703,66 @@ mod tests {
         );
         assert!(!index_exists(&shard, &name));
         drop(other);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_commit_waits_out_a_write_lock_held_for_a_moment() {
+        // A query connection that catches the wal-index header mid-update
+        // takes the write lock to read it again (PEI-1359). Another
+        // connection's IMMEDIATE transaction holds the same lock here, and
+        // releases it only once the writer is about to commit, so the commit
+        // usually begins while the lock is held.
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        for sequence in 1..=20 {
+            let (held_sender, held) = std::sync::mpsc::channel();
+            let (release, release_receiver) = std::sync::mpsc::channel();
+            let path = &path;
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let holder = Connection::open(path).unwrap();
+                    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    held_sender.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                    holder.execute_batch("ROLLBACK").unwrap();
+                });
+                held.recv().unwrap();
+                release.send(()).unwrap();
+                shard.commit(&[event(sequence, "example.kind")]).unwrap();
+            });
+        }
+        let committed: i64 = shard
+            .connection
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(committed, 20);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_commit_fails_once_the_write_lock_is_held_past_its_bounded_wait() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        let error = shard.commit(&[event(1, "example.kind")]).unwrap_err();
+        assert!(
+            matches!(&error, ShardError::Sql(cause)
+                if cause.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)),
+            "{error}"
+        );
+        assert!(started.elapsed() >= crate::writer_lock::WRITER_LOCK_WAIT);
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        shard.commit(&[event(1, "example.kind")]).unwrap();
+        drop(holder);
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -6141,8 +6141,9 @@ mod tests {
             authorizer_without_kacs(Arc::new(super::super::security::DescriptorCache::new()));
         let query = crate::query_language::parse("EVENTS").unwrap();
 
-        // The writer commits throughout, never waiting: its connection has
-        // no busy timeout, so a lock the query held would fail a commit.
+        // The writer commits throughout. Its connection waits for the write
+        // lock only for the moment a reader re-reading the wal-index header
+        // holds it, so a lock the query held any longer would fail a commit.
         let writer = std::thread::spawn(move || {
             for sequence in 2..=500 {
                 shard.commit(&ingest_items(sequence..=sequence)).unwrap();

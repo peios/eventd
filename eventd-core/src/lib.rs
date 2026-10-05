@@ -14,6 +14,7 @@ pub mod reconcile;
 pub mod routing;
 mod schema;
 pub mod shard;
+mod writer_lock;
 
 pub use boot_id::{BootId, BootIdError};
 pub use field::{field_guid, payload_index_name, valid_field_path};
