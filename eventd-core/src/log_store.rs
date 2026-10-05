@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::Guid;
+use crate::schema::Contents;
 
 const CREATE_SCHEMA: &str = r"
+BEGIN IMMEDIATE;
 CREATE TABLE logs (
     id INTEGER PRIMARY KEY,
     boot_id BLOB NOT NULL,
@@ -31,6 +33,7 @@ CREATE INDEX idx_logs_job_id ON logs(job_id) WHERE job_id IS NOT NULL;
 INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+COMMIT;
 ";
 
 /// One validated log record ready for storage.
@@ -85,7 +88,6 @@ impl LogStore {
     /// Open or create `logs.db` and verify schema version one.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, LogStoreError> {
         let path = path.as_ref();
-        let existed = path.try_exists().map_err(LogStoreError::Io)?;
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -99,8 +101,10 @@ impl LogStore {
              PRAGMA wal_autocheckpoint=0;\
              PRAGMA temp_store=MEMORY;",
         )?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
+        match crate::schema::contents(&connection)? {
+            Contents::Empty => connection.execute_batch(CREATE_SCHEMA)?,
+            Contents::Unrecognised => return Err(LogStoreError::UnrecognisedContents),
+            Contents::Store => {}
         }
         validate_schema(&connection)?;
         let known_origins = {
@@ -275,6 +279,8 @@ pub enum LogStoreError {
     InvalidSchema(&'static str),
     /// Unsupported schema version.
     UnknownVersion(String),
+    /// Schema objects without the metadata entries of a log store.
+    UnrecognisedContents,
     /// Retention batch size exceeds `SQLite`'s integer range.
     IntegerRange,
 }
@@ -290,7 +296,8 @@ impl LogStoreError {
         )
     }
 
-    /// Whether `SQLite` has declared the database image corrupt.
+    /// Whether `SQLite` has declared the database image corrupt, or it holds
+    /// contents that are not a log store at all.
     #[must_use]
     pub const fn is_corruption(&self) -> bool {
         matches!(
@@ -300,7 +307,7 @@ impl LogStoreError {
                     error.code,
                     rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
                 )
-        )
+        ) || matches!(self, Self::UnrecognisedContents)
     }
 }
 
@@ -312,6 +319,9 @@ impl fmt::Display for LogStoreError {
             Self::InvalidSchema(reason) => write!(formatter, "invalid log-store schema: {reason}"),
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported log-store schema {version}")
+            }
+            Self::UnrecognisedContents => {
+                formatter.write_str("unrecognised log-store contents: no metadata entries")
             }
             Self::IntegerRange => {
                 formatter.write_str("log retention batch size exceeds SQLite range")
@@ -325,7 +335,10 @@ impl std::error::Error for LogStoreError {
         match self {
             Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::InvalidSchema(_) | Self::UnknownVersion(_) | Self::IntegerRange => None,
+            Self::InvalidSchema(_)
+            | Self::UnknownVersion(_)
+            | Self::UnrecognisedContents
+            | Self::IntegerRange => None,
         }
     }
 }
@@ -438,6 +451,84 @@ mod tests {
             .unwrap();
         assert_eq!(first_attempts, 2);
         drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// What a power cut leaves of a store whose creating transaction never
+    /// reached the disk: a WAL-mode header page and no schema.
+    fn schemaless(path: &Path) {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 4096);
+    }
+
+    fn quarantined(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn a_store_whose_creation_was_lost_is_created_afresh() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        schemaless(&path);
+        let (mut store, recovery) = LogStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recovery, None);
+        store
+            .commit(&[LogRecord {
+                boot_id: [1; 16],
+                timestamp: 10,
+                origin: "test.origin".into(),
+                is_error: false,
+                message: "after the cut".into(),
+                job_id: None,
+            }])
+            .unwrap();
+        assert!(quarantined(&directory).is_empty());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partly_created_store_is_quarantined_but_a_missing_schema_version_fails() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        // Prefixes of a statement-at-a-time creation: tables without the
+        // metadata table, and the metadata table without its entries.
+        for partial in [
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY);\
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        ] {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(partial)
+                .unwrap();
+            let before = quarantined(&directory).len();
+            let (store, recovery) = LogStore::open_recovering(&path, 1_000).unwrap();
+            assert!(recovery.is_some(), "{partial}");
+            assert_eq!(quarantined(&directory).len(), before + 1, "{partial}");
+            drop(store);
+            std::fs::remove_file(&path).unwrap();
+        }
+        // A store whose metadata survives but lacks schema_version is a
+        // store with a bad schema: startup fails, nothing is quarantined.
+        drop(LogStore::open(&path, 1_000).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM metadata WHERE key = 'schema_version';")
+            .unwrap();
+        let before = quarantined(&directory).len();
+        assert!(matches!(
+            LogStore::open_recovering(&path, 1_000),
+            Err(LogStoreError::InvalidSchema(_))
+        ));
+        assert_eq!(quarantined(&directory).len(), before);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
