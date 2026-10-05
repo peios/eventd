@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 
 use peios::file::SecInfo;
 use peios::msgpack::{Reader, Type, Writer};
-use peios::security::{Sid, sddl};
+use peios::security::{SecurityDescriptor, Sid, sddl};
 
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
+use crate::datagram::{occupant, remove_stale, unlink_if_owned};
+use crate::directory::grants_as_required;
 use crate::health::{self, Failure, Refusal};
 use crate::indexing::{PolicyMessage, Tracker};
 use crate::metric_ingest::RollupSender;
@@ -113,36 +115,33 @@ pub struct QueryServer {
 
 impl QueryServer {
     pub fn bind(path: &Path) -> Result<Self, QuerySocketError> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => {
-                std::fs::remove_file(path).map_err(QuerySocketError::Io)?;
+        Self::bind_with(path, establish_protection)
+    }
+
+    /// Bind, establishing the socket's descriptor through `establish`.
+    fn bind_with(
+        path: &Path,
+        establish: impl Fn(&Path) -> Result<(), QuerySocketError>,
+    ) -> Result<Self, QuerySocketError> {
+        // Read and removed as the log and metric sockets are (`datagram.rs`):
+        // a stale socket whose descriptor an operator narrowed can be
+        // neither `lstat`ed nor unlinked by eventd until it is reclaimed.
+        match occupant(path).map_err(QuerySocketError::Io)? {
+            Some(metadata) if metadata.file_type().is_socket() => {
+                remove_stale(path, || establish(path).is_ok()).map_err(QuerySocketError::Io)?;
             }
-            Ok(_) => return Err(QuerySocketError::Occupied(path.to_owned())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(QuerySocketError::Io(error)),
+            Some(_) => return Err(QuerySocketError::Occupied(path.to_owned())),
+            None => {}
         }
         let listener = UnixListener::bind(path).map_err(QuerySocketError::Io)?;
         listener
             .set_nonblocking(true)
             .map_err(QuerySocketError::Io)?;
-        let metadata = std::fs::symlink_metadata(path).map_err(QuerySocketError::Io)?;
+        let metadata = occupant(path)
+            .map_err(QuerySocketError::Io)?
+            .ok_or_else(|| QuerySocketError::Io(std::io::ErrorKind::NotFound.into()))?;
 
-        let descriptor = sddl::parse(QUERY_SOCKET_SDDL).map_err(QuerySocketError::Peios)?;
-        peios::file::set_sd(
-            None,
-            path,
-            SecInfo::DACL,
-            &descriptor,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-        .map_err(QuerySocketError::Peios)?;
-        let actual = peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(QuerySocketError::Peios)?;
-        let actual = sddl::format(actual.as_bytes()).map_err(QuerySocketError::Peios)?;
-        let expected = sddl::format(descriptor.as_bytes()).map_err(QuerySocketError::Peios)?;
-        if actual != expected {
-            return Err(QuerySocketError::Protection(path.to_owned()));
-        }
+        establish(path)?;
         Ok(Self {
             listener,
             path: path.to_owned(),
@@ -242,12 +241,39 @@ impl Drop for QueryServer {
     }
 }
 
-fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
-    }) {
-        let _ = std::fs::remove_file(path);
+fn establish_protection(path: &Path) -> Result<(), QuerySocketError> {
+    establish_protection_with(
+        path,
+        |path, descriptor| {
+            peios::file::set_sd(
+                None,
+                path,
+                SecInfo::DACL,
+                descriptor,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        |path| peios::file::get_sd(None, path, SecInfo::DACL, libc::AT_SYMLINK_NOFOLLOW),
+    )
+}
+
+/// Set the query socket's descriptor through `set`, read it back through
+/// `get`, and refuse the socket unless it grants what was set — compared
+/// as access, as the store directory's is (`directory.rs`).
+fn establish_protection_with(
+    path: &Path,
+    set: impl FnOnce(&Path, &SecurityDescriptor) -> peios::Result<()>,
+    get: impl FnOnce(&Path) -> peios::Result<SecurityDescriptor>,
+) -> Result<(), QuerySocketError> {
+    let descriptor = sddl::parse(QUERY_SOCKET_SDDL).map_err(QuerySocketError::Peios)?;
+    set(path, &descriptor).map_err(QuerySocketError::Peios)?;
+    let actual = get(path).map_err(QuerySocketError::Peios)?;
+    if !grants_as_required(actual.as_bytes(), descriptor.as_bytes())
+        .map_err(QuerySocketError::Peios)?
+    {
+        return Err(QuerySocketError::Protection(path.to_owned()));
     }
+    Ok(())
 }
 
 #[allow(
@@ -925,5 +951,65 @@ mod tests {
         let descriptor = sddl::parse(QUERY_SOCKET_SDDL).expect("valid descriptor");
         let text = sddl::format(descriptor.as_bytes()).expect("formats");
         assert!(text.contains(";AU)"), "{text}");
+    }
+
+    fn socket_directory(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eventd-query-test-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    // PEI-1297: like the metric socket's, a stale query socket whose
+    // descriptor an operator narrowed made eventd unstartable.
+    #[test]
+    fn a_stale_query_socket_eventd_may_not_delete_is_reclaimed_and_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = socket_directory("reclaim");
+        let path = directory.join("query.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let set_mode = |mode| {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // The directory refuses the unlink, as a socket whose descriptor
+        // was narrowed past eventd's DELETE does where the directory does
+        // not grant FILE_DELETE_CHILD. Putting eventd's own descriptor back
+        // is what returns the right; the stand-in returns it here.
+        set_mode(0o555);
+        let result = QueryServer::bind_with(&path, |_| {
+            set_mode(0o755);
+            Ok(())
+        });
+        set_mode(0o755);
+        let server = result.unwrap();
+        UnixStream::connect(&path).unwrap();
+        drop(server);
+        assert!(
+            !path.exists(),
+            "the socket eventd bound is unlinked as it goes"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // As for the store directory (PEI-1316): a descriptor applied with GA
+    // may read back with the generic bits mapped to file rights.
+    #[test]
+    fn a_query_socket_descriptor_read_back_with_mapped_generic_rights_is_accepted() {
+        let path = Path::new("/nonexistent/query.sock");
+        let read_back = |stored: &'static str| {
+            establish_protection_with(path, |_, _| Ok(()), move |_| sddl::parse(stored))
+        };
+        read_back("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FW;;;AU)").unwrap();
+        assert!(matches!(
+            read_back("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FA;;;AU)"),
+            Err(QuerySocketError::Protection(_))
+        ));
     }
 }
