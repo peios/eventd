@@ -195,6 +195,9 @@ impl MetaStore {
         self.checkpoint_if_needed()
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), MetaStoreError> {
         let bytes = sidecar_size(&self.path, "-wal")?;
         if bytes / self.page_size.max(1) >= u64::from(self.checkpoint_pages) {
@@ -217,6 +220,7 @@ fn open_connection(path: &Path) -> Result<Connection, MetaStoreError> {
         "PRAGMA journal_mode=WAL;\
          PRAGMA synchronous=NORMAL;\
          PRAGMA wal_autocheckpoint=0;\
+         PRAGMA journal_size_limit=0;\
          PRAGMA temp_store=MEMORY;",
     )?;
     Ok(connection)
@@ -350,6 +354,54 @@ impl From<rusqlite::Error> for MetaStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_directory() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eventd-meta-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        let mut store = MetaStore::open(&path, 10).unwrap();
+        let wal = directory.join("eventd-meta.db-wal");
+        let wal_salt = || std::fs::read(&wal).unwrap()[16..24].to_vec();
+        let counters = |count: usize| -> Vec<IndexCounter> {
+            (0..count)
+                .map(|index| IndexCounter {
+                    field_path: format!("field.{index}.{}", "x".repeat(200)),
+                    query_count: 1,
+                    window_start: 1,
+                })
+                .collect()
+        };
+        let first = wal_salt();
+        while wal_salt() == first {
+            store.write_index_state(&counters(100), &[]).unwrap();
+        }
+        // Replacing a hundred counters by one rewrites enough pages to cross
+        // the threshold again; after that the writes are small.
+        store.write_index_state(&counters(1), &[]).unwrap();
+        store.write_index_state(&counters(1), &[]).unwrap();
+        let restarted = wal_salt();
+        store.write_index_state(&counters(1), &[]).unwrap();
+        store
+            .write_sequence_checkpoints(&[1; 16], &[(0, 1)], 1)
+            .unwrap();
+        assert_eq!(wal_salt(), restarted);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn recreates_malformed_metadata_and_writes_checkpoints() {

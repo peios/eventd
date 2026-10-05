@@ -226,6 +226,7 @@ impl MetricStore {
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=NORMAL;\
              PRAGMA wal_autocheckpoint=0;\
+             PRAGMA journal_size_limit=0;\
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
@@ -458,6 +459,9 @@ impl MetricStore {
         Ok(())
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), MetricStoreError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -972,6 +976,34 @@ mod tests {
                 "{name} in {quarantined:?}"
             );
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let mut store = MetricStore::open(&path, 10, 1_000).unwrap();
+        let wal = directory.join("metrics.db-wal");
+        let wal_salt = || std::fs::read(&wal).unwrap()[16..24].to_vec();
+        let batch = |count: usize| -> Vec<MetricRecord> {
+            (0..count)
+                .map(|index| MetricRecord {
+                    labels: format!("core={index},pad={}", "x".repeat(100)).into(),
+                    ..record(MetricType::Gauge, MetricValue::Number(1.0))
+                })
+                .collect()
+        };
+        let first = wal_salt();
+        while wal_salt() == first {
+            store.commit(&batch(100)).unwrap();
+        }
+        store.commit(&batch(1)).unwrap();
+        let restarted = wal_salt();
+        store.commit(&batch(1)).unwrap();
+        store.commit(&batch(1)).unwrap();
+        assert_eq!(wal_salt(), restarted);
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
