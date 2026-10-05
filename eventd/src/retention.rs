@@ -54,16 +54,18 @@ pub fn run(
         &mut stores.historical_event_paths,
         initial.checkpoint_pages,
     );
+    let mut backoff = Duration::ZERO;
     while wait_interval(
         &stopping,
         &requested,
         Config::read(&runtime, |config| config.retention_interval),
+        backoff,
     ) {
         let config = Config::read(&runtime, retention_config);
         for shard in &mut historical_shards {
             shard.set_checkpoint_pages(config.checkpoint_pages);
         }
-        if let Err(error) = pass(
+        match pass(
             &config,
             &stores,
             &event_queues,
@@ -73,10 +75,32 @@ pub fn run(
             &boot_id,
             &stopping,
         ) {
-            eprintln!("eventd: retention pass failed and will be retried: {error}");
+            Ok(()) => backoff = Duration::ZERO,
+            Err(error) => {
+                backoff = next_backoff(backoff);
+                eprintln!(
+                    "eventd: retention pass failed and will be retried in {}s: {error}",
+                    backoff.as_secs()
+                );
+            }
         }
     }
     Ok(())
+}
+
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+const LONGEST_RETRY: Duration = Duration::from_mins(1);
+
+/// How long to hold off requested passes after another failed one. A pass
+/// that fails for want of space asks for another itself (the writers'
+/// capacity errors request retention), so without this it would retry
+/// every 100 ms for as long as the disk stayed full.
+fn next_backoff(previous: Duration) -> Duration {
+    if previous.is_zero() {
+        FIRST_RETRY
+    } else {
+        previous.saturating_mul(2).min(LONGEST_RETRY)
+    }
 }
 
 /// Open each historical shard read-write, as its one writer. A shard that
@@ -114,15 +138,25 @@ const fn retention_config(config: &Config) -> RetentionConfig {
     }
 }
 
-fn wait_interval(stopping: &AtomicBool, requested: &AtomicBool, interval: Duration) -> bool {
-    let mut remaining = interval;
+/// Wait for the next pass: `interval`, or sooner on request, but no request
+/// is taken until `hold` has passed. A request made during the hold is kept
+/// and runs the pass when the hold ends.
+fn wait_interval(
+    stopping: &AtomicBool,
+    requested: &AtomicBool,
+    interval: Duration,
+    hold: Duration,
+) -> bool {
+    let total = interval.max(hold);
+    let mut waited = Duration::ZERO;
     while !stopping.load(Ordering::Acquire) {
-        if requested.swap(false, Ordering::AcqRel) || remaining.is_zero() {
+        if waited >= total || (waited >= hold && requested.swap(false, Ordering::AcqRel)) {
             return true;
         }
-        let sleep = remaining.min(Duration::from_millis(100));
+        let until = if waited < hold { hold } else { total };
+        let sleep = until.saturating_sub(waited).min(Duration::from_millis(100));
         std::thread::sleep(sleep);
-        remaining = remaining.saturating_sub(sleep);
+        waited = waited.saturating_add(sleep);
     }
     false
 }
@@ -142,6 +176,50 @@ fn pass(
     stopping: &AtomicBool,
 ) -> Result<(), String> {
     let now = realtime_nanoseconds()?;
+    // Each store is retained independently: one that fails (a full disk
+    // under the event store, say) must not keep retention, the only lever
+    // that frees space, from the others (§9.2).
+    let failures: Vec<_> = [
+        (
+            "event",
+            retain_events(
+                config,
+                stores,
+                event_queues,
+                historical_shards,
+                boot_id,
+                stopping,
+                now,
+            ),
+        ),
+        (
+            "log",
+            retain_logs(config, &stores.log_path, log_sender, stopping, now),
+        ),
+        (
+            "metric",
+            retain_metrics(config, &stores.metric_path, metric_sender, stopping, now),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(store, result)| result.err().map(|error| format!("{store} store: {error}")))
+    .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn retain_events(
+    config: &RetentionConfig,
+    stores: &Stores,
+    event_queues: &[BoundedQueue<WriterMessage>],
+    historical_shards: &mut [Shard],
+    boot_id: &[u8; 16],
+    stopping: &AtomicBool,
+    now: i64,
+) -> Result<(), String> {
     retain_event_age(
         event_queues,
         cutoff(now, config.event_age)?,
@@ -177,7 +255,16 @@ fn pass(
             stopping,
         )?;
     }
+    Ok(())
+}
 
+fn retain_logs(
+    config: &RetentionConfig,
+    path: &Path,
+    log_sender: &Sender<LogMaintenance>,
+    stopping: &AtomicBool,
+    now: i64,
+) -> Result<(), String> {
     retain_log_age(
         log_sender,
         cutoff(now, config.log_age)?,
@@ -186,8 +273,7 @@ fn pass(
     )?;
     checkpoint_log(log_sender)?;
     if config.log_max_bytes != 0 {
-        while logical_live_size(&stores.log_path)? > config.log_max_bytes
-            && !stopping.load(Ordering::Acquire)
+        while logical_live_size(path)? > config.log_max_bytes && !stopping.load(Ordering::Acquire)
         {
             if log_delete(log_sender, None, config.batch_rows)? == 0 {
                 break;
@@ -195,7 +281,16 @@ fn pass(
             checkpoint_log(log_sender)?;
         }
     }
+    Ok(())
+}
 
+fn retain_metrics(
+    config: &RetentionConfig,
+    path: &Path,
+    metric_sender: &Sender<MetricMaintenance>,
+    stopping: &AtomicBool,
+    now: i64,
+) -> Result<(), String> {
     retain_metric_age(
         metric_sender,
         cutoff(now, config.metric_age)?,
@@ -204,7 +299,7 @@ fn pass(
     )?;
     checkpoint_metric(metric_sender)?;
     if config.metric_max_bytes != 0 {
-        while logical_live_size(&stores.metric_path)? > config.metric_max_bytes
+        while logical_live_size(path)? > config.metric_max_bytes
             && !stopping.load(Ordering::Acquire)
         {
             if metric_delete(metric_sender, None, config.batch_rows)? == 0 {
@@ -761,18 +856,27 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn a_pass_processes_events_then_logs_then_metrics() {
-        let config = RetentionConfig {
+    fn age_only(batch_rows: usize) -> RetentionConfig {
+        RetentionConfig {
             event_age: Duration::from_hours(24),
             event_max_bytes: 0,
             log_age: Duration::from_hours(24),
             log_max_bytes: 0,
             metric_age: Duration::from_hours(24),
             metric_max_bytes: 0,
-            batch_rows: 100,
+            batch_rows,
             checkpoint_pages: 1_000,
-        };
+        }
+    }
+
+    /// Run one pass against two stub event writers and stub log and metric
+    /// writers. Each stub records what reached it, in arrival order (as
+    /// "events 0: DeleteBefore", "logs: Checkpoint", …), and answers with
+    /// `answer` for that arrival.
+    fn pass_against_stubs(
+        config: &RetentionConfig,
+        answer: impl Fn(&str) -> Result<usize, String> + Sync,
+    ) -> (Result<(), String>, Vec<String>) {
         let stores = Stores {
             event_paths: Vec::new(),
             historical_event_paths: Vec::new(),
@@ -782,11 +886,13 @@ mod tests {
         let queues: Vec<BoundedQueue<WriterMessage>> = (0..2)
             .map(|_| BoundedQueue::new(16, 1 << 20).unwrap())
             .collect();
-        // Stub writers: each records what reached it, in arrival order, and
-        // answers that nothing was deleted.
         let arrivals = Mutex::new(Vec::new());
-        let arrived = |what: String| arrivals.lock().unwrap().push(what);
-        std::thread::scope(|scope| {
+        let arrived = |what: String| {
+            let result = answer(&what);
+            arrivals.lock().unwrap().push(what);
+            result
+        };
+        let result = std::thread::scope(|scope| {
             for (index, queue) in queues.iter().enumerate() {
                 let arrived = &arrived;
                 scope.spawn(move || {
@@ -799,8 +905,9 @@ mod tests {
                             EventMaintenance::DeleteBoot { .. } => "DeleteBoot",
                             EventMaintenance::Checkpoint => "Checkpoint",
                         };
-                        arrived(format!("events {index}: {kind}"));
-                        response.send(Ok(0)).unwrap();
+                        response
+                            .send(arrived(format!("events {index}: {kind}")))
+                            .unwrap();
                     }
                 });
             }
@@ -809,12 +916,14 @@ mod tests {
                 for command in log_commands {
                     match command {
                         LogMaintenance::DeleteOldest { response, .. } => {
-                            arrived("logs: DeleteOldest".to_owned());
-                            response.send(Ok(0)).unwrap();
+                            response
+                                .send(arrived("logs: DeleteOldest".to_owned()))
+                                .unwrap();
                         }
                         LogMaintenance::Checkpoint(response) => {
-                            arrived("logs: Checkpoint".to_owned());
-                            response.send(Ok(0)).unwrap();
+                            response
+                                .send(arrived("logs: Checkpoint".to_owned()))
+                                .unwrap();
                         }
                     }
                 }
@@ -824,18 +933,20 @@ mod tests {
                 for command in metric_commands {
                     match command {
                         MetricMaintenance::DeleteOldest { response, .. } => {
-                            arrived("metrics: DeleteOldest".to_owned());
-                            response.send(Ok(0)).unwrap();
+                            response
+                                .send(arrived("metrics: DeleteOldest".to_owned()))
+                                .unwrap();
                         }
                         MetricMaintenance::Checkpoint(response) => {
-                            arrived("metrics: Checkpoint".to_owned());
-                            response.send(Ok(0)).unwrap();
+                            response
+                                .send(arrived("metrics: Checkpoint".to_owned()))
+                                .unwrap();
                         }
                     }
                 }
             });
-            pass(
-                &config,
+            let result = pass(
+                config,
                 &stores,
                 &queues,
                 &mut [],
@@ -843,16 +954,91 @@ mod tests {
                 &metric_sender,
                 &[1; 16],
                 &AtomicBool::new(false),
-            )
-            .unwrap();
+            );
             for queue in &queues {
                 queue.close();
             }
             drop(log_sender);
             drop(metric_sender);
+            result
         });
+        (result, arrivals.into_inner().unwrap())
+    }
+
+    // PEI-1289: a full event store must not keep retention from the log
+    // and metric stores, the one lever that frees space elsewhere.
+    #[test]
+    fn a_failing_store_does_not_stop_the_pass_reaching_the_others() {
+        let (result, arrivals) = pass_against_stubs(&age_only(100), |arrival| {
+            if arrival.starts_with("events") {
+                Err("database or disk is full".to_owned())
+            } else {
+                Ok(0)
+            }
+        });
+        let error = result.expect_err("the event store's failure is reported");
+        assert!(error.contains("disk is full"), "{error}");
+        for reached in [
+            "logs: DeleteOldest",
+            "logs: Checkpoint",
+            "metrics: DeleteOldest",
+            "metrics: Checkpoint",
+        ] {
+            assert!(
+                arrivals.iter().any(|arrival| arrival == reached),
+                "{reached} in {arrivals:?}"
+            );
+        }
+    }
+
+    // PEI-1289: after a failed pass a request waits out a growing hold
+    // instead of running the next pass at once.
+    #[test]
+    fn a_request_after_a_failed_pass_waits_out_the_backoff() {
+        let stopping = AtomicBool::new(false);
+        let requested = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        assert!(wait_interval(
+            &stopping,
+            &requested,
+            Duration::from_hours(1),
+            Duration::ZERO
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "without a hold a request runs at once"
+        );
+
+        requested.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        assert!(wait_interval(
+            &stopping,
+            &requested,
+            Duration::from_hours(1),
+            Duration::from_millis(300)
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(1),
+            "the held request ran when the hold ended: {waited:?}"
+        );
+        assert!(!requested.load(Ordering::Acquire), "and was taken");
+
+        let mut backoff = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            backoff = next_backoff(backoff);
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn a_pass_processes_events_then_logs_then_metrics() {
+        let (result, arrivals) = pass_against_stubs(&age_only(100), |_| Ok(0));
+        result.unwrap();
         assert_eq!(
-            arrivals.into_inner().unwrap(),
+            arrivals,
             [
                 "events 0: DeleteBefore",
                 "events 1: DeleteBefore",
