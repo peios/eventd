@@ -728,7 +728,8 @@ fn diagnostic_dump(
     let (active_queries, streaming_queries) = query_server.counts();
     let (metric_series, log_ingress, metric_ingress, errors) = crate::diagnostics::snapshot();
     eprintln!("eventd diagnostic dump:");
-    eprintln!("  boot_id: {canonical_boot_id}");
+    // The dump names the boot as the kernel does in /proc, unbraced.
+    eprintln!("  boot_id: {}", canonical_boot_id.trim_matches(['{', '}']));
     eprintln!(
         "  shards: active={} historical_readable={}",
         active_paths.len(),
