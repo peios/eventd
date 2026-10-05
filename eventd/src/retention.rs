@@ -41,7 +41,7 @@ pub struct Stores {
 )]
 pub fn run(
     runtime: SharedConfig,
-    stores: Stores,
+    mut stores: Stores,
     event_queues: Arc<[BoundedQueue<WriterMessage>]>,
     log_sender: Sender<LogMaintenance>,
     metric_sender: Sender<MetricMaintenance>,
@@ -50,11 +50,10 @@ pub fn run(
     requested: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let initial = Config::read(&runtime, retention_config);
-    let mut historical_shards = stores
-        .historical_event_paths
-        .iter()
-        .map(|path| Shard::open(path, initial.checkpoint_pages).map_err(|error| error.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut historical_shards = open_historical(
+        &mut stores.historical_event_paths,
+        initial.checkpoint_pages,
+    );
     while wait_interval(
         &stopping,
         &requested,
@@ -78,6 +77,28 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// Open each historical shard read-write, as its one writer. A shard that
+/// will not open is left out of retention (and of `paths`, which retention
+/// measures) rather than failing the thread: a bad historical shard does not
+/// stop eventd (§3.3).
+fn open_historical(paths: &mut Vec<PathBuf>, checkpoint_pages: u32) -> Vec<Shard> {
+    let mut shards = Vec::with_capacity(paths.len());
+    paths.retain(|path| match Shard::open(path, checkpoint_pages) {
+        Ok(shard) => {
+            shards.push(shard);
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "eventd: excluding historical shard {} from retention: {error}",
+                path.display()
+            );
+            false
+        }
+    });
+    shards
 }
 
 const fn retention_config(config: &Config) -> RetentionConfig {
@@ -697,6 +718,46 @@ mod tests {
             log.join().unwrap().unwrap();
             metric.join().unwrap().unwrap();
         });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1297 item 5: a historical shard the pipeline admitted read-only
+    // can still fail Shard::open's read-write open. Retention returning Err
+    // for it would end the worker, and supervise() would stop eventd.
+    #[test]
+    fn a_historical_shard_that_will_not_open_read_write_does_not_stop_retention() {
+        let directory = temporary_directory();
+        let bad = directory.join("shard-0007.db");
+        std::fs::write(&bad, b"not a sqlite database").unwrap();
+        let (log_sender, _log_commands) = channel();
+        let (metric_sender, _metric_commands) = channel();
+        let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from(Vec::new());
+        let result = run(
+            Config::test_defaults().shared(),
+            Stores {
+                event_paths: Vec::new(),
+                historical_event_paths: vec![bad],
+                log_path: directory.join("logs.db"),
+                metric_path: directory.join("metrics.db"),
+            },
+            queues,
+            log_sender,
+            metric_sender,
+            [1; 16],
+            // Already stopping: run returns once it has opened its shards.
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(result, Ok(()));
+
+        // It is also left out of what retention measures.
+        let good = directory.join("shard-0008.db");
+        drop(Shard::open(&good, 1_000).unwrap());
+        let mut paths = vec![directory.join("shard-0007.db"), good.clone()];
+        let shards = open_historical(&mut paths, 1_000);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(paths, [good]);
+        drop(shards);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
