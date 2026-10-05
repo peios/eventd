@@ -266,10 +266,12 @@ impl Shard {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
-            [],
-        )?;
+        if !self.known_types.contains("synthetic.gap") {
+            transaction.execute(
+                "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
+                [],
+            )?;
+        }
         let receipt_rows;
         {
             let mut insert_gap = transaction.prepare_cached(
@@ -345,10 +347,12 @@ impl Shard {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
-            [event.event_type.as_ref()],
-        )?;
+        if !self.known_types.contains(event.event_type.as_ref()) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
+                [event.event_type.as_ref()],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO events (boot_id, timestamp, event_type, payload) \
              VALUES (?1, ?2, ?3, ?4)",
@@ -1043,6 +1047,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn synthetic_and_gap_commits_catalogue_a_type_only_while_it_is_unknown() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        // A BEFORE trigger fires for every row an INSERT OR IGNORE attempts,
+        // so it counts catalogue statements, not rows added.
+        shard
+            .connection
+            .execute_batch(
+                "CREATE TEMP TABLE type_inserts (event_type TEXT NOT NULL);\
+                 CREATE TEMP TRIGGER count_type_inserts BEFORE INSERT ON main.event_types \
+                 BEGIN INSERT INTO type_inserts(event_type) VALUES (NEW.event_type); END;",
+            )
+            .unwrap();
+        let startup = SyntheticEvent {
+            boot_id: [1; 16],
+            timestamp: 42,
+            event_type: "synthetic.startup".into(),
+            payload: [0x80].into(),
+        };
+        shard.commit_synthetic(&startup).unwrap();
+        shard.commit_synthetic(&startup).unwrap();
+        let gap = |first_sequence| Gap {
+            timestamp: 40,
+            first_sequence,
+            last_sequence: first_sequence,
+            preceding_timestamp: None,
+            revealing_timestamp: 60,
+        };
+        shard.commit_gaps(&[1; 16], &[(2, gap(4))]).unwrap();
+        shard.commit_gaps(&[1; 16], &[(2, gap(5))]).unwrap();
+        let attempts: Vec<(String, u32)> = {
+            let mut statement = shard
+                .connection
+                .prepare(
+                    "SELECT event_type, count(*) FROM type_inserts \
+                     GROUP BY event_type ORDER BY event_type",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            attempts,
+            [
+                ("synthetic.gap".to_owned(), 1),
+                ("synthetic.startup".to_owned(), 1)
+            ]
+        );
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }
