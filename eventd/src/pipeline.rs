@@ -61,10 +61,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let boot = eventd_core::BootId::read_kernel()?;
     let canonical_boot_id = boot.canonical();
     let boot_id = boot.into_bytes();
-    let meta_store = MetaStore::open(
+    let (meta_store, meta_recreated) = MetaStore::open_recovering(
         event_directory.child("eventd-meta.db"),
         config.wal_checkpoint_pages,
     )?;
+    if let Some(error) = meta_recreated {
+        eprintln!("eventd: recreated invalid metadata database from defaults: {error}");
+    }
     let (persisted_counters, persisted_desired) = meta_store.load_index_state()?;
     let index_tracker = Arc::new(Tracker::from_persisted(
         persisted_counters,

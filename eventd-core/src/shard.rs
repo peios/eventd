@@ -4,13 +4,16 @@ use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
+use crate::schema::Contents;
 use crate::{DesiredIndex, Gap, Guid, IngestItem, Interval, SyntheticEvent};
 
 const SCHEMA_VERSION: &str = "1";
 
 const CREATE_SCHEMA: &str = r"
+BEGIN IMMEDIATE;
 CREATE TABLE events (
     id INTEGER PRIMARY KEY,
     boot_id BLOB NOT NULL,
@@ -42,6 +45,7 @@ CREATE INDEX idx_events_timestamp ON events(timestamp);
 INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+COMMIT;
 ";
 
 /// The only read-write connection to one event shard.
@@ -49,6 +53,8 @@ pub struct Shard {
     connection: Connection,
     path: PathBuf,
     known_types: HashSet<Box<str>>,
+    /// Types a committed retention delete touched, awaiting an orphan check.
+    orphan_candidates: HashSet<Box<str>>,
     checkpoint_pages: u32,
     page_size: u64,
 }
@@ -78,11 +84,12 @@ impl Shard {
         checkpoint_pages: u32,
     ) -> Result<(Self, Option<String>), ShardError> {
         let path = path.as_ref();
+        let preserved = crate::quarantine::Preserved::take(path);
         match Self::open(path, checkpoint_pages) {
             Ok(shard) => Ok((shard, None)),
             Err(error) if error.is_corruption() => {
-                let reason = error.to_string();
-                crate::quarantine::database(path).map_err(ShardError::Io)?;
+                let note = preserved.quarantine().map_err(ShardError::Io)?;
+                let reason = crate::quarantine::reason(&error, note);
                 Ok((Self::open(path, checkpoint_pages)?, Some(reason)))
             }
             Err(error) => Err(error),
@@ -92,7 +99,6 @@ impl Shard {
     /// Open or create one active shard and verify its required schema.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, ShardError> {
         let path = path.as_ref();
-        let existed = path.try_exists().map_err(ShardError::Io)?;
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -100,16 +106,22 @@ impl Shard {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         crate::payload_index::register(&connection)?;
+        // Until the shard is verified, closing must not checkpoint the WAL
+        // into a database that may be quarantined (§3.3).
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=FULL;\
              PRAGMA wal_autocheckpoint=0;\
+             PRAGMA journal_size_limit=0;\
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
+        match crate::schema::contents(&connection)? {
+            Contents::Empty => connection.execute_batch(CREATE_SCHEMA)?,
+            Contents::Unrecognised => return Err(ShardError::UnrecognisedContents),
+            Contents::Store => {}
         }
         validate_schema(&connection)?;
 
@@ -122,10 +134,12 @@ impl Shard {
                 .collect()
         };
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get::<_, u64>(0))?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             known_types,
+            orphan_candidates: HashSet::new(),
             checkpoint_pages,
             page_size,
         })
@@ -255,10 +269,12 @@ impl Shard {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
-            [],
-        )?;
+        if !self.known_types.contains("synthetic.gap") {
+            transaction.execute(
+                "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
+                [],
+            )?;
+        }
         let receipt_rows;
         {
             let mut insert_gap = transaction.prepare_cached(
@@ -317,6 +333,9 @@ impl Shard {
         let checkpoint_pages = self.checkpoint_pages;
         let placeholder = Connection::open_in_memory()?;
         let connection = std::mem::replace(&mut self.connection, placeholder);
+        // Closing would otherwise checkpoint the WAL into the corrupt
+        // database and delete it, leaving quarantine nothing to move.
+        let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(ShardError::Io)?;
         *self = Self::open(path, checkpoint_pages)?;
@@ -331,10 +350,12 @@ impl Shard {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
-            [event.event_type.as_ref()],
-        )?;
+        if !self.known_types.contains(event.event_type.as_ref()) {
+            transaction.execute(
+                "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
+                [event.event_type.as_ref()],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO events (boot_id, timestamp, event_type, payload) \
              VALUES (?1, ?2, ?3, ?4)",
@@ -352,27 +373,65 @@ impl Shard {
 
     /// Delete at most `limit` event rows older than `cutoff`.
     pub fn retain_before(&mut self, cutoff: i64, limit: usize) -> Result<usize, ShardError> {
-        self.delete_bounded(
+        self.delete_events(
             "DELETE FROM events WHERE id IN (SELECT id FROM events \
-             WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2)",
-            cutoff,
-            limit,
+             WHERE timestamp < ?1 ORDER BY timestamp, id LIMIT ?2) RETURNING event_type",
+            params![cutoff, sqlite_limit(limit)?],
         )
     }
 
     /// Delete at most `limit` rows belonging to one complete boot.
     pub fn retain_boot(&mut self, boot_id: &Guid, limit: usize) -> Result<usize, ShardError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = transaction.execute(
+        self.delete_events(
             "DELETE FROM events WHERE id IN (SELECT id FROM events \
-             WHERE boot_id = ?1 ORDER BY timestamp, id LIMIT ?2)",
+             WHERE boot_id = ?1 ORDER BY timestamp, id LIMIT ?2) RETURNING event_type",
             params![&boot_id[..], sqlite_limit(limit)?],
-        )?;
-        transaction.commit()?;
+        )
+    }
+
+    /// Remove catalogued types that retention's deletes left with no event.
+    ///
+    /// The candidates are the distinct types the committed delete batches
+    /// touched. Each is rechecked with `NOT EXISTS` inside the deletion
+    /// transaction, and uninterned only once that commits (§3.1). A stale
+    /// catalogue row is safe, so the check is skipped, keeping its
+    /// candidates for a later offer, when `idx_events_event_type` is not
+    /// material (the recheck would scan the events table) or when `cancel`
+    /// reports work waiting: cleanup never delays ingestion. Returns the
+    /// number of types removed.
+    pub fn remove_orphan_types<F>(&mut self, mut cancel: F) -> Result<usize, ShardError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        if self.orphan_candidates.is_empty()
+            || cancel()
+            || !self
+                .material_indexes()?
+                .iter()
+                .any(|name| name == "idx_events_event_type")
+        {
+            return Ok(0);
+        }
+        let candidates: Vec<Box<str>> = self.orphan_candidates.iter().cloned().collect();
+        self.connection.progress_handler(1_000, Some(cancel));
+        let result = delete_orphans(&mut self.connection, &candidates);
+        self.connection.progress_handler(0, None::<fn() -> bool>);
+        let removed = match result {
+            Ok(removed) => removed,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                return Ok(0);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Every candidate was rechecked: the rest still have events.
+        self.orphan_candidates.clear();
+        for event_type in &removed {
+            self.known_types.remove(event_type);
+        }
         self.checkpoint_if_needed()?;
-        Ok(deleted)
+        Ok(removed.len())
     }
 
     /// Ask the sole writer connection to perform a passive checkpoint.
@@ -478,17 +537,34 @@ impl Shard {
             .map_err(ShardError::Sql)
     }
 
-    fn delete_bounded(
+    /// Run one bounded `DELETE … RETURNING event_type`, recording the
+    /// distinct types it touched as orphan candidates once it commits.
+    fn delete_events(
         &mut self,
         sql: &str,
-        cutoff: i64,
-        limit: usize,
+        parameters: impl rusqlite::Params,
     ) -> Result<usize, ShardError> {
+        let mut deleted = 0;
+        let mut touched = HashSet::<Box<str>>::new();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = transaction.execute(sql, params![cutoff, sqlite_limit(limit)?])?;
+        {
+            let mut statement = transaction.prepare(sql)?;
+            let mut rows = statement.query(parameters)?;
+            while let Some(row) = rows.next()? {
+                deleted += 1;
+                let event_type = row
+                    .get_ref(0)?
+                    .as_str()
+                    .map_err(|_| ShardError::InvalidSchema("event_type is not text"))?;
+                if !touched.contains(event_type) {
+                    touched.insert(event_type.into());
+                }
+            }
+        }
         transaction.commit()?;
+        self.orphan_candidates.extend(touched);
         self.checkpoint_if_needed()?;
         Ok(deleted)
     }
@@ -562,6 +638,9 @@ impl Shard {
         Ok(())
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), ShardError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -610,6 +689,30 @@ fn adaptive_index(index: &DesiredIndex) -> Option<(String, String)> {
         Some((name.to_owned(), format!("{column}{collation}")))
     }
 }
+
+/// Delete each candidate type still without an event, in one transaction.
+/// `COLLATE NOCASE` lets the recheck use `idx_events_event_type`; a type
+/// that differs from a stored one only in case is kept, which is safe.
+fn delete_orphans(
+    connection: &mut Connection,
+    candidates: &[Box<str>],
+) -> rusqlite::Result<Vec<Box<str>>> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut removed = Vec::new();
+    {
+        let mut delete = transaction.prepare(ORPHAN_DELETE)?;
+        for candidate in candidates {
+            if delete.execute([candidate.as_ref()])? != 0 {
+                removed.push(candidate.clone());
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(removed)
+}
+
+const ORPHAN_DELETE: &str = "DELETE FROM event_types WHERE event_type = ?1 \
+     AND NOT EXISTS (SELECT 1 FROM events WHERE event_type = ?1 COLLATE NOCASE)";
 
 fn read_receipts(connection: &Connection) -> Result<Vec<(Guid, u16, Interval)>, ShardError> {
     let mut statement = connection
@@ -788,6 +891,8 @@ pub enum ShardError {
     InvalidSchema(&'static str),
     /// The shard uses an unsupported schema version.
     UnknownVersion(String),
+    /// Schema objects without the metadata entries of an event shard.
+    UnrecognisedContents,
     /// An unsigned kernel value cannot fit `SQLite`'s signed `INTEGER`.
     IntegerRange(&'static str),
     /// The direct-write API was given a non-synthetic event type.
@@ -805,7 +910,8 @@ impl ShardError {
         )
     }
 
-    /// Whether `SQLite` has declared the database image corrupt.
+    /// Whether `SQLite` has declared the database image corrupt, or it holds
+    /// contents that are not an event shard at all.
     #[must_use]
     pub const fn is_corruption(&self) -> bool {
         matches!(
@@ -815,7 +921,7 @@ impl ShardError {
                     error.code,
                     rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
                 )
-        )
+        ) || matches!(self, Self::UnrecognisedContents)
     }
 }
 
@@ -829,6 +935,9 @@ impl fmt::Display for ShardError {
             }
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported event shard schema {version}")
+            }
+            Self::UnrecognisedContents => {
+                formatter.write_str("unrecognised event shard contents: no metadata entries")
             }
             Self::IntegerRange(field) => write!(formatter, "{field} exceeds SQLite INTEGER range"),
             Self::InvalidSyntheticType => {
@@ -845,6 +954,7 @@ impl std::error::Error for ShardError {
             Self::Io(error) => Some(error),
             Self::InvalidSchema(_)
             | Self::UnknownVersion(_)
+            | Self::UnrecognisedContents
             | Self::IntegerRange(_)
             | Self::InvalidSyntheticType => None,
         }
@@ -1036,6 +1146,172 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_and_gap_commits_catalogue_a_type_only_while_it_is_unknown() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        // A BEFORE trigger fires for every row an INSERT OR IGNORE attempts,
+        // so it counts catalogue statements, not rows added.
+        shard
+            .connection
+            .execute_batch(
+                "CREATE TEMP TABLE type_inserts (event_type TEXT NOT NULL);\
+                 CREATE TEMP TRIGGER count_type_inserts BEFORE INSERT ON main.event_types \
+                 BEGIN INSERT INTO type_inserts(event_type) VALUES (NEW.event_type); END;",
+            )
+            .unwrap();
+        let startup = SyntheticEvent {
+            boot_id: [1; 16],
+            timestamp: 42,
+            event_type: "synthetic.startup".into(),
+            payload: [0x80].into(),
+        };
+        shard.commit_synthetic(&startup).unwrap();
+        shard.commit_synthetic(&startup).unwrap();
+        let gap = |first_sequence| Gap {
+            timestamp: 40,
+            first_sequence,
+            last_sequence: first_sequence,
+            preceding_timestamp: None,
+            revealing_timestamp: 60,
+        };
+        shard.commit_gaps(&[1; 16], &[(2, gap(4))]).unwrap();
+        shard.commit_gaps(&[1; 16], &[(2, gap(5))]).unwrap();
+        let attempts: Vec<(String, u32)> = {
+            let mut statement = shard
+                .connection
+                .prepare(
+                    "SELECT event_type, count(*) FROM type_inserts \
+                     GROUP BY event_type ORDER BY event_type",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            attempts,
+            [
+                ("synthetic.gap".to_owned(), 1),
+                ("synthetic.startup".to_owned(), 1)
+            ]
+        );
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn catalogued(shard: &Shard, event_type: &str) -> bool {
+        shard
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_types WHERE event_type = ?1)",
+                [event_type],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Events at timestamp 1 of `old.type` and of `orphans` more types, and
+    /// of `kept.type` at timestamps 1 and 100000, in that id order.
+    fn shard_with_orphans_to_be(path: &Path, orphans: u64) -> Shard {
+        let mut shard = Shard::open(path, 1_000).unwrap();
+        let mut items: Vec<_> = core::iter::once("old.type".to_owned())
+            .chain((0..orphans).map(|index| format!("old.type{index}")))
+            .chain(["kept.type".to_owned()])
+            .enumerate()
+            .map(|(index, event_type)| {
+                let mut item = event(index as u64 + 1, &event_type);
+                item.event.timestamp = 1;
+                item
+            })
+            .collect();
+        items.push(event(100_000, "kept.type"));
+        shard.commit(&items).unwrap();
+        shard
+    }
+
+    #[test]
+    fn retention_removes_a_type_its_deletes_orphaned_and_uninterns_it_after_commit() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = shard_with_orphans_to_be(&path, 0);
+        shard
+            .converge_indexes(&event_type_index(), || false)
+            .unwrap();
+        // The recheck is answered from the index, not by scanning events.
+        let plan = {
+            let mut statement = shard
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {ORPHAN_DELETE}"))
+                .unwrap();
+            statement
+                .query_map(["old.type"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("; ")
+        };
+        assert!(plan.contains("idx_events_event_type"), "{plan}");
+
+        assert_eq!(shard.retain_before(10, 100).unwrap(), 2);
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 1);
+        assert!(!catalogued(&shard, "old.type"));
+        assert!(
+            catalogued(&shard, "kept.type"),
+            "a type with an event left stays"
+        );
+        // Uninterned: its next event catalogues it again.
+        shard.commit(&[event(200, "old.type")]).unwrap();
+        assert!(catalogued(&shard, "old.type"));
+        // The candidates were all checked; nothing is left to offer.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 0);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_unindexed_or_interrupted_orphan_check_is_skipped_and_offered_again() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        // Enough candidates for the deletion transaction to reach the
+        // progress handler.
+        let mut shard = shard_with_orphans_to_be(&path, 300);
+        assert_eq!(shard.retain_boot(&[1; 16], 302).unwrap(), 302);
+        // No idx_events_event_type: skipped.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 0);
+        assert!(catalogued(&shard, "old.type"));
+        shard
+            .converge_indexes(&event_type_index(), || false)
+            .unwrap();
+        // Work waiting: skipped.
+        assert_eq!(shard.remove_orphan_types(|| true).unwrap(), 0);
+        assert!(catalogued(&shard, "old.type"));
+        // Interrupted part-way through the deletion transaction: rolled back.
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&checks);
+        assert_eq!(
+            shard
+                .remove_orphan_types(move || counter.fetch_add(1, Ordering::Relaxed) > 0)
+                .unwrap(),
+            0
+        );
+        assert!(
+            checks.load(Ordering::Relaxed) > 1,
+            "the progress handler ran"
+        );
+        assert!(catalogued(&shard, "old.type"));
+        assert!(shard.connection.is_autocommit());
+        // Still candidates, so the next offer removes them all.
+        assert_eq!(shard.remove_orphan_types(|| false).unwrap(), 301);
+        assert!(!catalogued(&shard, "old.type"));
+        assert!(catalogued(&shard, "kept.type"));
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn commits_recovery_gaps_and_receipts_atomically() {
         let directory = temporary_directory();
         let path = directory.join("shard-0000.db");
@@ -1098,6 +1374,145 @@ mod tests {
                 .starts_with("shard-0000.db.corrupt.")
         }));
         drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The WAL header's salt, which changes whenever a writer restarts the
+    /// log after a checkpoint.
+    fn wal_salt(path: &Path) -> Vec<u8> {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::read(PathBuf::from(wal)).unwrap()[16..24].to_vec()
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 10).unwrap();
+        let mut sequence = 0;
+        let mut batch = |count: u64| -> Vec<IngestItem> {
+            (0..count)
+                .map(|_| {
+                    sequence += 1;
+                    let mut item = event(sequence, "example.test");
+                    item.event.payload = [0xc4, 200].into_iter().chain([0; 200]).collect();
+                    item
+                })
+                .collect()
+        };
+        let first = wal_salt(&path);
+        while wal_salt(&path) == first {
+            shard.commit(&batch(100)).unwrap();
+        }
+        shard.commit(&batch(1)).unwrap();
+        let restarted = wal_salt(&path);
+        shard.commit(&batch(1)).unwrap();
+        shard
+            .commit_synthetic(&SyntheticEvent {
+                boot_id: [1; 16],
+                timestamp: 1,
+                event_type: "synthetic.startup".into(),
+                payload: [0x80].into(),
+            })
+            .unwrap();
+        assert_eq!(wal_salt(&path), restarted);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn quarantined(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn quarantine_keeps_the_wal_and_shm_byte_for_byte_under_the_databases_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let originals = [
+            ("shard-0000.db", "garbage database ".repeat(500)),
+            ("shard-0000.db-wal", "garbage wal ".repeat(300)),
+            ("shard-0000.db-shm", "garbage shm ".repeat(3000)),
+        ];
+        for (name, body) in &originals {
+            std::fs::write(directory.join(name), body).unwrap();
+        }
+        let (shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+        assert!(recovery.is_some());
+        drop(shard);
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("shard-0000.db.corrupt"))
+            .unwrap();
+        for (name, body) in &originals {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(format!("{name}.corrupt{suffix}"))).unwrap(),
+                *body,
+                "{name} in {quarantined:?}"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preserved"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_shard_whose_creation_was_lost_is_created_afresh() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        let (mut shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recovery, None);
+        shard.commit(&[event(1, "example.test")]).unwrap();
+        assert!(quarantined(&directory).is_empty());
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partly_created_shard_is_quarantined_but_a_missing_schema_version_fails() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        for partial in [
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);\
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        ] {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(partial)
+                .unwrap();
+            let before = quarantined(&directory).len();
+            let (shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+            assert!(recovery.is_some(), "{partial}");
+            assert_eq!(quarantined(&directory).len(), before + 1, "{partial}");
+            drop(shard);
+            std::fs::remove_file(&path).unwrap();
+        }
+        drop(Shard::open(&path, 1_000).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM metadata WHERE key = 'schema_version';")
+            .unwrap();
+        let before = quarantined(&directory).len();
+        assert!(matches!(
+            Shard::open_recovering(&path, 1_000),
+            Err(ShardError::InvalidSchema(_))
+        ));
+        assert_eq!(quarantined(&directory).len(), before);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

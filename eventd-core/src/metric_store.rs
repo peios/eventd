@@ -5,11 +5,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hashlink::LinkedHashMap;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 use crate::Guid;
+use crate::schema::Contents;
 
 const CREATE_SCHEMA: &str = r"
+BEGIN IMMEDIATE;
 CREATE TABLE series (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -18,7 +21,7 @@ CREATE TABLE series (
     label_hash INTEGER NOT NULL,
     boundaries_hash INTEGER,
     boundaries BLOB,
-    UNIQUE(name, labels, boundaries_hash)
+    UNIQUE(name, labels, boundaries)
 );
 CREATE TABLE samples (
     id INTEGER PRIMARY KEY,
@@ -35,6 +38,7 @@ CREATE TABLE metadata (
 CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);
 CREATE INDEX idx_series_name ON series(name);
 CREATE INDEX idx_series_label_hash ON series(label_hash);
+CREATE INDEX idx_series_boundaries_hash ON series(boundaries_hash);
 CREATE TABLE rollups (
     series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
     window_start INTEGER NOT NULL,
@@ -49,9 +53,46 @@ CREATE TABLE rollups (
     PRIMARY KEY (series_id, window_start, window_width, transform, function)
 ) WITHOUT ROWID;
 CREATE INDEX idx_rollups_window ON rollups(window_start);
-INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
+INSERT INTO metadata(key, value) VALUES ('schema_version', '3');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+COMMIT;
+";
+
+/// Version 2 to 3: a series is unique on its full boundary blob, not on the
+/// blob's hash, which is a lookup key and never an identity (§5.2). Two
+/// histograms whose boundaries collide on the hash are two series; under
+/// version 2 the second one's INSERT violated the constraint.
+///
+/// `SQLite` cannot alter a constraint, so the table is rebuilt. Foreign keys
+/// are off around it: with them on, dropping the old table would delete
+/// through `rollups`' cascade and fail on `samples`' reference. Identifiers
+/// are kept, so both tables' references hold once the new table takes the
+/// old name. No row can conflict, since rows equal on the blob are equal on
+/// its hash.
+const MIGRATE_V2_TO_V3: &str = r"
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TABLE series_v3 (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    type INTEGER NOT NULL CHECK (type IN (0, 1, 2)),
+    label_hash INTEGER NOT NULL,
+    boundaries_hash INTEGER,
+    boundaries BLOB,
+    UNIQUE(name, labels, boundaries)
+);
+INSERT INTO series_v3 (id, name, labels, type, label_hash, boundaries_hash, boundaries)
+SELECT id, name, labels, type, label_hash, boundaries_hash, boundaries FROM series;
+DROP TABLE series;
+ALTER TABLE series_v3 RENAME TO series;
+CREATE INDEX idx_series_name ON series(name);
+CREATE INDEX idx_series_label_hash ON series(label_hash);
+CREATE INDEX idx_series_boundaries_hash ON series(boundaries_hash);
+UPDATE metadata SET value = '3' WHERE key = 'schema_version';
+COMMIT;
+PRAGMA foreign_keys=ON;
 ";
 
 /// Metric series type stored as a stable integer.
@@ -186,11 +227,12 @@ impl MetricStore {
         cache_capacity: usize,
     ) -> Result<(Self, Option<String>), MetricStoreError> {
         let path = path.as_ref();
+        let preserved = crate::quarantine::Preserved::take(path);
         match Self::open(path, checkpoint_pages, cache_capacity) {
             Ok(store) => Ok((store, None)),
             Err(error) if error.is_corruption() => {
-                let reason = error.to_string();
-                crate::quarantine::database(path).map_err(MetricStoreError::Io)?;
+                let note = preserved.quarantine().map_err(MetricStoreError::Io)?;
+                let reason = crate::quarantine::reason(&error, note);
                 Ok((
                     Self::open(path, checkpoint_pages, cache_capacity)?,
                     Some(reason),
@@ -207,26 +249,32 @@ impl MetricStore {
         cache_capacity: usize,
     ) -> Result<Self, MetricStoreError> {
         let path = path.as_ref();
-        let existed = path.try_exists().map_err(MetricStoreError::Io)?;
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Until the store is verified, closing must not checkpoint the WAL
+        // into a database that may be quarantined (§3.3).
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=NORMAL;\
              PRAGMA wal_autocheckpoint=0;\
+             PRAGMA journal_size_limit=0;\
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
+        match crate::schema::contents(&connection)? {
+            Contents::Empty => connection.execute_batch(CREATE_SCHEMA)?,
+            Contents::Unrecognised => return Err(MetricStoreError::UnrecognisedContents),
+            Contents::Store => {}
         }
         validate_schema(&connection)?;
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
@@ -320,6 +368,9 @@ impl MetricStore {
         let cache_capacity = self.cache_capacity;
         let placeholder = Connection::open_in_memory()?;
         let connection = std::mem::replace(&mut self.connection, placeholder);
+        // Closing would otherwise checkpoint the WAL into the corrupt
+        // database and delete it, leaving quarantine nothing to move.
+        let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(MetricStoreError::Io)?;
         *self = Self::open(path, checkpoint_pages, cache_capacity)?;
@@ -445,6 +496,9 @@ impl MetricStore {
         Ok(())
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), MetricStoreError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
@@ -652,19 +706,37 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
         )?;
         "2".clone_into(&mut version);
     }
-    if version != "2" {
+    if version == "2" {
+        // The rebuild recreates the series indexes, so verify the version 2
+        // structure first: a store missing one still fails startup.
+        require_objects(connection, &VERSION_2_OBJECTS)?;
+        connection.execute_batch(MIGRATE_V2_TO_V3)?;
+        "3".clone_into(&mut version);
+    }
+    if version != "3" {
         return Err(MetricStoreError::UnknownVersion(version));
     }
-    for (kind, name) in [
-        ("table", "series"),
-        ("table", "samples"),
-        ("table", "metadata"),
-        ("index", "idx_samples_series_timestamp"),
-        ("index", "idx_series_name"),
-        ("index", "idx_series_label_hash"),
-        ("table", "rollups"),
-        ("index", "idx_rollups_window"),
-    ] {
+    require_objects(connection, &VERSION_2_OBJECTS)?;
+    require_objects(connection, &[("index", "idx_series_boundaries_hash")])
+}
+
+/// The schema objects of version 2, all of which version 3 keeps.
+const VERSION_2_OBJECTS: [(&str, &str); 8] = [
+    ("table", "series"),
+    ("table", "samples"),
+    ("table", "metadata"),
+    ("index", "idx_samples_series_timestamp"),
+    ("index", "idx_series_name"),
+    ("index", "idx_series_label_hash"),
+    ("table", "rollups"),
+    ("index", "idx_rollups_window"),
+];
+
+fn require_objects(
+    connection: &Connection,
+    objects: &[(&str, &str)],
+) -> Result<(), MetricStoreError> {
+    for (kind, name) in objects {
         let exists: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
             params![kind, name],
@@ -704,8 +776,10 @@ fn prune_rollups(transaction: &Transaction<'_>, max_rows: usize) -> Result<(), M
         return Ok(());
     }
     let count: i64 = transaction.query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))?;
-    let excess = count.saturating_sub(max_rows);
-    if excess != 0 {
+    // Under the cap the difference is negative, and SQLite reads a negative
+    // LIMIT as no limit at all.
+    let excess = count - max_rows;
+    if excess > 0 {
         transaction.execute(
             "DELETE FROM rollups WHERE (series_id, window_start, window_width, transform, function) IN \
              (SELECT series_id, window_start, window_width, transform, function FROM rollups ORDER BY window_start LIMIT ?1)",
@@ -748,6 +822,8 @@ pub enum MetricStoreError {
     InvalidSchema(&'static str),
     /// Unsupported schema version.
     UnknownVersion(String),
+    /// Schema objects without the metadata entries of a metric store.
+    UnrecognisedContents,
     /// Retention batch size exceeds `SQLite`'s integer range.
     IntegerRange,
     /// A query submitted an internally inconsistent adaptive-rollup row.
@@ -765,7 +841,8 @@ impl MetricStoreError {
         )
     }
 
-    /// Whether `SQLite` has declared the database image corrupt.
+    /// Whether `SQLite` has declared the database image corrupt, or it holds
+    /// contents that are not a metric store at all.
     #[must_use]
     pub const fn is_corruption(&self) -> bool {
         matches!(
@@ -775,7 +852,7 @@ impl MetricStoreError {
                     error.code,
                     rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
                 )
-        )
+        ) || matches!(self, Self::UnrecognisedContents)
     }
 }
 
@@ -789,6 +866,9 @@ impl fmt::Display for MetricStoreError {
             }
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported metric-store schema {version}")
+            }
+            Self::UnrecognisedContents => {
+                formatter.write_str("unrecognised metric-store contents: no metadata entries")
             }
             Self::IntegerRange => {
                 formatter.write_str("metric retention batch size exceeds SQLite range")
@@ -805,6 +885,7 @@ impl std::error::Error for MetricStoreError {
             Self::Io(error) => Some(error),
             Self::InvalidSchema(_)
             | Self::UnknownVersion(_)
+            | Self::UnrecognisedContents
             | Self::IntegerRange
             | Self::InvalidRollup => None,
         }
@@ -915,6 +996,128 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    fn quarantined(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn quarantine_keeps_the_wal_and_shm_byte_for_byte_under_the_databases_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let originals = [
+            ("metrics.db", "this is not a database ".repeat(400)),
+            ("metrics.db-wal", "wal junk".to_owned()),
+            ("metrics.db-shm", "shm junk".to_owned()),
+        ];
+        for (name, body) in &originals {
+            std::fs::write(directory.join(name), body).unwrap();
+        }
+        let (store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+        assert!(recovery.is_some());
+        drop(store);
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("metrics.db.corrupt"))
+            .unwrap();
+        for (name, body) in &originals {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(format!("{name}.corrupt{suffix}"))).unwrap(),
+                *body,
+                "{name} in {quarantined:?}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let mut store = MetricStore::open(&path, 10, 1_000).unwrap();
+        let wal = directory.join("metrics.db-wal");
+        let wal_salt = || std::fs::read(&wal).unwrap()[16..24].to_vec();
+        let batch = |count: usize| -> Vec<MetricRecord> {
+            (0..count)
+                .map(|index| MetricRecord {
+                    labels: format!("core={index},pad={}", "x".repeat(100)).into(),
+                    ..record(MetricType::Gauge, MetricValue::Number(1.0))
+                })
+                .collect()
+        };
+        let first = wal_salt();
+        while wal_salt() == first {
+            store.commit(&batch(100)).unwrap();
+        }
+        store.commit(&batch(1)).unwrap();
+        let restarted = wal_salt();
+        store.commit(&batch(1)).unwrap();
+        store.commit(&batch(1)).unwrap();
+        assert_eq!(wal_salt(), restarted);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_store_whose_creation_was_lost_is_created_afresh() {
+        // What PEI-1317's power cut left: a 4096-byte WAL-mode header page
+        // with no schema, and a 56-byte WAL holding no complete frame.
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        std::fs::write(directory.join("metrics.db-wal"), [0; 56]).unwrap();
+        let (mut store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+        assert_eq!(recovery, None);
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        assert!(quarantined(&directory).is_empty());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partly_created_store_is_quarantined_but_a_missing_schema_version_fails() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        for partial in [
+            "CREATE TABLE series (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE series (id INTEGER PRIMARY KEY);\
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        ] {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(partial)
+                .unwrap();
+            let before = quarantined(&directory).len();
+            let (store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+            assert!(recovery.is_some(), "{partial}");
+            assert_eq!(quarantined(&directory).len(), before + 1, "{partial}");
+            drop(store);
+            std::fs::remove_file(&path).unwrap();
+        }
+        drop(MetricStore::open(&path, 1_000, 10).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM metadata WHERE key = 'schema_version';")
+            .unwrap();
+        let before = quarantined(&directory).len();
+        assert!(matches!(
+            MetricStore::open_recovering(&path, 1_000, 10),
+            Err(MetricStoreError::InvalidSchema(_))
+        ));
+        assert_eq!(quarantined(&directory).len(), before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn classifies_sqlite_full_as_capacity_failure() {
         let error = MetricStoreError::Sql(rusqlite::Error::SqliteFailure(
@@ -946,6 +1149,171 @@ mod tests {
             .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Two strictly increasing boundary arrays whose blobs differ but share
+    /// a `boundaries_hash` under the book's FNV-1a parameters.
+    fn colliding_histograms() -> [MetricRecord; 2] {
+        [
+            [0x3ff7_40fe_76b4_fb21_u64, 0x4002_1c00_0000_0000],
+            [0x3ffc_3e90_05d7_14f8, 0x4003_0400_0000_0000],
+        ]
+        .map(|bits| {
+            record(
+                MetricType::Histogram,
+                MetricValue::Histogram(Histogram {
+                    boundaries: bits.map(f64::from_bits).into(),
+                    counts: [0, 1].into(),
+                    total_count: 1,
+                    sum: 1.5,
+                }),
+            )
+        })
+    }
+
+    #[test]
+    fn histograms_whose_boundary_hashes_collide_are_two_series() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let hashes: Vec<i64> = {
+            let mut statement = store
+                .connection
+                .prepare("SELECT boundaries_hash FROM series ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(hashes, [5_602_808_888_786_851_467; 2]);
+        // And each resolves to its own series from now on.
+        store.configure(1_000, 0);
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let per_series: Vec<u32> = {
+            let mut statement = store
+                .connection
+                .prepare("SELECT count(*) FROM samples GROUP BY series_id ORDER BY series_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(per_series, [2, 2]);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The version 2 schema as eventd 0.1.8 created it.
+    const VERSION_2_SCHEMA: &str = "PRAGMA journal_mode=WAL;\
+         CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT NOT NULL,\
+             labels TEXT NOT NULL, type INTEGER NOT NULL CHECK (type IN (0, 1, 2)),\
+             label_hash INTEGER NOT NULL, boundaries_hash INTEGER, boundaries BLOB,\
+             UNIQUE(name, labels, boundaries_hash));\
+         CREATE TABLE samples (id INTEGER PRIMARY KEY,\
+             series_id INTEGER NOT NULL REFERENCES series(id), boot_id BLOB NOT NULL,\
+             timestamp INTEGER NOT NULL, value REAL NOT NULL, histogram_data BLOB);\
+         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;\
+         CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);\
+         CREATE INDEX idx_series_name ON series(name);\
+         CREATE INDEX idx_series_label_hash ON series(label_hash);\
+         CREATE TABLE rollups (\
+             series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,\
+             window_start INTEGER NOT NULL, window_width INTEGER NOT NULL,\
+             transform INTEGER NOT NULL, function INTEGER NOT NULL, value REAL,\
+             overflow INTEGER NOT NULL, source_max_sample_id INTEGER NOT NULL,\
+             source_baseline_sample_id INTEGER,\
+             PRIMARY KEY (series_id, window_start, window_width, transform, function)\
+         ) WITHOUT ROWID;\
+         CREATE INDEX idx_rollups_window ON rollups(window_start);\
+         INSERT INTO metadata VALUES ('schema_version', '2');\
+         INSERT INTO metadata VALUES ('created_at', '2026-01-01T00:00:00Z');";
+
+    #[test]
+    fn a_version_two_store_missing_a_series_index_fails_rather_than_migrating() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(VERSION_2_SCHEMA).unwrap();
+        old.execute_batch("DROP INDEX idx_series_name;").unwrap();
+        drop(old);
+        assert!(matches!(
+            MetricStore::open(&path, 1_000, 10),
+            Err(MetricStoreError::InvalidSchema(_))
+        ));
+        let version: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2", "the store was left as it was");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_version_two_store_migrates_to_three_keeping_series_samples_and_rollups() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(VERSION_2_SCHEMA).unwrap();
+        old.execute_batch(
+            "INSERT INTO series VALUES (7, 'test.metric', 'core=0', 1, 0, NULL, NULL);\
+             INSERT INTO samples VALUES (1, 7, zeroblob(16), 10, 1.0, NULL);\
+             INSERT INTO rollups VALUES (7, 0, 10, 0, 0, 1.0, 0, 1, NULL);",
+        )
+        .unwrap();
+        old.execute(
+            "UPDATE series SET label_hash = ?1 WHERE id = 7",
+            [hash_for_sql(b"core=0")],
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = MetricStore::open(&path, 1_000, 10).unwrap();
+        let counts: (String, u32, u32, u32) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT value FROM metadata WHERE key = 'schema_version'),\
+                 (SELECT count(*) FROM series WHERE id = 7),\
+                 (SELECT count(*) FROM samples WHERE series_id = 7),\
+                 (SELECT count(*) FROM rollups WHERE series_id = 7)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, ("3".to_owned(), 1, 1, 1));
+        let violations: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        // The existing gauge series still resolves, and a collision is two
+        // series rather than a failed commit.
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(2.0))])
+            .unwrap();
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let series: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(series, 3);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -987,6 +1355,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollups_under_the_cap_are_all_kept() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        let rollups: Vec<_> = (0..3)
+            .map(|window| MetricRollup {
+                series_id: 1,
+                window_start: window * 10,
+                window_width: 10,
+                transform: 0,
+                function: 0,
+                value: Some(1.0),
+                overflow: false,
+                source_max_sample_id: 1,
+                source_baseline_sample_id: None,
+            })
+            .collect();
+        assert_eq!(store.commit_rollups(&rollups, 100_000).unwrap(), 3);
+        store.prune_rollups(100_000).unwrap();
+        // Exactly at the cap nothing goes either.
+        store.prune_rollups(3).unwrap();
+        let remaining: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 3);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1049,7 +1450,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        // Through version 2 to the current version 3.
+        assert_eq!(version, "3");
         let exists: bool = store
             .connection
             .query_row(
