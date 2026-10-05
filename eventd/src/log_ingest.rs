@@ -65,17 +65,31 @@ pub fn run(
             buffer.resize(datagram_ceiling, 0);
             socket.configure_receive_buffer(datagram_ceiling)?;
         }
+        // The latency cap holds whatever arrives: datagrams that yield no
+        // record never reach the commit check below, and never empty the
+        // queue either.
+        if open.is_some_and(|(started, _, latency_cap)| started.elapsed() >= latency_cap) {
+            commit_batch(
+                &mut store,
+                &batch,
+                commits,
+                retention_requested,
+                boot_id,
+                error_events,
+            )?;
+            batch.clear();
+            open = None;
+        }
         match socket.receive(&mut buffer)? {
             Receive::Datagram(length) => {
                 let receipt_timestamp = realtime_nanoseconds()?;
-                let Some(records) = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
-                else {
-                    continue;
-                };
+                // An unusable datagram yields nothing and goes on, like any
+                // other, to the maintenance step.
+                let records = parse_datagram(&buffer[..length], boot_id, receipt_timestamp)
+                    .unwrap_or_default();
                 for record in records {
-                    let (started, size_cap, latency_cap) = *open.get_or_insert_with(|| {
-                        (Instant::now(), max_batch_size, max_batch_latency)
-                    });
+                    let (started, size_cap, latency_cap) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, max_batch_latency));
                     batch.push(record);
                     if batch.len() >= size_cap || started.elapsed() >= latency_cap {
                         commit_batch(
@@ -126,9 +140,8 @@ pub fn run(
                     continue;
                 };
                 for record in records {
-                    let (_, size_cap, _) = *open.get_or_insert_with(|| {
-                        (Instant::now(), max_batch_size, Duration::MAX)
-                    });
+                    let (_, size_cap, _) = *open
+                        .get_or_insert_with(|| (Instant::now(), max_batch_size, Duration::MAX));
                     batch.push(record);
                     if batch.len() >= size_cap {
                         commit_batch(
@@ -678,6 +691,63 @@ mod tests {
             Ok(0),
             &mut last_error
         ));
+    }
+
+    #[test]
+    fn a_transaction_commits_at_its_latency_while_only_unusable_datagrams_arrive() {
+        let log = LogThread::new(5_000);
+        log.runtime.write().unwrap().log_max_batch_latency = Duration::from_millis(100);
+        let socket = log.bind();
+        let store = log.open_store();
+        let (_maintenance, commands) = channel();
+        // Well-formed MessagePack that is not a record: slow for the thread
+        // to validate and quick to send, so blocked senders refill the
+        // receive queue faster than it drains and no receive finds it empty.
+        let mut writer = Writer::new();
+        writer.write_array(50_000);
+        for _ in 0..50_000 {
+            writer.write_uint(1);
+        }
+        let unusable = writer.to_bytes().unwrap();
+        let flood_over = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (log, socket) = (&log, &socket);
+            let thread = scope.spawn(move || log.run(socket, store, &commands));
+            let _stopping = StopOnDrop(&log.stopping);
+            let flooders: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+                        sender
+                            .set_write_timeout(Some(Duration::from_millis(100)))
+                            .unwrap();
+                        while !flood_over.load(Ordering::Acquire) {
+                            let _ = sender.send_to(&unusable, &log.socket_path);
+                        }
+                    })
+                })
+                .collect();
+            let _flood_over = StopOnDrop(&flood_over);
+            std::thread::sleep(Duration::from_millis(100));
+            // One record opens a transaction in the middle of the flood.
+            log.send(1, "under the flood");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while log.commits.generation() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let committed = log.commits.generation();
+            flood_over.store(true, Ordering::Release);
+            for flooder in flooders {
+                flooder.join().unwrap();
+            }
+            assert_eq!(
+                committed, 1,
+                "the transaction committed at LogMaxBatchLatencyMs, while the flood went on"
+            );
+            log.wait_for_stored(1);
+            log.stopping.store(true, Ordering::Release);
+            thread.join().unwrap().unwrap();
+        });
     }
 
     #[test]
