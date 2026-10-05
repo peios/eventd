@@ -704,8 +704,10 @@ fn prune_rollups(transaction: &Transaction<'_>, max_rows: usize) -> Result<(), M
         return Ok(());
     }
     let count: i64 = transaction.query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))?;
-    let excess = count.saturating_sub(max_rows);
-    if excess != 0 {
+    // Under the cap the difference is negative, and SQLite reads a negative
+    // LIMIT as no limit at all.
+    let excess = count - max_rows;
+    if excess > 0 {
         transaction.execute(
             "DELETE FROM rollups WHERE (series_id, window_start, window_width, transform, function) IN \
              (SELECT series_id, window_start, window_width, transform, function FROM rollups ORDER BY window_start LIMIT ?1)",
@@ -987,6 +989,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollups_under_the_cap_are_all_kept() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        let rollups: Vec<_> = (0..3)
+            .map(|window| MetricRollup {
+                series_id: 1,
+                window_start: window * 10,
+                window_width: 10,
+                transform: 0,
+                function: 0,
+                value: Some(1.0),
+                overflow: false,
+                source_max_sample_id: 1,
+                source_baseline_sample_id: None,
+            })
+            .collect();
+        assert_eq!(store.commit_rollups(&rollups, 100_000).unwrap(), 3);
+        store.prune_rollups(100_000).unwrap();
+        // Exactly at the cap nothing goes either.
+        store.prune_rollups(3).unwrap();
+        let remaining: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM rollups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 3);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
