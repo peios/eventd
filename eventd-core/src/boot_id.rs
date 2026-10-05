@@ -35,9 +35,17 @@ impl BootId {
         &self.0
     }
 
-    /// Format the identifier in canonical PCDS GUID text form.
+    /// Format the identifier in canonical PCDS GUID text form: braced,
+    /// 38 characters, lowercase, as eventd renders every GUID.
     #[must_use]
     pub fn canonical(self) -> String {
+        format!("{{{}}}", self.unbraced())
+    }
+
+    /// The 36 characters within the canonical form's braces, which is the
+    /// text the kernel gives in `/proc/sys/kernel/random/boot_id`.
+    #[must_use]
+    pub fn unbraced(self) -> String {
         let mut rfc = self.0;
         rfc[0..4].reverse();
         rfc[4..6].reverse();
@@ -161,7 +169,16 @@ mod tests {
                 0xee, 0xff,
             ]
         );
-        assert_eq!(id.canonical(), "00112233-4455-6677-8899-aabbccddeeff");
+        assert_eq!(id.unbraced(), "00112233-4455-6677-8899-aabbccddeeff");
+    }
+
+    // PEI-1296, PCDS GUID string format: the canonical form is braced, 38
+    // characters and lowercase, whatever case the kernel's text was in.
+    #[test]
+    fn the_canonical_form_is_the_braced_lowercase_pcds_string() {
+        let id: BootId = "00112233-4455-6677-8899-AABBCCDDEEFF".parse().unwrap();
+        assert_eq!(id.canonical(), "{00112233-4455-6677-8899-aabbccddeeff}");
+        assert_eq!(id.canonical().len(), 38);
     }
 
     #[test]

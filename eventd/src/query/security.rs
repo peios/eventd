@@ -183,18 +183,9 @@ impl Authorizer {
         let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
             return Ok(false);
         };
-        let mut guids: Vec<[u8; 16]> = fields
-            .iter()
-            .map(|field| eventd_core::field_guid(field))
-            .collect();
-        let named = guids.len();
-        let granted: Vec<[u8; 16]> = eventd_client::access::field_grants(&descriptor)
-            .into_iter()
-            .filter(|guid| !guids.contains(guid))
-            .collect();
-        guids.extend(granted);
+        let guids = may_read_fields(fields, &descriptor);
         let reads = self.reads(namespace, &pattern, &descriptor, &guids)?;
-        Ok(reads.iter().any(|reads| *reads) && reads[1..=named].iter().all(|reads| *reads))
+        Ok(reads.iter().any(|reads| *reads) && reads[1..=fields.len()].iter().all(|reads| *reads))
     }
 
     /// Whether the caller may read the record (first) and each field in
@@ -318,6 +309,21 @@ impl Authorizer {
     pub fn user(&self) -> Result<peios::security::Sid, SecurityError> {
         self.token.user().map_err(SecurityError::Peios)
     }
+}
+
+/// The level-1 nodes `may_read` asks about: `fields`, in order, then each
+/// field `descriptor` grants by name that is not among them.
+fn may_read_fields(fields: &[String], descriptor: &SecurityDescriptor) -> Vec<[u8; 16]> {
+    let mut guids: Vec<[u8; 16]> = fields
+        .iter()
+        .map(|field| eventd_core::field_guid(field))
+        .collect();
+    let granted: Vec<[u8; 16]> = eventd_client::access::field_grants(descriptor)
+        .into_iter()
+        .filter(|guid| !guids.contains(guid))
+        .collect();
+    guids.extend(granted);
+    guids
 }
 
 #[derive(Clone)]
@@ -881,6 +887,42 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    // PEI-1288, TRM §7.3 and §B: a data type's root GUID is the object type
+    // list's level-0 node only. An ACE naming it grants the record whole
+    // through that node, so it adds no level-1 node of its own; listed
+    // twice, AccessCheck refuses the list with EINVAL.
+    #[test]
+    fn an_ace_naming_the_root_guid_adds_no_level_1_node() {
+        let descriptor = peios::security::sddl::parse(
+            "O:SYG:SYD:P(A;;0x1;;;SY)\
+             (OA;;0x1;a1b2c3d4-0001-4000-8000-000000000001;;AU)\
+             (OA;;0x1;a1b2c3d4-0001-4000-8000-000000000002;;AU)\
+             (OA;;0x1;e2bd1ef2-4a1f-5a4d-8b2b-6a2b43ff4a5f;;AU)",
+        )
+        .unwrap();
+        let fields = ["timestamp".to_owned(), "event_type".to_owned()];
+        let guids = may_read_fields(&fields, &descriptor);
+        for namespace in Namespace::ALL {
+            assert!(
+                !guids.contains(&namespace.root_guid()),
+                "{namespace:?}'s root is not a level-1 node"
+            );
+        }
+        assert_eq!(
+            guids[..2],
+            [
+                eventd_core::field_guid("timestamp"),
+                eventd_core::field_guid("event_type")
+            ],
+            "the fields asked about come first, in order"
+        );
+        assert_eq!(
+            guids.len(),
+            3,
+            "and the one field granted by name after them"
+        );
     }
 
     #[test]

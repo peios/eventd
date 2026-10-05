@@ -245,6 +245,12 @@ pub fn access(
 /// The fields `descriptor` grants by name: the object GUIDs of its
 /// allowing object ACEs, each a field's (§7.3), once each. Whether they
 /// grant anything to a given caller is the access check's to say.
+///
+/// A data type's root GUID (§B) is the list's level-0 node and names no
+/// field, so an ACE naming one is not a field grant: listed again at level
+/// 1 it would put the root in the list twice, which KACS refuses.
+/// Every root is left out, not only the namespace's own, since no field's
+/// GUID is a root's: field GUIDs are UUID v5 and the roots are not.
 #[must_use]
 pub fn field_grants(descriptor: &SecurityDescriptor) -> Vec<[u8; 16]> {
     /// `ACCESS_ALLOWED_OBJECT` and `ACCESS_ALLOWED_CALLBACK_OBJECT` (MS-DTYP
@@ -262,6 +268,11 @@ pub fn field_grants(descriptor: &SecurityDescriptor) -> Vec<[u8; 16]> {
             |ace| matches!(ace.ace_type(), AceType::Other(raw) if ALLOWING_OBJECT.contains(&raw)),
         )
         .filter_map(|ace| ace.object_type().copied())
+        .filter(|guid| {
+            !Namespace::ALL
+                .iter()
+                .any(|namespace| namespace.root_guid() == *guid)
+        })
         .collect();
     guids.sort_unstable();
     guids.dedup();
@@ -514,6 +525,45 @@ mod tests {
         assert_eq!(field_grants(&descriptor), expected);
         let plain = peios::security::sddl::parse("O:SYG:SYD:P(A;;0x1;;;SY)").expect("descriptor");
         assert!(field_grants(&plain).is_empty());
+    }
+
+    // PEI-1288: an object ACE naming a data type's root GUID grants the
+    // level-0 node, and with it the record; it is no field's grant. Listed
+    // as a field, the root would be in the object type list twice.
+    #[test]
+    fn an_ace_naming_a_data_type_root_is_not_a_field_grant() {
+        let descriptor = peios::security::sddl::parse(
+            "O:SYG:SYD:P(A;;0x1;;;SY)\
+             (OA;;0x1;a1b2c3d4-0001-4000-8000-000000000001;;BA)\
+             (OA;;0x1;a1b2c3d4-0001-4000-8000-000000000002;;BA)\
+             (OA;;0x1;a1b2c3d4-0001-4000-8000-000000000003;;AU)\
+             (OA;;0x1;341d2267-b9db-536b-b36c-94ab6cd47e4c;;AU)",
+        )
+        .expect("descriptor");
+        assert_eq!(field_grants(&descriptor), [field_guid("timestamp")]);
+        for namespace in Namespace::ALL {
+            assert!(!field_grants(&descriptor).contains(&namespace.root_guid()));
+        }
+    }
+
+    #[test]
+    fn the_root_guids_are_the_ones_the_book_gives_in_pcds_byte_order() {
+        for (namespace, sddl) in [
+            (Namespace::Events, "a1b2c3d4-0001-4000-8000-000000000001"),
+            (Namespace::Logs, "a1b2c3d4-0001-4000-8000-000000000002"),
+            (Namespace::Metrics, "a1b2c3d4-0001-4000-8000-000000000003"),
+        ] {
+            let descriptor =
+                peios::security::sddl::parse(&format!("O:SYG:SYD:P(OA;;0x1;{sddl};;AU)"))
+                    .expect("descriptor");
+            let view = descriptor.view().expect("view");
+            let named = view
+                .dacl()
+                .expect("dacl")
+                .iter()
+                .find_map(|ace| ace.object_type().copied());
+            assert_eq!(named, Some(namespace.root_guid()), "{sddl}");
+        }
     }
 
     #[test]

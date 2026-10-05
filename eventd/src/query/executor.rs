@@ -302,6 +302,11 @@ fn execute_at(
             .take
             .and_then(|take| usize::try_from(take.saturating_add(query.skip)).ok())
     };
+    let predicates = if matches!(query.source, Source::Logs { .. }) {
+        log_predicates(&query.predicates)
+    } else {
+        query.predicates.clone()
+    };
     let mut visit = |mut row: Row| -> Result<Flow, QueryError> {
         if historical_ranges
             .as_deref()
@@ -310,8 +315,7 @@ fn execute_at(
             return Ok(Flow::More);
         }
         if !authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
-            || !query
-                .predicates
+            || !predicates
                 .iter()
                 .all(|predicate| evaluate(predicate, &row.record))
         {
@@ -1221,6 +1225,10 @@ fn metric_comparison(number: f64, operator: Operator, value: &Literal) -> bool {
 struct Row {
     record: Record,
     identifier: String,
+    /// The record's timestamp, which orders and windows it whether or not
+    /// the caller may read its `timestamp` field: an internal key with no
+    /// access-control identity, like `tie` (TRM §6.2).
+    at: i64,
     tie: Tie,
 }
 
@@ -1411,6 +1419,7 @@ fn next_event(
         return Ok(Some(Row {
             record,
             identifier,
+            at: timestamp,
             tie: Tie::Event { shard, id },
         }));
     }
@@ -1608,6 +1617,7 @@ fn scan_logs(
         let row = Row {
             record,
             identifier,
+            at: timestamp,
             tie: Tie::Single(id),
         };
         if visit(row)? == Flow::Enough {
@@ -1856,6 +1866,46 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
     }
 }
 
+/// A log query's predicates, with each integer `1` or `0` that `is_error`
+/// is compared against read as `true` or `false`. PSPU §3.22 makes the
+/// two forms one for that field alone; everywhere else types do not
+/// coerce (§3.20), so an event payload's `is_error` is left as it is.
+fn log_predicates(predicates: &[Expr]) -> Vec<Expr> {
+    fn boolean(literal: &Literal) -> Literal {
+        match literal {
+            Literal::Signed(1) | Literal::Unsigned(1) => Literal::Bool(true),
+            Literal::Signed(0) | Literal::Unsigned(0) => Literal::Bool(false),
+            other => other.clone(),
+        }
+    }
+    fn rewrite(expression: &Expr) -> Expr {
+        match expression {
+            Expr::Compare {
+                field,
+                operator,
+                value,
+            } if field == "is_error" => Expr::Compare {
+                field: field.clone(),
+                operator: *operator,
+                value: boolean(value),
+            },
+            Expr::In {
+                field,
+                negated,
+                values,
+            } if field == "is_error" => Expr::In {
+                field: field.clone(),
+                negated: *negated,
+                values: values.iter().map(boolean).collect(),
+            },
+            Expr::And(left, right) => Expr::And(Box::new(rewrite(left)), Box::new(rewrite(right))),
+            Expr::Or(left, right) => Expr::Or(Box::new(rewrite(left)), Box::new(rewrite(right))),
+            other => other.clone(),
+        }
+    }
+    predicates.iter().map(rewrite).collect()
+}
+
 fn canonical_guid_literal(value: &str) -> Option<String> {
     let body = value
         .strip_prefix('{')
@@ -1921,11 +1971,11 @@ fn sort_rows(rows: &mut [Row], query: &Query) {
                 return ordering;
             }
         }
-        if query.sort.is_empty() {
-            let ordering = timestamp(right).cmp(&timestamp(left));
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
+        // The tiebreakers follow the SORT keys as they follow the default
+        // order: timestamp descending first (TRM §6.2).
+        let ordering = timestamp(right).cmp(&timestamp(left));
+        if ordering != Ordering::Equal {
+            return ordering;
         }
         match (left.tie, right.tie) {
             (
@@ -1946,11 +1996,8 @@ fn sort_rows(rows: &mut [Row], query: &Query) {
     });
 }
 
-fn timestamp(row: &Row) -> i64 {
-    match row.record.get("timestamp") {
-        Some(Value::Signed(value)) => *value,
-        _ => 0,
-    }
+const fn timestamp(row: &Row) -> i64 {
+    row.at
 }
 
 /// An aggregation's groups, folded as rows pass, so what is held is the
@@ -2045,9 +2092,10 @@ impl<'q> Groups<'q> {
         Ok(())
     }
 
-    /// The result rows: `COUNT BY` and `TOP N BY` by count descending,
-    /// `DISTINCT` by value, `GROUP` in the order its groups appeared.
-    fn finish(self) -> Result<Vec<Row>, QueryError> {
+    /// The result rows: `COUNT BY`, `TOP N BY` and `GROUP … COUNT` by
+    /// count descending, `DISTINCT` by value, any other `GROUP` in the
+    /// order its groups appeared.
+    fn finish(mut self) -> Result<Vec<Row>, QueryError> {
         let records = match self.aggregate {
             RecordAggregate::CountBy(field) => counted(field, self.seen, None),
             RecordAggregate::TopBy { count, field } => counted(field, self.seen, Some(*count)),
@@ -2064,6 +2112,22 @@ impl<'q> Groups<'q> {
                     .collect()
             }
             RecordAggregate::Group { fields, function } => {
+                // Counted groups come by count descending, then TAKE (TRM
+                // §6.4); ties go by the group keys in GROUP order under the
+                // value ordering, as COUNT BY's do (PSPU §3.21). Distinct
+                // groups differ in some key, so the order is total.
+                if matches!(function, GroupFunction::Count) {
+                    self.seen.sort_by(|left, right| {
+                        right.count.cmp(&left.count).then_with(|| {
+                            left.keys
+                                .iter()
+                                .zip(&right.keys)
+                                .map(|(left, right)| language_cmp(left, right))
+                                .find(|ordering| ordering.is_ne())
+                                .unwrap_or(Ordering::Equal)
+                        })
+                    });
+                }
                 let mut records = Vec::with_capacity(self.seen.len());
                 for group in self.seen {
                     let (name, value) = match function {
@@ -2094,6 +2158,8 @@ impl<'q> Groups<'q> {
             .map(|(index, record)| Row {
                 record,
                 identifier: String::new(),
+                // A group is no record and has no time of its own.
+                at: 0,
                 tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
             })
             .collect())
@@ -2293,23 +2359,29 @@ fn apply_record_sort(rows: &mut [Row], query: &Query) {
         return;
     }
     rows.sort_by(|left, right| {
-        query
-            .sort
-            .iter()
-            .find_map(|key| {
-                let ordering = language_cmp(
-                    left.record.get(&key.field).unwrap_or(&Value::Null),
-                    right.record.get(&key.field).unwrap_or(&Value::Null),
-                );
-                let ordering = if key.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
-                (ordering != Ordering::Equal).then_some(ordering)
-            })
-            .unwrap_or_else(|| left.tie.cmp(&right.tie))
+        sort_key_order(left, right, query).then_with(|| left.tie.cmp(&right.tie))
     });
+}
+
+/// How the query's SORT keys order two rows, `Equal` when they tie on
+/// every key.
+fn sort_key_order(left: &Row, right: &Row, query: &Query) -> Ordering {
+    query
+        .sort
+        .iter()
+        .find_map(|key| {
+            let ordering = language_cmp(
+                left.record.get(&key.field).unwrap_or(&Value::Null),
+                right.record.get(&key.field).unwrap_or(&Value::Null),
+            );
+            let ordering = if key.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            (ordering != Ordering::Equal).then_some(ordering)
+        })
+        .unwrap_or(Ordering::Equal)
 }
 
 fn apply_pagination<T>(rows: &mut Vec<T>, query: &Query) {
@@ -3376,6 +3448,7 @@ fn metric_template(name: &str, metric_type: i64, labels: &Record) -> Result<Row,
     Ok(Row {
         record,
         identifier: name.to_owned(),
+        at: 0,
         tie: Tie::Single(0),
     })
 }
@@ -3453,6 +3526,7 @@ fn read_metric_input(
         row: Row {
             record,
             identifier: name.to_owned(),
+            at: timestamp,
             tie: Tie::Single(id),
         },
         number,
@@ -3551,6 +3625,7 @@ fn transform_metric_inputs(
                 let mut row = Row {
                     record: later.row.record.clone(),
                     identifier: later.row.identifier.clone(),
+                    at: later.row.at,
                     tie: later.row.tie,
                 };
                 row.record.insert("value".into(), finite_value(value)?);
@@ -3848,6 +3923,7 @@ fn metric_aggregate_row(
     Ok(Row {
         record,
         identifier: output_name.to_owned(),
+        at: output_timestamp,
         tie: Tie::Single(tie),
     })
 }
@@ -3962,17 +4038,41 @@ fn set_metric_result(record: &mut Record, value: Value, overflow: bool) {
     }
 }
 
+/// The SORT keys, then the metric tiebreakers of TRM §6.2: timestamp,
+/// name, canonical labels and sample id, all ascending.
 fn sort_metric_rows(rows: &mut [Row], query: &Query) {
-    if query.sort.is_empty() {
-        rows.sort_by(|left, right| {
-            timestamp(left)
-                .cmp(&timestamp(right))
-                .then_with(|| left.identifier.cmp(&right.identifier))
-                .then_with(|| left.tie.cmp(&right.tie))
-        });
-    } else {
-        apply_record_sort(rows, query);
-    }
+    rows.sort_by(|left, right| {
+        sort_key_order(left, right, query)
+            .then_with(|| timestamp(left).cmp(&timestamp(right)))
+            .then_with(|| left.identifier.cmp(&right.identifier))
+            .then_with(|| canonical_labels(left).cmp(canonical_labels(right)))
+            .then_with(|| left.tie.cmp(&right.tie))
+    });
+}
+
+/// The fields of a metric record that are not labels (PSPU §3.22).
+const METRIC_FIELDS: [&str; 6] = ["timestamp", "boot_id", "name", "type", "value", "overflow"];
+
+/// The bytes of a metric row's canonical label string: its labels sorted
+/// by key, each `key=value`, joined with commas (PSPU §3.13). A record's
+/// map is already in key byte order.
+fn canonical_labels(row: &Row) -> impl Iterator<Item = u8> + '_ {
+    row.record
+        .iter()
+        .filter(|(key, _)| !METRIC_FIELDS.contains(&key.as_str()))
+        .enumerate()
+        .flat_map(|(index, (key, value))| {
+            let value: &[u8] = match value {
+                Value::String(value) => value.as_bytes(),
+                _ => &[],
+            };
+            (index != 0)
+                .then_some(b',')
+                .into_iter()
+                .chain(key.bytes())
+                .chain(core::iter::once(b'='))
+                .chain(value.iter().copied())
+        })
 }
 
 fn parse_labels(canonical: &str) -> Record {
@@ -4460,6 +4560,63 @@ mod tests {
         );
     }
 
+    // PEI-1295, TRM §6.2: records an explicit SORT leaves tied are ordered
+    // by the mode's tiebreakers in full, timestamp descending first.
+    #[test]
+    fn records_tied_on_the_sort_keys_come_newest_first_before_shard_and_id() {
+        let event = |timestamp: i64, shard: usize, id: i64| Row {
+            record: BTreeMap::from([
+                ("timestamp".into(), Value::Signed(timestamp)),
+                ("k".into(), Value::Signed(1)),
+            ]),
+            identifier: "t".into(),
+            at: timestamp,
+            tie: Tie::Event { shard, id },
+        };
+        // The older event in the lower shard, the newer in the higher, and
+        // a newer one still with the lower row id of the higher shard.
+        let mut rows = vec![
+            event(10, 0, 9),
+            event(20, 1, 1),
+            event(20, 1, 2),
+            event(30, 1, 0),
+        ];
+        sort_rows(
+            &mut rows,
+            &crate::query_language::parse("EVENTS SORT k").unwrap(),
+        );
+        let order: Vec<_> = rows.iter().map(|row| (timestamp(row), row.tie)).collect();
+        assert_eq!(
+            order,
+            [
+                (30, Tie::Event { shard: 1, id: 0 }),
+                (20, Tie::Event { shard: 1, id: 2 }),
+                (20, Tie::Event { shard: 1, id: 1 }),
+                (10, Tie::Event { shard: 0, id: 9 }),
+            ]
+        );
+
+        let line = |timestamp: i64, id: i64| Row {
+            record: BTreeMap::from([
+                ("timestamp".into(), Value::Signed(timestamp)),
+                ("is_error".into(), Value::Bool(false)),
+            ]),
+            identifier: "o".into(),
+            at: timestamp,
+            tie: Tie::Single(id),
+        };
+        // The newer line inserted first: row id and time disagree.
+        let mut rows = vec![line(20, 1), line(10, 2)];
+        sort_rows(
+            &mut rows,
+            &crate::query_language::parse("LOGS SORT is_error").unwrap(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.tie).collect::<Vec<_>>(),
+            [Tie::Single(1), Tie::Single(2)]
+        );
+    }
+
     #[test]
     fn a_newest_first_scan_stops_when_told_enough() {
         let shards = [
@@ -4698,6 +4855,7 @@ mod tests {
                             row: Row {
                                 record,
                                 identifier: name.into(),
+                                at,
                                 tie: Tie::Single(core * 1_000 + index),
                             },
                             number,
@@ -4820,6 +4978,7 @@ mod tests {
                         .row
                         .record
                         .insert("timestamp".into(), Value::Signed(at));
+                    input.row.at = at;
                     if let Some(point) = transformer.push(input)? {
                         sink.push(point, held)?;
                     }
@@ -5173,6 +5332,7 @@ mod tests {
                 ("value".into(), value),
             ]),
             identifier: "test".into(),
+            at: timestamp,
             tie: Tie::Single(timestamp),
         }
     }
@@ -5191,6 +5351,90 @@ mod tests {
             number: 0.0,
             histogram: Some(test_histogram(total_count, final_count)),
         }
+    }
+
+    // PEI-1296, TRM §7.3: a sample whose timestamp field the caller may
+    // not read is still placed by its time, as range and window membership
+    // need, and its result still lacks the field.
+    #[test]
+    fn a_sample_with_its_timestamp_hidden_is_still_placed_by_its_time() {
+        let since = 1_000;
+        // What authorize_row leaves of a sample when timestamp is denied.
+        let hidden = |at| {
+            let mut input = test_metric_input(at, 2.0);
+            input.row.record.remove("timestamp");
+            input
+        };
+        let point = Transformer::new(None, since)
+            .push(hidden(5_000))
+            .unwrap()
+            .expect("the sample is in range");
+        assert_eq!(point.row.record.get("timestamp"), None, "and stays hidden");
+        assert!(
+            Transformer::new(None, since)
+                .push(hidden(500))
+                .unwrap()
+                .is_none(),
+            "one before SINCE is out of range still"
+        );
+        let budget = budget(usize::MAX);
+        let mut held = Held::new(&budget);
+        let mut windows = Windows::new(1_000);
+        windows.push(&point, &mut held).unwrap();
+        assert_eq!(
+            windows.folds.keys().copied().collect::<Vec<_>>(),
+            [5_000],
+            "a window takes it by its time"
+        );
+    }
+
+    // PEI-1295, TRM §6.2: metric rows tie-break on timestamp, name,
+    // canonical labels and sample id, all ascending, after any SORT keys.
+    #[test]
+    fn metric_ties_are_broken_by_canonical_labels_before_sample_id() {
+        let sample = |name: &str, labels: &[(&str, &str)], at: i64, id: i64| {
+            let mut row = test_row(at, Value::Float(1.0));
+            row.identifier = name.into();
+            row.record.insert("name".into(), Value::String(name.into()));
+            for (key, value) in labels {
+                row.record
+                    .insert((*key).into(), Value::String((*value).into()));
+            }
+            row.tie = Tie::Single(id);
+            row
+        };
+        let order = |query: &str, mut rows: Vec<Row>| {
+            sort_metric_rows(&mut rows, &crate::query_language::parse(query).unwrap());
+            rows.iter().map(row_id).collect::<Vec<_>>()
+        };
+        // k=b was written first, so its sample id is the lower.
+        let tied = || {
+            vec![
+                sample("m", &[("k", "b")], 5, 1),
+                sample("m", &[("k", "a")], 5, 2),
+            ]
+        };
+        assert_eq!(order("METRIC m[]", tied()), [2, 1], "k=a before k=b");
+        assert_eq!(
+            order("METRIC m[] SORT value", tied()),
+            [2, 1],
+            "under a SORT too"
+        );
+        // Canonical labels compare as the joined string, where `,` (0x2c)
+        // sorts after `+` (0x2b): "k=a+" < "k=a,l=x".
+        let joined = vec![
+            sample("m", &[("k", "a"), ("l", "x")], 5, 1),
+            sample("m", &[("k", "a+")], 5, 2),
+        ];
+        assert_eq!(order("METRIC m[]", joined), [2, 1]);
+        // Timestamp, then name, come first, and the sample id last.
+        let rows = vec![
+            sample("n", &[("k", "a")], 5, 1),
+            sample("m", &[("k", "b")], 5, 2),
+            sample("m", &[("k", "c")], 4, 3),
+            sample("m", &[("k", "b")], 5, 0),
+        ];
+        assert_eq!(order("METRIC m[] SORT value", rows), [3, 0, 2, 1]);
     }
 
     fn test_histogram(total_count: u64, final_count: u64) -> Vec<u8> {
@@ -5266,6 +5510,7 @@ mod tests {
                 Row {
                     record,
                     identifier: "t".into(),
+                    at: 0,
                     tie: Tie::Single(index),
                 }
             })
@@ -5321,6 +5566,22 @@ mod tests {
             } else {
                 groups.push((keys, vec![row]));
             }
+        }
+        if let RecordAggregate::Group {
+            function: GroupFunction::Count,
+            ..
+        } = aggregate
+        {
+            groups.sort_by(|left, right| {
+                right.1.len().cmp(&left.1.len()).then_with(|| {
+                    left.0
+                        .iter()
+                        .zip(&right.0)
+                        .map(|(left, right)| language_cmp(left, right))
+                        .find(|ordering| ordering.is_ne())
+                        .unwrap_or(Ordering::Equal)
+                })
+            });
         }
         let records: Vec<Record> = match aggregate {
             RecordAggregate::CountBy(field) | RecordAggregate::TopBy { field, .. } => {
@@ -5435,6 +5696,7 @@ mod tests {
             .map(|(index, record)| Row {
                 record,
                 identifier: String::new(),
+                at: 0,
                 tie: Tie::Single(i64::try_from(index).unwrap()),
             })
             .collect();
@@ -5482,6 +5744,39 @@ mod tests {
         // Every NaN is one value, so they are one group (PSPU §3.21).
         let distinct = fold(&rows, &RecordAggregate::Distinct("k".into()));
         assert_eq!(distinct.matches("NaN").count(), 1);
+    }
+
+    // PEI-1296, PSPU §3.22: a log's is_error, served as a boolean, compares
+    // against 1 and 0 as against true and false.
+    #[test]
+    fn a_log_query_compares_is_error_against_1_and_0_as_true_and_false() {
+        let matches = |text: &str, is_error: bool| {
+            let query = crate::query_language::parse(&format!("LOGS WHERE {text}")).unwrap();
+            let record = BTreeMap::from([("is_error".into(), Value::Bool(is_error))]);
+            log_predicates(&query.predicates)
+                .iter()
+                .all(|predicate| evaluate(predicate, &record))
+        };
+        for (text, error, normal) in [
+            ("is_error == 1", true, false),
+            ("is_error == 0", false, true),
+            ("is_error == true", true, false),
+            ("is_error != 1", false, true),
+            ("is_error IN (1)", true, false),
+            ("is_error NOT_IN (0)", true, false),
+            ("is_error == 1 AND is_error != 0", true, false),
+            ("is_error == 0 OR is_error == 1", true, true),
+            // Only 1 and 0 are its integers; 2 is no boolean.
+            ("is_error == 2", false, false),
+        ] {
+            assert_eq!(matches(text, true), error, "{text} of an error line");
+            assert_eq!(matches(text, false), normal, "{text} of a normal one");
+        }
+        // An event's is_error is a payload field like any other, and types
+        // do not coerce there (§3.20).
+        let query = crate::query_language::parse("EVENTS WHERE is_error == 1").unwrap();
+        let record = BTreeMap::from([("is_error".into(), Value::Bool(true))]);
+        assert!(!evaluate(&query.predicates[0], &record));
     }
 
     #[test]
@@ -5554,6 +5849,7 @@ mod tests {
             .map(|index| Row {
                 record: BTreeMap::from([("n".into(), Value::Signed((index * 7_919) % 5_003))]),
                 identifier: "t".into(),
+                at: 0,
                 tie: Tie::Single(index),
             })
             .collect();
@@ -5597,6 +5893,70 @@ mod tests {
         assert_eq!(budget.used.load(AtomicOrdering::Acquire), 0);
     }
 
+    // PEI-1295, TRM §6.4: GROUP … COUNT's groups are sorted by count
+    // descending and then taken, whatever order they were read in; ties
+    // go by the group keys under the value ordering (PSPU §3.21).
+    #[test]
+    fn grouped_counts_come_by_count_descending_then_key_whatever_the_read_order() {
+        let grouped = |query: &str, values: &[(&str, i64)]| {
+            let query = crate::query_language::parse(query).unwrap();
+            let budget = budget(usize::MAX);
+            let mut held = Held::new(&budget);
+            let mut groups = Groups::new(query.aggregate.as_ref().unwrap());
+            for (index, (v, w)) in values.iter().enumerate() {
+                let row = Row {
+                    record: BTreeMap::from([
+                        ("v".into(), Value::String((*v).into())),
+                        ("w".into(), Value::Signed(*w)),
+                    ]),
+                    identifier: "t".into(),
+                    at: 0,
+                    tie: Tie::Single(i64::try_from(index).unwrap()),
+                };
+                groups.add(&row, &mut held).unwrap();
+            }
+            let mut rows = groups.finish().unwrap();
+            apply_record_sort(&mut rows, &query);
+            apply_pagination(&mut rows, &query);
+            rows.iter()
+                .map(|row| {
+                    let Some(Value::String(v)) = row.record.get("v") else {
+                        panic!("a group has its key")
+                    };
+                    let w = match row.record.get("w") {
+                        Some(Value::Signed(w)) => format!("{w}"),
+                        _ => String::new(),
+                    };
+                    format!("{v}{w}")
+                })
+                .collect::<Vec<_>>()
+        };
+        // a once, b three times, c twice, d once; a and d tie, d read first.
+        let read = [
+            ("d", 0),
+            ("a", 0),
+            ("b", 0),
+            ("c", 0),
+            ("b", 0),
+            ("c", 0),
+            ("b", 0),
+        ];
+        assert_eq!(grouped("EVENTS GROUP v COUNT", &read), ["b", "c", "a", "d"]);
+        let mut reversed = read;
+        reversed.reverse();
+        assert_eq!(
+            grouped("EVENTS GROUP v COUNT", &reversed),
+            ["b", "c", "a", "d"]
+        );
+        assert_eq!(grouped("EVENTS GROUP v COUNT TAKE 2", &read), ["b", "c"]);
+        // Two keys: ties go by the first, then the second.
+        let read = [("b", 2), ("a", 2), ("b", 1), ("a", 1), ("a", 1)];
+        assert_eq!(
+            grouped("EVENTS GROUP v, w COUNT", &read),
+            ["a1", "a2", "b1", "b2"]
+        );
+    }
+
     #[test]
     fn an_aggregation_past_the_budget_fails_rather_than_grows() {
         let budget = budget(HELD_GRANULE);
@@ -5607,6 +5967,7 @@ mod tests {
             let row = Row {
                 record: BTreeMap::from([("k".into(), Value::String(format!("value {index}")))]),
                 identifier: "t".into(),
+                at: 0,
                 tie: Tie::Single(index),
             };
             groups.add(&row, &mut held).err()
