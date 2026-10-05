@@ -302,6 +302,11 @@ fn execute_at(
             .take
             .and_then(|take| usize::try_from(take.saturating_add(query.skip)).ok())
     };
+    let predicates = if matches!(query.source, Source::Logs { .. }) {
+        log_predicates(&query.predicates)
+    } else {
+        query.predicates.clone()
+    };
     let mut visit = |mut row: Row| -> Result<Flow, QueryError> {
         if historical_ranges
             .as_deref()
@@ -310,8 +315,7 @@ fn execute_at(
             return Ok(Flow::More);
         }
         if !authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
-            || !query
-                .predicates
+            || !predicates
                 .iter()
                 .all(|predicate| evaluate(predicate, &row.record))
         {
@@ -1854,6 +1858,46 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
         Literal::Binary(value) => Value::Binary(value.clone()),
         Literal::Bool(value) => Value::Bool(*value),
     }
+}
+
+/// A log query's predicates, with each integer `1` or `0` that `is_error`
+/// is compared against read as `true` or `false`. PSPU §3.22 makes the
+/// two forms one for that field alone; everywhere else types do not
+/// coerce (§3.20), so an event payload's `is_error` is left as it is.
+fn log_predicates(predicates: &[Expr]) -> Vec<Expr> {
+    fn boolean(literal: &Literal) -> Literal {
+        match literal {
+            Literal::Signed(1) | Literal::Unsigned(1) => Literal::Bool(true),
+            Literal::Signed(0) | Literal::Unsigned(0) => Literal::Bool(false),
+            other => other.clone(),
+        }
+    }
+    fn rewrite(expression: &Expr) -> Expr {
+        match expression {
+            Expr::Compare {
+                field,
+                operator,
+                value,
+            } if field == "is_error" => Expr::Compare {
+                field: field.clone(),
+                operator: *operator,
+                value: boolean(value),
+            },
+            Expr::In {
+                field,
+                negated,
+                values,
+            } if field == "is_error" => Expr::In {
+                field: field.clone(),
+                negated: *negated,
+                values: values.iter().map(boolean).collect(),
+            },
+            Expr::And(left, right) => Expr::And(Box::new(rewrite(left)), Box::new(rewrite(right))),
+            Expr::Or(left, right) => Expr::Or(Box::new(rewrite(left)), Box::new(rewrite(right))),
+            other => other.clone(),
+        }
+    }
+    predicates.iter().map(rewrite).collect()
 }
 
 fn canonical_guid_literal(value: &str) -> Option<String> {
@@ -5537,6 +5581,39 @@ mod tests {
         // Every NaN is one value, so they are one group (PSPU §3.21).
         let distinct = fold(&rows, &RecordAggregate::Distinct("k".into()));
         assert_eq!(distinct.matches("NaN").count(), 1);
+    }
+
+    // PEI-1296, PSPU §3.22: a log's is_error, served as a boolean, compares
+    // against 1 and 0 as against true and false.
+    #[test]
+    fn a_log_query_compares_is_error_against_1_and_0_as_true_and_false() {
+        let matches = |text: &str, is_error: bool| {
+            let query = crate::query_language::parse(&format!("LOGS WHERE {text}")).unwrap();
+            let record = BTreeMap::from([("is_error".into(), Value::Bool(is_error))]);
+            log_predicates(&query.predicates)
+                .iter()
+                .all(|predicate| evaluate(predicate, &record))
+        };
+        for (text, error, normal) in [
+            ("is_error == 1", true, false),
+            ("is_error == 0", false, true),
+            ("is_error == true", true, false),
+            ("is_error != 1", false, true),
+            ("is_error IN (1)", true, false),
+            ("is_error NOT_IN (0)", true, false),
+            ("is_error == 1 AND is_error != 0", true, false),
+            ("is_error == 0 OR is_error == 1", true, true),
+            // Only 1 and 0 are its integers; 2 is no boolean.
+            ("is_error == 2", false, false),
+        ] {
+            assert_eq!(matches(text, true), error, "{text} of an error line");
+            assert_eq!(matches(text, false), normal, "{text} of a normal one");
+        }
+        // An event's is_error is a payload field like any other, and types
+        // do not coerce there (§3.20).
+        let query = crate::query_language::parse("EVENTS WHERE is_error == 1").unwrap();
+        let record = BTreeMap::from([("is_error".into(), Value::Bool(true))]);
+        assert!(!evaluate(&query.predicates[0], &record));
     }
 
     #[test]
