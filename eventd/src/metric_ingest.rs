@@ -300,7 +300,10 @@ pub fn run(
         }
     }
     // The queue left at shutdown drains without the latency cap, the open
-    // transaction keeping the size cap it began with.
+    // transaction keeping the size cap it began with. As for logs, the
+    // socket is shut for reading first, so a later sender is refused
+    // rather than queued behind the drain and lost when the socket closes.
+    socket.shut_for_reading()?;
     loop {
         let max_batch_size = Config::read(runtime, |config| config.metric_max_batch_size);
         match socket.receive_token(&mut buffer)? {
@@ -1085,6 +1088,31 @@ mod tests {
                 "five commands to an idle thread took {took:?}"
             );
         });
+    }
+
+    // PEI-1297: as for the log socket.
+    #[test]
+    fn once_the_metric_thread_has_drained_its_socket_a_send_is_refused_not_lost() {
+        let metric = MetricThread::new();
+        let socket = metric.bind();
+        let (_maintenance, commands) = std::sync::mpsc::channel();
+        let (_rollups, rollup_commands) = std::sync::mpsc::sync_channel(1);
+        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        sender.connect(metric.socket_path()).unwrap();
+        sender.send(b"before the stop").unwrap();
+        metric.stopping.store(true, Ordering::Release);
+        metric.run(&socket, &commands, &rollup_commands).unwrap();
+        let mut buffer = [0_u8; 64];
+        assert!(
+            matches!(socket.receive_token(&mut buffer), Ok(TokenReceive::Empty)),
+            "what was queued at the stop was read"
+        );
+        let refused = sender.send(b"after the drain").unwrap_err();
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::EPIPE),
+            "a send after the drain is refused, so the sender keeps it: {refused}"
+        );
     }
 
     #[test]

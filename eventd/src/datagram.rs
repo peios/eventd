@@ -272,6 +272,16 @@ impl IngestionSocket {
         Ok(())
     }
 
+    /// Refuse every datagram from here on: a send to the socket now fails
+    /// with `EPIPE`, telling its sender the datagram was not taken, where
+    /// one queued now would be freed unread when the descriptor closes.
+    /// What is already queued stays readable.
+    pub fn shut_for_reading(&self) -> Result<(), SocketError> {
+        self.socket
+            .shutdown(std::net::Shutdown::Read)
+            .map_err(SocketError::Io)
+    }
+
     /// Remove the bound pathname without closing the queued datagram descriptor.
     pub fn unlink(&self) {
         unlink_if_owned(&self.path, self.identity);
