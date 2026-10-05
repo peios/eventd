@@ -135,17 +135,26 @@ impl Config {
         reason = "the registry schema remains visible as one configuration literal"
     )]
     fn from_values(values: &HashMap<Vec<u8>, ValueRecord>) -> Result<Self, ConfigError> {
-        let adaptive_index_create_threshold = u64::from(dword(
+        let mut adaptive_index_create_threshold = u64::from(dword(
             values,
             b"AdaptiveIndexCreateThreshold",
             100,
             10,
             10_000,
         ));
-        let adaptive_index_drop_threshold =
+        let mut adaptive_index_drop_threshold =
             u64::from(dword(values, b"AdaptiveIndexDropThreshold", 10, 1, 1_000));
+        // A reload keeps the pair already in use when the new pair is out of
+        // relation; it reaches here already corrected. At startup the pair
+        // in use is the defaults, so the same rule keeps those.
         if adaptive_index_drop_threshold >= adaptive_index_create_threshold {
-            return Err(ConfigError::Invalid(b"AdaptiveIndexDropThreshold"));
+            eprintln!(
+                "eventd: ignoring AdaptiveIndexDropThreshold {adaptive_index_drop_threshold} \
+                 with AdaptiveIndexCreateThreshold {adaptive_index_create_threshold}: the drop \
+                 threshold must be below the create threshold; using 10 and 100"
+            );
+            adaptive_index_create_threshold = 100;
+            adaptive_index_drop_threshold = 10;
         }
 
         Ok(Self {
@@ -1233,6 +1242,49 @@ mod tests {
         assert_eq!(
             required_path(&values, b"EventStorePath").unwrap(),
             PathBuf::from("/var/state/eventd/events/")
+        );
+    }
+
+    #[test]
+    fn a_threshold_pair_out_of_relation_at_startup_keeps_the_defaults() {
+        let mut values = Config::test_defaults().raw_values;
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 500),
+        );
+        let config = Config::from_values(&values).expect("a tuning pair does not fail startup");
+        assert_eq!(config.adaptive_index_create_threshold, 100);
+        assert_eq!(config.adaptive_index_drop_threshold, 10);
+
+        values.insert(
+            b"AdaptiveIndexCreateThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexCreateThreshold", 50),
+        );
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 50),
+        );
+        let config = Config::from_values(&values).expect("equal thresholds do not fail startup");
+        assert_eq!(
+            (
+                config.adaptive_index_create_threshold,
+                config.adaptive_index_drop_threshold
+            ),
+            (100, 10)
+        );
+
+        values.insert(
+            b"AdaptiveIndexDropThreshold".to_vec(),
+            dword_record(b"AdaptiveIndexDropThreshold", 20),
+        );
+        let config = Config::from_values(&values).expect("configuration");
+        assert_eq!(
+            (
+                config.adaptive_index_create_threshold,
+                config.adaptive_index_drop_threshold
+            ),
+            (50, 20),
+            "a pair in relation is used as configured"
         );
     }
 
