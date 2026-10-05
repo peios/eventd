@@ -21,7 +21,7 @@ CREATE TABLE series (
     label_hash INTEGER NOT NULL,
     boundaries_hash INTEGER,
     boundaries BLOB,
-    UNIQUE(name, labels, boundaries_hash)
+    UNIQUE(name, labels, boundaries)
 );
 CREATE TABLE samples (
     id INTEGER PRIMARY KEY,
@@ -38,6 +38,7 @@ CREATE TABLE metadata (
 CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);
 CREATE INDEX idx_series_name ON series(name);
 CREATE INDEX idx_series_label_hash ON series(label_hash);
+CREATE INDEX idx_series_boundaries_hash ON series(boundaries_hash);
 CREATE TABLE rollups (
     series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
     window_start INTEGER NOT NULL,
@@ -52,10 +53,46 @@ CREATE TABLE rollups (
     PRIMARY KEY (series_id, window_start, window_width, transform, function)
 ) WITHOUT ROWID;
 CREATE INDEX idx_rollups_window ON rollups(window_start);
-INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
+INSERT INTO metadata(key, value) VALUES ('schema_version', '3');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
 COMMIT;
+";
+
+/// Version 2 to 3: a series is unique on its full boundary blob, not on the
+/// blob's hash, which is a lookup key and never an identity (§5.2). Two
+/// histograms whose boundaries collide on the hash are two series; under
+/// version 2 the second one's INSERT violated the constraint.
+///
+/// `SQLite` cannot alter a constraint, so the table is rebuilt. Foreign keys
+/// are off around it: with them on, dropping the old table would delete
+/// through `rollups`' cascade and fail on `samples`' reference. Identifiers
+/// are kept, so both tables' references hold once the new table takes the
+/// old name. No row can conflict, since rows equal on the blob are equal on
+/// its hash.
+const MIGRATE_V2_TO_V3: &str = r"
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TABLE series_v3 (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    type INTEGER NOT NULL CHECK (type IN (0, 1, 2)),
+    label_hash INTEGER NOT NULL,
+    boundaries_hash INTEGER,
+    boundaries BLOB,
+    UNIQUE(name, labels, boundaries)
+);
+INSERT INTO series_v3 (id, name, labels, type, label_hash, boundaries_hash, boundaries)
+SELECT id, name, labels, type, label_hash, boundaries_hash, boundaries FROM series;
+DROP TABLE series;
+ALTER TABLE series_v3 RENAME TO series;
+CREATE INDEX idx_series_name ON series(name);
+CREATE INDEX idx_series_label_hash ON series(label_hash);
+CREATE INDEX idx_series_boundaries_hash ON series(boundaries_hash);
+UPDATE metadata SET value = '3' WHERE key = 'schema_version';
+COMMIT;
+PRAGMA foreign_keys=ON;
 ";
 
 /// Metric series type stored as a stable integer.
@@ -669,19 +706,37 @@ fn validate_schema(connection: &Connection) -> Result<(), MetricStoreError> {
         )?;
         "2".clone_into(&mut version);
     }
-    if version != "2" {
+    if version == "2" {
+        // The rebuild recreates the series indexes, so verify the version 2
+        // structure first: a store missing one still fails startup.
+        require_objects(connection, &VERSION_2_OBJECTS)?;
+        connection.execute_batch(MIGRATE_V2_TO_V3)?;
+        "3".clone_into(&mut version);
+    }
+    if version != "3" {
         return Err(MetricStoreError::UnknownVersion(version));
     }
-    for (kind, name) in [
-        ("table", "series"),
-        ("table", "samples"),
-        ("table", "metadata"),
-        ("index", "idx_samples_series_timestamp"),
-        ("index", "idx_series_name"),
-        ("index", "idx_series_label_hash"),
-        ("table", "rollups"),
-        ("index", "idx_rollups_window"),
-    ] {
+    require_objects(connection, &VERSION_2_OBJECTS)?;
+    require_objects(connection, &[("index", "idx_series_boundaries_hash")])
+}
+
+/// The schema objects of version 2, all of which version 3 keeps.
+const VERSION_2_OBJECTS: [(&str, &str); 8] = [
+    ("table", "series"),
+    ("table", "samples"),
+    ("table", "metadata"),
+    ("index", "idx_samples_series_timestamp"),
+    ("index", "idx_series_name"),
+    ("index", "idx_series_label_hash"),
+    ("table", "rollups"),
+    ("index", "idx_rollups_window"),
+];
+
+fn require_objects(
+    connection: &Connection,
+    objects: &[(&str, &str)],
+) -> Result<(), MetricStoreError> {
+    for (kind, name) in objects {
         let exists: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
             params![kind, name],
@@ -1098,6 +1153,171 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Two strictly increasing boundary arrays whose blobs differ but share
+    /// a `boundaries_hash` under the book's FNV-1a parameters.
+    fn colliding_histograms() -> [MetricRecord; 2] {
+        [
+            [0x3ff7_40fe_76b4_fb21_u64, 0x4002_1c00_0000_0000],
+            [0x3ffc_3e90_05d7_14f8, 0x4003_0400_0000_0000],
+        ]
+        .map(|bits| {
+            record(
+                MetricType::Histogram,
+                MetricValue::Histogram(Histogram {
+                    boundaries: bits.map(f64::from_bits).into(),
+                    counts: [0, 1].into(),
+                    total_count: 1,
+                    sum: 1.5,
+                }),
+            )
+        })
+    }
+
+    #[test]
+    fn histograms_whose_boundary_hashes_collide_are_two_series() {
+        let directory = temporary_directory();
+        let mut store = MetricStore::open(directory.join("metrics.db"), 1_000, 10).unwrap();
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let hashes: Vec<i64> = {
+            let mut statement = store
+                .connection
+                .prepare("SELECT boundaries_hash FROM series ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(hashes, [5_602_808_888_786_851_467; 2]);
+        // And each resolves to its own series from now on.
+        store.configure(1_000, 0);
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let per_series: Vec<u32> = {
+            let mut statement = store
+                .connection
+                .prepare("SELECT count(*) FROM samples GROUP BY series_id ORDER BY series_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(per_series, [2, 2]);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The version 2 schema as eventd 0.1.8 created it.
+    const VERSION_2_SCHEMA: &str = "PRAGMA journal_mode=WAL;\
+         CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT NOT NULL,\
+             labels TEXT NOT NULL, type INTEGER NOT NULL CHECK (type IN (0, 1, 2)),\
+             label_hash INTEGER NOT NULL, boundaries_hash INTEGER, boundaries BLOB,\
+             UNIQUE(name, labels, boundaries_hash));\
+         CREATE TABLE samples (id INTEGER PRIMARY KEY,\
+             series_id INTEGER NOT NULL REFERENCES series(id), boot_id BLOB NOT NULL,\
+             timestamp INTEGER NOT NULL, value REAL NOT NULL, histogram_data BLOB);\
+         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;\
+         CREATE INDEX idx_samples_series_timestamp ON samples(series_id, timestamp, id);\
+         CREATE INDEX idx_series_name ON series(name);\
+         CREATE INDEX idx_series_label_hash ON series(label_hash);\
+         CREATE TABLE rollups (\
+             series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,\
+             window_start INTEGER NOT NULL, window_width INTEGER NOT NULL,\
+             transform INTEGER NOT NULL, function INTEGER NOT NULL, value REAL,\
+             overflow INTEGER NOT NULL, source_max_sample_id INTEGER NOT NULL,\
+             source_baseline_sample_id INTEGER,\
+             PRIMARY KEY (series_id, window_start, window_width, transform, function)\
+         ) WITHOUT ROWID;\
+         CREATE INDEX idx_rollups_window ON rollups(window_start);\
+         INSERT INTO metadata VALUES ('schema_version', '2');\
+         INSERT INTO metadata VALUES ('created_at', '2026-01-01T00:00:00Z');";
+
+    #[test]
+    fn a_version_two_store_missing_a_series_index_fails_rather_than_migrating() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(VERSION_2_SCHEMA).unwrap();
+        old.execute_batch("DROP INDEX idx_series_name;").unwrap();
+        drop(old);
+        assert!(matches!(
+            MetricStore::open(&path, 1_000, 10),
+            Err(MetricStoreError::InvalidSchema(_))
+        ));
+        let version: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2", "the store was left as it was");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_version_two_store_migrates_to_three_keeping_series_samples_and_rollups() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(VERSION_2_SCHEMA).unwrap();
+        old.execute_batch(
+            "INSERT INTO series VALUES (7, 'test.metric', 'core=0', 1, 0, NULL, NULL);\
+             INSERT INTO samples VALUES (1, 7, zeroblob(16), 10, 1.0, NULL);\
+             INSERT INTO rollups VALUES (7, 0, 10, 0, 0, 1.0, 0, 1, NULL);",
+        )
+        .unwrap();
+        old.execute(
+            "UPDATE series SET label_hash = ?1 WHERE id = 7",
+            [hash_for_sql(b"core=0")],
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = MetricStore::open(&path, 1_000, 10).unwrap();
+        let counts: (String, u32, u32, u32) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT value FROM metadata WHERE key = 'schema_version'),\
+                 (SELECT count(*) FROM series WHERE id = 7),\
+                 (SELECT count(*) FROM samples WHERE series_id = 7),\
+                 (SELECT count(*) FROM rollups WHERE series_id = 7)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, ("3".to_owned(), 1, 1, 1));
+        let violations: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        // The existing gauge series still resolves, and a collision is two
+        // series rather than a failed commit.
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(2.0))])
+            .unwrap();
+        for histogram in colliding_histograms() {
+            store.commit(&[histogram]).unwrap();
+        }
+        let series: u32 = store
+            .connection
+            .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(series, 3);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn rollups_are_bounded_and_retention_invalidates_their_series() {
         let directory = temporary_directory();
@@ -1230,7 +1450,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        // Through version 2 to the current version 3.
+        assert_eq!(version, "3");
         let exists: bool = store
             .connection
             .query_row(
