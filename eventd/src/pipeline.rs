@@ -690,9 +690,10 @@ fn supervise(
     match timestamp {
         Ok(timestamp) => {
             let shutdown = crate::synthetic::shutdown(boot_id, &sequences, timestamp);
+            // With no writable shard the record is skipped and the failure
+            // logged (TRM §8.4); it does not fail the shutdown.
             if let Err(error) = commit_synthetic_fallback(queues, &shutdown) {
                 eprintln!("eventd: cannot persist synthetic.shutdown: {error}");
-                first_error.get_or_insert(error);
             }
         }
         Err(error) => {
