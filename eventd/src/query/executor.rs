@@ -1921,11 +1921,11 @@ fn sort_rows(rows: &mut [Row], query: &Query) {
                 return ordering;
             }
         }
-        if query.sort.is_empty() {
-            let ordering = timestamp(right).cmp(&timestamp(left));
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
+        // The tiebreakers follow the SORT keys as they follow the default
+        // order: timestamp descending first (TRM §6.2).
+        let ordering = timestamp(right).cmp(&timestamp(left));
+        if ordering != Ordering::Equal {
+            return ordering;
         }
         match (left.tie, right.tie) {
             (
@@ -4457,6 +4457,61 @@ mod tests {
         assert_eq!(
             &merged[4..8],
             &[(20, 0, 4), (20, 0, 3), (20, 1, 4), (20, 1, 1)]
+        );
+    }
+
+    // PEI-1295, TRM §6.2: records an explicit SORT leaves tied are ordered
+    // by the mode's tiebreakers in full, timestamp descending first.
+    #[test]
+    fn records_tied_on_the_sort_keys_come_newest_first_before_shard_and_id() {
+        let event = |timestamp: i64, shard: usize, id: i64| Row {
+            record: BTreeMap::from([
+                ("timestamp".into(), Value::Signed(timestamp)),
+                ("k".into(), Value::Signed(1)),
+            ]),
+            identifier: "t".into(),
+            tie: Tie::Event { shard, id },
+        };
+        // The older event in the lower shard, the newer in the higher, and
+        // a newer one still with the lower row id of the higher shard.
+        let mut rows = vec![
+            event(10, 0, 9),
+            event(20, 1, 1),
+            event(20, 1, 2),
+            event(30, 1, 0),
+        ];
+        sort_rows(
+            &mut rows,
+            &crate::query_language::parse("EVENTS SORT k").unwrap(),
+        );
+        let order: Vec<_> = rows.iter().map(|row| (timestamp(row), row.tie)).collect();
+        assert_eq!(
+            order,
+            [
+                (30, Tie::Event { shard: 1, id: 0 }),
+                (20, Tie::Event { shard: 1, id: 2 }),
+                (20, Tie::Event { shard: 1, id: 1 }),
+                (10, Tie::Event { shard: 0, id: 9 }),
+            ]
+        );
+
+        let line = |timestamp: i64, id: i64| Row {
+            record: BTreeMap::from([
+                ("timestamp".into(), Value::Signed(timestamp)),
+                ("is_error".into(), Value::Bool(false)),
+            ]),
+            identifier: "o".into(),
+            tie: Tie::Single(id),
+        };
+        // The newer line inserted first: row id and time disagree.
+        let mut rows = vec![line(20, 1), line(10, 2)];
+        sort_rows(
+            &mut rows,
+            &crate::query_language::parse("LOGS SORT is_error").unwrap(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.tie).collect::<Vec<_>>(),
+            [Tie::Single(1), Tie::Single(2)]
         );
     }
 
