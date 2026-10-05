@@ -64,6 +64,9 @@ pub fn run(
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
     let mut batch_history = VecDeque::new();
     loop {
+        let first = queue.pop_wait();
+        // Read after the wait, so a change made while the writer was idle
+        // bounds the batch this message opens, not the one after it.
         let (max_batch_size, max_batch_latency, checkpoint_pages, shedding) =
             Config::read(runtime, |config| {
                 (
@@ -78,7 +81,6 @@ pub fn run(
                 )
             });
         shard.set_checkpoint_pages(checkpoint_pages);
-        let first = queue.pop_wait();
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
@@ -741,6 +743,50 @@ mod tests {
             writer.join().unwrap().unwrap();
         });
         assert_eq!(stored_events(&directory.join("shard-0000.db")), 450);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_max_batch_size_change_while_the_writer_is_idle_bounds_the_next_batch() {
+        let directory = temporary_directory();
+        let shard = Shard::open(directory.join("shard-0000.db"), 1_000).unwrap();
+        let queue = handoff();
+        let runtime = batched_by_size(100);
+        let harness = Harness::new();
+        let (idle, idle_signal) = sync_channel(1);
+        let (done, done_signal) = sync_channel(1);
+        publish(&queue, WriterMessage::Barrier(idle));
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            idle_signal.recv().unwrap().unwrap();
+            // The writer goes back to waiting on its empty handoff.
+            std::thread::sleep(Duration::from_millis(200));
+            runtime.write().unwrap().max_batch_size = 10;
+            // Thirty events and a barrier, which the writer sees together:
+            // every slot is reserved first and the first is published last.
+            let mut slots: Vec<_> = (0..31)
+                .map(|_| {
+                    queue
+                        .reserve(core::mem::size_of::<WriterMessage>())
+                        .unwrap()
+                })
+                .collect();
+            slots.pop().unwrap().publish(WriterMessage::Barrier(done));
+            for sequence in (1..=30).rev() {
+                slots.pop().unwrap().publish(real_event(sequence));
+            }
+            done_signal.recv().unwrap().unwrap();
+            assert_eq!(
+                harness.commits.generation(),
+                3,
+                "30 events under the new MaxBatchSize 10 commit as three batches, not one of 30"
+            );
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(stored_events(&directory.join("shard-0000.db")), 30);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
