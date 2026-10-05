@@ -383,6 +383,17 @@ pub fn guid_string(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    // PEI-1296: synthetic.startup's boot_id and the boot_id column are one
+    // text form, PCDS's canonical one.
+    #[test]
+    fn a_boot_id_reads_as_its_column_renders_it() {
+        let boot: eventd_core::BootId = "00112233-4455-6677-8899-AABBCCDDEEFF".parse().unwrap();
+        assert_eq!(
+            guid_string(boot.as_bytes()).as_deref(),
+            Some(boot.canonical().as_str())
+        );
+    }
+
     #[test]
     fn numeric_comparison_does_not_round_large_integers() {
         assert_eq!(
