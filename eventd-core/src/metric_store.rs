@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hashlink::LinkedHashMap;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 use crate::Guid;
@@ -189,11 +190,12 @@ impl MetricStore {
         cache_capacity: usize,
     ) -> Result<(Self, Option<String>), MetricStoreError> {
         let path = path.as_ref();
+        let preserved = crate::quarantine::Preserved::take(path);
         match Self::open(path, checkpoint_pages, cache_capacity) {
             Ok(store) => Ok((store, None)),
             Err(error) if error.is_corruption() => {
-                let reason = error.to_string();
-                crate::quarantine::database(path).map_err(MetricStoreError::Io)?;
+                let note = preserved.quarantine().map_err(MetricStoreError::Io)?;
+                let reason = crate::quarantine::reason(&error, note);
                 Ok((
                     Self::open(path, checkpoint_pages, cache_capacity)?,
                     Some(reason),
@@ -216,6 +218,9 @@ impl MetricStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Until the store is verified, closing must not checkpoint the WAL
+        // into a database that may be quarantined (§3.3).
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -231,6 +236,7 @@ impl MetricStore {
         }
         validate_schema(&connection)?;
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
@@ -324,6 +330,9 @@ impl MetricStore {
         let cache_capacity = self.cache_capacity;
         let placeholder = Connection::open_in_memory()?;
         let connection = std::mem::replace(&mut self.connection, placeholder);
+        // Closing would otherwise checkpoint the WAL into the corrupt
+        // database and delete it, leaving quarantine nothing to move.
+        let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(MetricStoreError::Io)?;
         *self = Self::open(path, checkpoint_pages, cache_capacity)?;
@@ -934,6 +943,36 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".corrupt."))
             .collect()
+    }
+
+    #[test]
+    fn quarantine_keeps_the_wal_and_shm_byte_for_byte_under_the_databases_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        let originals = [
+            ("metrics.db", "this is not a database ".repeat(400)),
+            ("metrics.db-wal", "wal junk".to_owned()),
+            ("metrics.db-shm", "shm junk".to_owned()),
+        ];
+        for (name, body) in &originals {
+            std::fs::write(directory.join(name), body).unwrap();
+        }
+        let (store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+        assert!(recovery.is_some());
+        drop(store);
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("metrics.db.corrupt"))
+            .unwrap();
+        for (name, body) in &originals {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(format!("{name}.corrupt{suffix}"))).unwrap(),
+                *body,
+                "{name} in {quarantined:?}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

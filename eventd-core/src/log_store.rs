@@ -4,6 +4,7 @@ use core::fmt;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::Guid;
@@ -74,11 +75,12 @@ impl LogStore {
         checkpoint_pages: u32,
     ) -> Result<(Self, Option<String>), LogStoreError> {
         let path = path.as_ref();
+        let preserved = crate::quarantine::Preserved::take(path);
         match Self::open(path, checkpoint_pages) {
             Ok(store) => Ok((store, None)),
             Err(error) if error.is_corruption() => {
-                let reason = error.to_string();
-                crate::quarantine::database(path).map_err(LogStoreError::Io)?;
+                let note = preserved.quarantine().map_err(LogStoreError::Io)?;
+                let reason = crate::quarantine::reason(&error, note);
                 Ok((Self::open(path, checkpoint_pages)?, Some(reason)))
             }
             Err(error) => Err(error),
@@ -94,6 +96,9 @@ impl LogStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Until the store is verified, closing must not checkpoint the WAL
+        // into a database that may be quarantined (§3.3).
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -117,6 +122,7 @@ impl LogStore {
                 .collect()
         };
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
@@ -173,6 +179,9 @@ impl LogStore {
         let checkpoint_pages = self.checkpoint_pages;
         let placeholder = Connection::open_in_memory()?;
         let connection = std::mem::replace(&mut self.connection, placeholder);
+        // Closing would otherwise checkpoint the WAL into the corrupt
+        // database and delete it, leaving quarantine nothing to move.
+        let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(LogStoreError::Io)?;
         *self = Self::open(path, checkpoint_pages)?;
@@ -470,6 +479,94 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".corrupt."))
             .collect()
+    }
+
+    #[test]
+    fn quarantine_keeps_the_wal_and_shm_byte_for_byte_under_the_databases_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        let originals = [
+            ("logs.db", "this is not a database ".repeat(400)),
+            ("logs.db-wal", "wal junk".to_owned()),
+            ("logs.db-shm", "shm junk".to_owned()),
+        ];
+        for (name, body) in &originals {
+            std::fs::write(directory.join(name), body).unwrap();
+        }
+        let (store, recovery) = LogStore::open_recovering(&path, 1_000).unwrap();
+        assert!(recovery.is_some());
+        drop(store);
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("logs.db.corrupt"))
+            .unwrap();
+        for (name, body) in &originals {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(format!("{name}.corrupt{suffix}"))).unwrap(),
+                *body,
+                "{name} in {quarantined:?}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn record(message: &str) -> LogRecord {
+        LogRecord {
+            boot_id: [1; 16],
+            timestamp: 10,
+            origin: "test.origin".into(),
+            is_error: false,
+            message: message.into(),
+            job_id: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_open_leaves_the_database_and_its_wal_as_they_were() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        drop(LogStore::open(&path, 1_000).unwrap());
+        // An unknown version committed to the WAL and never checkpointed,
+        // as a crash leaves it.
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .unwrap();
+        writer
+            .execute_batch("UPDATE metadata SET value = '99' WHERE key = 'schema_version';")
+            .unwrap();
+        drop(writer);
+        let wal = directory.join("logs.db-wal");
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
+        assert!(matches!(
+            LogStore::open_recovering(&path, 1_000),
+            Err(LogStoreError::UnknownVersion(version)) if version == "99"
+        ));
+        let after = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
+        assert!(before == after, "the open changed the database or its WAL");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn write_time_quarantine_moves_the_wal_with_the_database() {
+        let directory = temporary_directory();
+        let path = directory.join("logs.db");
+        let mut store = LogStore::open(&path, 1_000).unwrap();
+        store.commit(&[record("in the wal")]).unwrap();
+        store.replace_corrupt().unwrap();
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("logs.db.corrupt"))
+            .unwrap();
+        let wal = directory.join(format!("logs.db-wal.corrupt{suffix}"));
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "{quarantined:?}"
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

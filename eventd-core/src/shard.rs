@@ -4,6 +4,7 @@ use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::schema::Contents;
@@ -81,11 +82,12 @@ impl Shard {
         checkpoint_pages: u32,
     ) -> Result<(Self, Option<String>), ShardError> {
         let path = path.as_ref();
+        let preserved = crate::quarantine::Preserved::take(path);
         match Self::open(path, checkpoint_pages) {
             Ok(shard) => Ok((shard, None)),
             Err(error) if error.is_corruption() => {
-                let reason = error.to_string();
-                crate::quarantine::database(path).map_err(ShardError::Io)?;
+                let note = preserved.quarantine().map_err(ShardError::Io)?;
+                let reason = crate::quarantine::reason(&error, note);
                 Ok((Self::open(path, checkpoint_pages)?, Some(reason)))
             }
             Err(error) => Err(error),
@@ -102,6 +104,9 @@ impl Shard {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         crate::payload_index::register(&connection)?;
+        // Until the shard is verified, closing must not checkpoint the WAL
+        // into a database that may be quarantined (§3.3).
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -126,6 +131,7 @@ impl Shard {
                 .collect()
         };
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get::<_, u64>(0))?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
@@ -321,6 +327,9 @@ impl Shard {
         let checkpoint_pages = self.checkpoint_pages;
         let placeholder = Connection::open_in_memory()?;
         let connection = std::mem::replace(&mut self.connection, placeholder);
+        // Closing would otherwise checkpoint the WAL into the corrupt
+        // database and delete it, leaving quarantine nothing to move.
+        let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(ShardError::Io)?;
         *self = Self::open(path, checkpoint_pages)?;
@@ -1106,6 +1115,42 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".corrupt."))
             .collect()
+    }
+
+    #[test]
+    fn quarantine_keeps_the_wal_and_shm_byte_for_byte_under_the_databases_suffix() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let originals = [
+            ("shard-0000.db", "garbage database ".repeat(500)),
+            ("shard-0000.db-wal", "garbage wal ".repeat(300)),
+            ("shard-0000.db-shm", "garbage shm ".repeat(3000)),
+        ];
+        for (name, body) in &originals {
+            std::fs::write(directory.join(name), body).unwrap();
+        }
+        let (shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+        assert!(recovery.is_some());
+        drop(shard);
+        let quarantined = quarantined(&directory);
+        let suffix = quarantined
+            .iter()
+            .find_map(|name| name.strip_prefix("shard-0000.db.corrupt"))
+            .unwrap();
+        for (name, body) in &originals {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(format!("{name}.corrupt{suffix}"))).unwrap(),
+                *body,
+                "{name} in {quarantined:?}"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preserved"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
