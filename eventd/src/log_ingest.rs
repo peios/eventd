@@ -13,6 +13,7 @@ use peios::msgpack::{Reader, Type};
 use crate::commit_signal::CommitSignal;
 use crate::config::{Config, SharedConfig};
 use crate::datagram::{IngestionSocket, Receive, SocketError, WakingSender};
+use crate::pipeline::SyntheticReporter;
 use crate::writer::WriterMessage;
 
 /// Maintenance for the log thread, which wakes it to take each command.
@@ -36,13 +37,16 @@ pub fn run(
     socket: &IngestionSocket,
     mut store: LogStore,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    event_queues: &Arc<[BoundedQueue<WriterMessage>]>,
     runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
     maintenance: &Receiver<LogMaintenance>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), LogIngestError> {
+    // Where a storage error found while running goes: dropped as the
+    // thread ends, on any path, once what it was handed is committed.
+    let error_events = &mut SyntheticReporter::new(Arc::clone(event_queues));
     let (initial_batch_size, mut datagram_ceiling) = Config::read(runtime, |config| {
         (config.log_max_batch_size, config.max_log_datagram_bytes)
     });
@@ -187,7 +191,7 @@ fn process_maintenance(
     receiver: &Receiver<LogMaintenance>,
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
 ) -> Result<(), LogIngestError> {
     let command = match receiver.try_recv() {
         Ok(command) => command,
@@ -227,7 +231,7 @@ fn commit_batch(
     commits: &CommitSignal,
     retention_requested: &AtomicBool,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
 ) -> Result<(), LogIngestError> {
     match store.commit(batch) {
         Ok(()) => {
@@ -260,7 +264,7 @@ fn request_retention(requested: &AtomicBool, error: &LogStoreError) {
 fn recover_corruption(
     store: &mut LogStore,
     boot_id: [u8; 16],
-    error_events: &BoundedQueue<WriterMessage>,
+    error_events: &mut SyntheticReporter,
     error: &LogStoreError,
 ) -> Result<(), LogIngestError> {
     let description = error.to_string();
@@ -271,8 +275,11 @@ fn recover_corruption(
     Ok(())
 }
 
+/// Report a storage error as the daemon-wide `synthetic.storage_error`:
+/// shard 0, else the lowest-numbered shard that takes it (TRM §2.6),
+/// committed off this thread.
 fn emit_storage_error(
-    queue: &BoundedQueue<WriterMessage>,
+    reporter: &mut SyntheticReporter,
     boot_id: [u8; 16],
     store: &str,
     error: &str,
@@ -283,16 +290,9 @@ fn emit_storage_error(
         eprintln!("eventd: cannot timestamp {store} storage error");
         return;
     };
-    let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
-    match queue.reserve(core::mem::size_of::<WriterMessage>()) {
-        Ok(permit) => permit.publish(WriterMessage::Synthetic(
-            crate::synthetic::storage_error(boot_id, store, None, error, timestamp),
-            sender,
-        )),
-        Err(queue_error) => {
-            eprintln!("eventd: cannot enqueue {store} storage error: {queue_error}");
-        }
-    }
+    reporter.report(crate::synthetic::storage_error(
+        boot_id, store, None, error, timestamp,
+    ));
 }
 
 fn realtime_nanoseconds() -> Result<i64, LogIngestError> {
@@ -529,7 +529,7 @@ mod tests {
         stopping: Arc<AtomicBool>,
         commits: Arc<CommitSignal>,
         retention_requested: Arc<AtomicBool>,
-        error_events: BoundedQueue<WriterMessage>,
+        error_events: Arc<[BoundedQueue<WriterMessage>]>,
     }
 
     impl LogThread {
@@ -554,7 +554,7 @@ mod tests {
                 stopping: Arc::new(AtomicBool::new(false)),
                 commits: Arc::new(CommitSignal::new()),
                 retention_requested: Arc::new(AtomicBool::new(false)),
-                error_events: BoundedQueue::new(16, 1 << 20).unwrap(),
+                error_events: Arc::from([BoundedQueue::new(16, 1 << 20).unwrap()]),
             }
         }
 
@@ -726,6 +726,65 @@ mod tests {
             );
             log.stopping.store(true, Ordering::Release);
             thread.join().unwrap().unwrap();
+        });
+    }
+
+    // PEI-1292: a storage error found while running is daemon-wide, so it
+    // goes to shard 0, else to the lowest-numbered shard that takes it
+    // (TRM §2.6), and the log thread does not wait while it does.
+    #[test]
+    fn a_runtime_storage_error_passes_over_a_refusing_shard_0_without_holding_the_thread() {
+        /// Closes the queues when dropped, so a failing test still ends
+        /// the stub writers its scope joins.
+        struct CloseOnDrop<'a>(&'a [BoundedQueue<WriterMessage>]);
+
+        impl Drop for CloseOnDrop<'_> {
+            fn drop(&mut self) {
+                for queue in self.0 {
+                    queue.close();
+                }
+            }
+        }
+
+        let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..2)
+            .map(|_| BoundedQueue::new(16, 1 << 20).unwrap())
+            .collect::<Vec<_>>()
+            .into();
+        let (stored, delivered) = channel();
+        std::thread::scope(|scope| {
+            // Dropped in reverse: the queues close, shard 0 is let go, and
+            // then the reporter is waited for.
+            let mut reporter = SyntheticReporter::new(Arc::clone(&queues));
+            let (release, held) = sync_channel::<()>(0);
+            let _close = CloseOnDrop(&queues);
+            let (first, second) = (&queues[0], &queues[1]);
+            // Shard 0 is full: it refuses, but only once the test lets it.
+            scope.spawn(move || {
+                if let eventd_core::Pop::Item(WriterMessage::Synthetic(_, response)) =
+                    first.pop_wait()
+                {
+                    let _ = held.recv();
+                    let _ = response.send(Err("database or disk is full".into()));
+                }
+            });
+            scope.spawn(move || {
+                if let eventd_core::Pop::Item(WriterMessage::Synthetic(event, response)) =
+                    second.pop_wait()
+                {
+                    response.send(Ok(())).unwrap();
+                    stored.send(event.event_type).unwrap();
+                }
+            });
+            emit_storage_error(&mut reporter, [1; 16], "log", "corrupt");
+            // Shard 0 has not answered, and the log thread is back.
+            release.send(()).unwrap();
+            assert_eq!(
+                delivered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the record reached shard 1")
+                    .as_ref(),
+                "synthetic.storage_error"
+            );
         });
     }
 

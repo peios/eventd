@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::path::PathBuf;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -240,7 +240,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_retention_requested = Arc::clone(&retention_requested);
     let (log_maintenance_sender, log_maintenance_receiver) = waking_channel(log_socket.waker());
     let log_thread_socket = Arc::clone(&log_socket);
-    let log_error_events = queues[0].clone();
+    let log_error_events = Arc::clone(&queues);
     let log_handle = std::thread::Builder::new()
         .name("eventd-log".to_owned())
         .spawn(move || {
@@ -264,7 +264,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         waking_channel(metric_socket.waker());
     let (rollup_sender, rollup_receiver) = rollup_channel(8, metric_socket.waker());
     let metric_thread_socket = Arc::clone(&metric_socket);
-    let metric_error_events = queues[0].clone();
+    let metric_error_events = Arc::clone(&queues);
     let metric_descriptors = Arc::clone(&descriptors);
     let metric_handle = std::thread::Builder::new()
         .name("eventd-metric".to_owned())
@@ -869,6 +869,68 @@ pub fn commit_synthetic_fallback(
         }
     }
     Err(last_error)
+}
+
+/// Commits daemon-wide synthetic events by [`commit_synthetic_fallback`] on
+/// a thread of its own, started for the first, so that the thread that
+/// finds one — the log or metric thread, on a storage error — is not held
+/// while each shard's writer answers. Dropping it waits for the events
+/// already handed to it.
+pub struct SyntheticReporter {
+    queues: Arc<[BoundedQueue<WriterMessage>]>,
+    worker: Option<(Sender<eventd_core::SyntheticEvent>, JoinHandle<()>)>,
+}
+
+impl SyntheticReporter {
+    pub const fn new(queues: Arc<[BoundedQueue<WriterMessage>]>) -> Self {
+        Self {
+            queues,
+            worker: None,
+        }
+    }
+
+    /// Hand `event` over to be committed, and return at once. A failure
+    /// to commit it is logged to standard error, as for every daemon-wide
+    /// event no shard can take (TRM §2.6).
+    pub fn report(&mut self, event: eventd_core::SyntheticEvent) {
+        if self.worker.is_none() {
+            let (sender, events) = channel::<eventd_core::SyntheticEvent>();
+            let queues = Arc::clone(&self.queues);
+            let spawned = std::thread::Builder::new()
+                .name("eventd-synthetic".to_owned())
+                .spawn(move || {
+                    for event in events {
+                        if let Err(error) = commit_synthetic_fallback(&queues, &event) {
+                            eprintln!("eventd: cannot persist {}: {error}", event.event_type);
+                        }
+                    }
+                });
+            match spawned {
+                Ok(handle) => self.worker = Some((sender, handle)),
+                Err(error) => {
+                    eprintln!("eventd: cannot persist {}: {error}", event.event_type);
+                    return;
+                }
+            }
+        }
+        if let Some((sender, _)) = &self.worker
+            && let Err(unsent) = sender.send(event)
+        {
+            eprintln!(
+                "eventd: cannot persist {}: its committer has stopped",
+                unsent.0.event_type
+            );
+        }
+    }
+}
+
+impl Drop for SyntheticReporter {
+    fn drop(&mut self) {
+        if let Some((sender, handle)) = self.worker.take() {
+            drop(sender);
+            let _ = handle.join();
+        }
+    }
 }
 
 fn join_worker(handle: JoinHandle<Result<(), String>>, first_error: &mut Option<String>) {

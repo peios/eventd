@@ -654,7 +654,9 @@ mod tests {
         let ceiling = crate::config::PORTABLE_INGEST_DATAGRAM_BYTES as usize;
         let log_socket = IngestionSocket::unprotected(&socket_path, ceiling).unwrap();
         let metric_socket = IngestionSocket::unprotected(&metric_socket_path, ceiling).unwrap();
-        let queue: BoundedQueue<WriterMessage> = BoundedQueue::new(1_024, 1 << 24).unwrap();
+        let queues: Arc<[BoundedQueue<WriterMessage>]> =
+            Arc::from([BoundedQueue::new(1_024, 1 << 24).unwrap()]);
+        let queue = &queues[0];
         let stopping = Arc::new(AtomicBool::new(false));
         let event_commits = Arc::new(CommitSignal::new());
         let log_commits = Arc::new(CommitSignal::new());
@@ -667,14 +669,14 @@ mod tests {
         std::thread::scope(|scope| {
             let _shutdown = Shutdown {
                 stopping: &stopping,
-                queue: &queue,
+                queue,
             };
             let writer = scope.spawn(|| {
                 crate::writer::run(
                     shard,
                     0,
                     [1; 16],
-                    &queue,
+                    queue,
                     &runtime,
                     &stopping,
                     &event_commits,
@@ -683,7 +685,7 @@ mod tests {
                 )
             });
             let (queue_ref, runtime_ref, stopping_ref, requested_ref) =
-                (&queue, &runtime, &stopping, &retention_requested);
+                (&queues, &runtime, &stopping, &retention_requested);
             let log_commits = &log_commits;
             let log = scope.spawn(move || {
                 crate::log_ingest::run(
@@ -791,7 +793,7 @@ mod tests {
             pass(
                 &|| retention,
                 &stores,
-                core::slice::from_ref(&queue),
+                &queues,
                 &mut [],
                 &log_sender,
                 &metric_sender,
