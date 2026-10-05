@@ -16,6 +16,7 @@ use crate::log_ingest::LogMaintenance;
 use crate::metric_ingest::MetricMaintenance;
 use crate::writer::{EventMaintenance, WriterMessage};
 
+#[derive(Debug, Clone, Copy)]
 pub struct RetentionConfig {
     pub event_age: Duration,
     pub event_max_bytes: u64,
@@ -66,7 +67,7 @@ pub fn run(
             shard.set_checkpoint_pages(config.checkpoint_pages);
         }
         match pass(
-            &config,
+            &|| Config::read(&runtime, retention_config),
             &stores,
             &event_queues,
             &mut historical_shards,
@@ -166,7 +167,7 @@ fn wait_interval(
     reason = "the coordinator processes three independent stores in a fixed order"
 )]
 fn pass(
-    config: &RetentionConfig,
+    current: Current<'_>,
     stores: &Stores,
     event_queues: &[BoundedQueue<WriterMessage>],
     historical_shards: &mut [Shard],
@@ -183,7 +184,7 @@ fn pass(
         (
             "event",
             retain_events(
-                config,
+                current,
                 stores,
                 event_queues,
                 historical_shards,
@@ -194,11 +195,11 @@ fn pass(
         ),
         (
             "log",
-            retain_logs(config, &stores.log_path, log_sender, stopping, now),
+            retain_logs(current, &stores.log_path, log_sender, stopping, now),
         ),
         (
             "metric",
-            retain_metrics(config, &stores.metric_path, metric_sender, stopping, now),
+            retain_metrics(current, &stores.metric_path, metric_sender, stopping, now),
         ),
     ]
     .into_iter()
@@ -211,8 +212,19 @@ fn pass(
     }
 }
 
+/// The retention configuration as it is now. A pass reads it again before
+/// every bounded batch, so a change applied while a pass runs (a lifted
+/// size limit, a longer retention period) governs the rest of that pass,
+/// not only the next one.
+type Current<'a> = &'a dyn Fn() -> RetentionConfig;
+
+/// Whether a store of `size` bytes exceeds `maximum`, zero meaning no limit.
+const fn over(size: u64, maximum: u64) -> bool {
+    maximum != 0 && size > maximum
+}
+
 fn retain_events(
-    config: &RetentionConfig,
+    current: Current<'_>,
     stores: &Stores,
     event_queues: &[BoundedQueue<WriterMessage>],
     historical_shards: &mut [Shard],
@@ -220,14 +232,10 @@ fn retain_events(
     stopping: &AtomicBool,
     now: i64,
 ) -> Result<(), String> {
-    retain_event_age(
-        event_queues,
-        cutoff(now, config.event_age)?,
-        config.batch_rows,
-        stopping,
-    )?;
+    retain_event_age(current, event_queues, now, stopping)?;
     for shard in historical_shards.iter_mut() {
         while !stopping.load(Ordering::Acquire) {
+            let config = current();
             let deleted = shard
                 .retain_before(cutoff(now, config.event_age)?, config.batch_rows)
                 .map_err(|error| error.to_string())?;
@@ -238,7 +246,7 @@ fn retain_events(
         }
     }
     checkpoint_events(event_queues, historical_shards)?;
-    if config.event_max_bytes != 0 {
+    if current().event_max_bytes != 0 {
         let all_event_paths = stores
             .event_paths
             .iter()
@@ -246,11 +254,10 @@ fn retain_events(
             .cloned()
             .collect::<Vec<_>>();
         retain_event_size(
+            current,
             event_queues,
             historical_shards,
             &all_event_paths,
-            config.event_max_bytes,
-            config.batch_rows,
             boot_id,
             stopping,
         )?;
@@ -259,66 +266,68 @@ fn retain_events(
 }
 
 fn retain_logs(
-    config: &RetentionConfig,
+    current: Current<'_>,
     path: &Path,
     log_sender: &Sender<LogMaintenance>,
     stopping: &AtomicBool,
     now: i64,
 ) -> Result<(), String> {
-    retain_log_age(
-        log_sender,
-        cutoff(now, config.log_age)?,
-        config.batch_rows,
-        stopping,
-    )?;
-    checkpoint_log(log_sender)?;
-    if config.log_max_bytes != 0 {
-        while logical_live_size(path)? > config.log_max_bytes && !stopping.load(Ordering::Acquire)
-        {
-            if log_delete(log_sender, None, config.batch_rows)? == 0 {
-                break;
-            }
-            checkpoint_log(log_sender)?;
+    while !stopping.load(Ordering::Acquire) {
+        let config = current();
+        let limit = config.batch_rows;
+        if log_delete(log_sender, Some(cutoff(now, config.log_age)?), limit)? != limit {
+            break;
         }
+    }
+    checkpoint_log(log_sender)?;
+    while current().log_max_bytes != 0 && !stopping.load(Ordering::Acquire) {
+        if !over(logical_live_size(path)?, current().log_max_bytes)
+            || log_delete(log_sender, None, current().batch_rows)? == 0
+        {
+            break;
+        }
+        checkpoint_log(log_sender)?;
     }
     Ok(())
 }
 
 fn retain_metrics(
-    config: &RetentionConfig,
+    current: Current<'_>,
     path: &Path,
     metric_sender: &Sender<MetricMaintenance>,
     stopping: &AtomicBool,
     now: i64,
 ) -> Result<(), String> {
-    retain_metric_age(
-        metric_sender,
-        cutoff(now, config.metric_age)?,
-        config.batch_rows,
-        stopping,
-    )?;
-    checkpoint_metric(metric_sender)?;
-    if config.metric_max_bytes != 0 {
-        while logical_live_size(path)? > config.metric_max_bytes
-            && !stopping.load(Ordering::Acquire)
-        {
-            if metric_delete(metric_sender, None, config.batch_rows)? == 0 {
-                break;
-            }
-            checkpoint_metric(metric_sender)?;
+    while !stopping.load(Ordering::Acquire) {
+        let config = current();
+        let limit = config.batch_rows;
+        if metric_delete(metric_sender, Some(cutoff(now, config.metric_age)?), limit)? != limit {
+            break;
         }
+    }
+    checkpoint_metric(metric_sender)?;
+    while current().metric_max_bytes != 0 && !stopping.load(Ordering::Acquire) {
+        if !over(logical_live_size(path)?, current().metric_max_bytes)
+            || metric_delete(metric_sender, None, current().batch_rows)? == 0
+        {
+            break;
+        }
+        checkpoint_metric(metric_sender)?;
     }
     Ok(())
 }
 
 fn retain_event_age(
+    current: Current<'_>,
     queues: &[BoundedQueue<WriterMessage>],
-    cutoff: i64,
-    limit: usize,
+    now: i64,
     stopping: &AtomicBool,
 ) -> Result<(), String> {
     for queue in queues {
         while !stopping.load(Ordering::Acquire) {
+            let config = current();
+            let limit = config.batch_rows;
+            let cutoff = cutoff(now, config.event_age)?;
             let deleted = event_command(queue, EventMaintenance::DeleteBefore { cutoff, limit })?;
             health::retention_deleted(Store::Events, deleted);
             if deleted < limit {
@@ -330,11 +339,10 @@ fn retain_event_age(
 }
 
 fn retain_event_size(
+    current: Current<'_>,
     queues: &[BoundedQueue<WriterMessage>],
     historical_shards: &mut [Shard],
     paths: &[PathBuf],
-    maximum: u64,
-    limit: usize,
     current_boot: &[u8; 16],
     stopping: &AtomicBool,
 ) -> Result<(), String> {
@@ -344,14 +352,17 @@ fn retain_event_size(
         .collect();
     boots.sort_by_key(|(_, newest)| *newest);
     for (boot_id, _) in boots {
-        delete_boot(queues, historical_shards, &boot_id, limit, stopping)?;
+        delete_boot(current, queues, historical_shards, &boot_id, stopping)?;
         checkpoint_events(queues, historical_shards)?;
-        if total_live_size(paths)? <= maximum {
+        if !over(total_live_size(paths)?, current().event_max_bytes) {
             return Ok(());
         }
     }
-    while total_live_size(paths)? > maximum && !stopping.load(Ordering::Acquire) {
-        let deleted = delete_boot_once(queues, historical_shards, current_boot, limit)?;
+    while !stopping.load(Ordering::Acquire)
+        && over(total_live_size(paths)?, current().event_max_bytes)
+    {
+        let deleted =
+            delete_boot_once(queues, historical_shards, current_boot, current().batch_rows)?;
         if deleted == 0 {
             break;
         }
@@ -360,15 +371,18 @@ fn retain_event_size(
     Ok(())
 }
 
+/// Delete one whole non-current boot, a batch at a time, unless the size
+/// limit is lifted while it runs.
 fn delete_boot(
+    current: Current<'_>,
     queues: &[BoundedQueue<WriterMessage>],
     historical_shards: &mut [Shard],
     boot_id: &[u8; 16],
-    limit: usize,
     stopping: &AtomicBool,
 ) -> Result<(), String> {
     while !stopping.load(Ordering::Acquire)
-        && delete_boot_once(queues, historical_shards, boot_id, limit)? != 0
+        && current().event_max_bytes != 0
+        && delete_boot_once(queues, historical_shards, boot_id, current().batch_rows)? != 0
     {}
     Ok(())
 }
@@ -427,16 +441,6 @@ fn event_command(
         .map_err(|_| "event writer stopped during retention".to_owned())?
 }
 
-fn retain_log_age(
-    sender: &Sender<LogMaintenance>,
-    cutoff: i64,
-    limit: usize,
-    stopping: &AtomicBool,
-) -> Result<(), String> {
-    while !stopping.load(Ordering::Acquire) && log_delete(sender, Some(cutoff), limit)? == limit {}
-    Ok(())
-}
-
 fn log_delete(
     sender: &Sender<LogMaintenance>,
     older_than: Option<i64>,
@@ -465,18 +469,6 @@ fn checkpoint_log(sender: &Sender<LogMaintenance>) -> Result<(), String> {
     receiver
         .recv()
         .map_err(|_| "log writer stopped during checkpoint".to_owned())??;
-    Ok(())
-}
-
-fn retain_metric_age(
-    sender: &Sender<MetricMaintenance>,
-    cutoff: i64,
-    limit: usize,
-    stopping: &AtomicBool,
-) -> Result<(), String> {
-    while !stopping.load(Ordering::Acquire) && metric_delete(sender, Some(cutoff), limit)? == limit
-    {
-    }
     Ok(())
 }
 
@@ -794,7 +786,7 @@ mod tests {
                 metric_path: metric_path.clone(),
             };
             pass(
-                &retention,
+                &|| retention,
                 &stores,
                 core::slice::from_ref(&queue),
                 &mut [],
@@ -856,31 +848,33 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    fn age_only(batch_rows: usize) -> RetentionConfig {
-        RetentionConfig {
-            event_age: Duration::from_hours(24),
-            event_max_bytes: 0,
-            log_age: Duration::from_hours(24),
-            log_max_bytes: 0,
-            metric_age: Duration::from_hours(24),
-            metric_max_bytes: 0,
-            batch_rows,
-            checkpoint_pages: 1_000,
-        }
+    /// A runtime configuration retaining every store by a day's age alone.
+    fn age_only(batch_rows: usize) -> SharedConfig {
+        let mut config = Config::test_defaults();
+        config.event_retention = Duration::from_hours(24);
+        config.event_retention_max_bytes = 0;
+        config.log_retention = Duration::from_hours(24);
+        config.log_retention_max_bytes = 0;
+        config.metric_retention = Duration::from_hours(24);
+        config.metric_retention_max_bytes = 0;
+        config.retention_delete_batch_rows = batch_rows;
+        config.shared()
     }
 
-    /// Run one pass against two stub event writers and stub log and metric
-    /// writers. Each stub records what reached it, in arrival order (as
-    /// "events 0: DeleteBefore", "logs: Checkpoint", …), and answers with
-    /// `answer` for that arrival.
+    /// Run one pass, configured by `runtime`, against two stub event
+    /// writers and stub log and metric writers. Each stub records what
+    /// reached it, in arrival order (as "events 0: DeleteBefore",
+    /// "logs: Checkpoint", "logs: DeleteOldest by size", …), and answers
+    /// with `answer` for that arrival.
     fn pass_against_stubs(
-        config: &RetentionConfig,
+        runtime: &SharedConfig,
+        log_path: &Path,
         answer: impl Fn(&str) -> Result<usize, String> + Sync,
     ) -> (Result<(), String>, Vec<String>) {
         let stores = Stores {
             event_paths: Vec::new(),
             historical_event_paths: Vec::new(),
-            log_path: PathBuf::from("/nonexistent/logs.db"),
+            log_path: log_path.to_owned(),
             metric_path: PathBuf::from("/nonexistent/metrics.db"),
         };
         let queues: Vec<BoundedQueue<WriterMessage>> = (0..2)
@@ -915,10 +909,17 @@ mod tests {
             scope.spawn(|| {
                 for command in log_commands {
                     match command {
-                        LogMaintenance::DeleteOldest { response, .. } => {
-                            response
-                                .send(arrived("logs: DeleteOldest".to_owned()))
-                                .unwrap();
+                        LogMaintenance::DeleteOldest {
+                            older_than,
+                            response,
+                            ..
+                        } => {
+                            let arrival = if older_than.is_some() {
+                                "logs: DeleteOldest"
+                            } else {
+                                "logs: DeleteOldest by size"
+                            };
+                            response.send(arrived(arrival.to_owned())).unwrap();
                         }
                         LogMaintenance::Checkpoint(response) => {
                             response
@@ -946,7 +947,7 @@ mod tests {
                 }
             });
             let result = pass(
-                config,
+                &|| Config::read(runtime, retention_config),
                 &stores,
                 &queues,
                 &mut [],
@@ -969,7 +970,8 @@ mod tests {
     // and metric stores, the one lever that frees space elsewhere.
     #[test]
     fn a_failing_store_does_not_stop_the_pass_reaching_the_others() {
-        let (result, arrivals) = pass_against_stubs(&age_only(100), |arrival| {
+        let nowhere = Path::new("/nonexistent/logs.db");
+        let (result, arrivals) = pass_against_stubs(&age_only(100), nowhere, |arrival| {
             if arrival.starts_with("events") {
                 Err("database or disk is full".to_owned())
             } else {
@@ -989,6 +991,42 @@ mod tests {
                 "{reached} in {arrivals:?}"
             );
         }
+    }
+
+    // PEI-1297 item 4: a size limit lifted while a pass runs stops that
+    // pass's size deletion at its next batch.
+    #[test]
+    fn a_running_pass_follows_a_size_limit_lifted_during_it() {
+        let directory = temporary_directory();
+        let log_path = directory.join("logs.db");
+        let connection = Connection::open(&log_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE logs(message TEXT);\
+                 INSERT INTO logs VALUES (zeroblob(65536));",
+            )
+            .unwrap();
+        drop(connection);
+        let runtime = age_only(100);
+        runtime.write().unwrap().log_retention_max_bytes = 1;
+        let size_deletes = std::sync::atomic::AtomicUsize::new(0);
+        let (result, _) = pass_against_stubs(&runtime, &log_path, |arrival| {
+            if arrival != "logs: DeleteOldest by size" {
+                return Ok(0);
+            }
+            // The stub deletes nothing, so the store stays over any limit;
+            // the operator lifts the limit as the first batch runs.
+            runtime.write().unwrap().log_retention_max_bytes = 0;
+            let calls = size_deletes.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(usize::from(calls < 5))
+        });
+        result.unwrap();
+        assert_eq!(
+            size_deletes.load(Ordering::SeqCst),
+            1,
+            "no batch after the one during which the limit was lifted"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     // PEI-1289: after a failed pass a request waits out a growing hold
@@ -1035,7 +1073,8 @@ mod tests {
 
     #[test]
     fn a_pass_processes_events_then_logs_then_metrics() {
-        let (result, arrivals) = pass_against_stubs(&age_only(100), |_| Ok(0));
+        let nowhere = Path::new("/nonexistent/logs.db");
+        let (result, arrivals) = pass_against_stubs(&age_only(100), nowhere, |_| Ok(0));
         result.unwrap();
         assert_eq!(
             arrivals,
