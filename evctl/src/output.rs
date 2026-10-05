@@ -212,7 +212,7 @@ fn write_json_value(output: &mut impl Write, value: &Value) -> io::Result<()> {
         Value::Extension(kind, bytes) => {
             write!(output, "{{\"$extension\":{{\"type\":{kind},\"data\":\"")?;
             write_hex(output, bytes)?;
-            output.write_all(b"\"}}}")
+            output.write_all(b"\"}}")
         }
     }
 }
@@ -299,6 +299,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "{\"binary\":{\"$binary\":\"00ff\"},\"line\":\"a\\nb\",\"wide\":18446744073709551615}\n"
+        );
+    }
+
+    // PEI-1296: the `{{` of the opening `write!` are format escapes, so it
+    // opens two objects and the value closes exactly two.
+    #[test]
+    fn an_extension_value_is_a_balanced_tagged_object() {
+        let mut output = Vec::new();
+        let record = Record::from([("e".into(), Value::Extension(5, vec![7]))]);
+        write_record(&mut output, &record, Format::JsonLines, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"e\":{\"$extension\":{\"type\":5,\"data\":\"07\"}}}\n"
         );
     }
 
