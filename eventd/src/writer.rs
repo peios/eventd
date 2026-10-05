@@ -63,6 +63,8 @@ pub fn run(
     let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
     let mut batch_history = VecDeque::new();
+    // Whether the material indexes may still differ from `desired`.
+    let mut unconverged = false;
     loop {
         let (max_batch_size, max_batch_latency, checkpoint_pages, shedding) =
             Config::read(runtime, |config| {
@@ -78,22 +80,43 @@ pub fn run(
                 )
             });
         shard.set_checkpoint_pages(checkpoint_pages);
-        let first = queue.pop_wait();
+        let context = ControlContext {
+            commits,
+            queue,
+            retention_requested,
+            shard_index,
+            boot_id,
+        };
+        let first = if unconverged && queue.is_empty() {
+            // TRM §3.4: a quiet writer short of the desired set takes one
+            // convergence action, then rechecks pressure. Quiet means no
+            // pending events and no large batch within the shedding window,
+            // the measure that shed the indexes in the first place.
+            let pressure = until_quiet(&batch_history, shedding.window);
+            if pressure.is_zero() {
+                match converge_once(&mut shard, &desired, &context) {
+                    Ok(more) => unconverged = more,
+                    Err(error) => {
+                        crate::diagnostics::event_error(&error);
+                        stopping.store(true, Ordering::Release);
+                        queue.close();
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            match queue.pop_wait_timeout(pressure) {
+                Pop::Empty => continue,
+                popped => popped,
+            }
+        } else {
+            queue.pop_wait()
+        };
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
-                if let Err(error) = handle_control(
-                    &mut shard,
-                    control,
-                    &mut desired,
-                    &ControlContext {
-                        commits,
-                        queue,
-                        retention_requested,
-                        shard_index,
-                        boot_id,
-                    },
-                ) {
+                unconverged |= matches!(control, WriterMessage::IndexPolicy(_));
+                if let Err(error) = handle_control(&mut shard, control, &mut desired, &context) {
                     crate::diagnostics::event_error(&error);
                     stopping.store(true, Ordering::Release);
                     queue.close();
@@ -102,7 +125,7 @@ pub fn run(
                 continue;
             }
             Pop::Closed => return Ok(()),
-            Pop::Empty => unreachable!("pop_wait never returns Empty"),
+            Pop::Empty => unreachable!("only a timed wait returns Empty, and it is taken above"),
         }
         let started = Instant::now();
         let mut closed = false;
@@ -123,6 +146,7 @@ pub fn run(
                         retention_requested,
                         &desired,
                         &mut batch_history,
+                        &mut unconverged,
                     ) {
                         crate::diagnostics::event_error(&error);
                         fail_control(control, &error);
@@ -131,18 +155,9 @@ pub fn run(
                         return Err(error);
                     }
                     batch.clear();
-                    if let Err(error) = handle_control(
-                        &mut shard,
-                        control,
-                        &mut desired,
-                        &ControlContext {
-                            commits,
-                            queue,
-                            retention_requested,
-                            shard_index,
-                            boot_id,
-                        },
-                    ) {
+                    unconverged |= matches!(control, WriterMessage::IndexPolicy(_));
+                    if let Err(error) = handle_control(&mut shard, control, &mut desired, &context)
+                    {
                         crate::diagnostics::event_error(&error);
                         stopping.store(true, Ordering::Release);
                         queue.close();
@@ -170,6 +185,7 @@ pub fn run(
             retention_requested,
             &desired,
             &mut batch_history,
+            &mut unconverged,
         ) {
             crate::diagnostics::event_error(&error);
             stopping.store(true, Ordering::Release);
@@ -200,6 +216,7 @@ fn commit_batch(
     retention_requested: &AtomicBool,
     desired: &[DesiredIndex],
     history: &mut VecDeque<(Instant, bool)>,
+    unconverged: &mut bool,
 ) -> Result<(), ShardError> {
     if batch.is_empty() {
         return Ok(());
@@ -278,7 +295,10 @@ fn commit_batch(
             .any(|pressure| pressure.load(Ordering::Acquire) >= shedding.emergency_buffer_percent);
     if emergency {
         match shard.shed_all_indexes() {
-            Ok(shed) => crate::health::index_shed(Shed::Emergency, shed),
+            Ok(shed) => {
+                *unconverged |= shed != 0;
+                crate::health::index_shed(Shed::Emergency, shed);
+            }
             Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
         }
         return Ok(());
@@ -290,7 +310,10 @@ fn commit_batch(
             .saturating_mul(shedding.batch_percent as usize)
     {
         match shard.shed_lowest_index(desired) {
-            Ok(shed) => crate::health::index_shed(Shed::Pressure, usize::from(shed.is_some())),
+            Ok(shed) => {
+                *unconverged |= shed.is_some();
+                crate::health::index_shed(Shed::Pressure, usize::from(shed.is_some()));
+            }
             Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
         }
     }
@@ -466,33 +489,8 @@ fn handle_control(
         }
         WriterMessage::IndexPolicy(desired) => {
             let mut retry = !context.queue.is_empty();
-            while !retry {
-                let action = shard.converge_indexes(&desired, {
-                    let queue = context.queue.clone();
-                    move || !queue.is_empty()
-                });
-                match action {
-                    Ok(IndexAction::Created(_) | IndexAction::Dropped(_)) => {
-                        retry = !context.queue.is_empty();
-                    }
-                    Ok(IndexAction::Cancelled) => retry = true,
-                    Ok(IndexAction::Unchanged) => break,
-                    Err(error) if error.is_corruption() => {
-                        recover_corruption(
-                            shard,
-                            context.shard_index,
-                            context.boot_id,
-                            context.commits,
-                            context.retention_requested,
-                            &error,
-                        )?;
-                        retry = true;
-                    }
-                    Err(error) => {
-                        eprintln!("eventd: adaptive index convergence failed: {error}");
-                        break;
-                    }
-                }
+            while !retry && converge_once(shard, &desired, context)? {
+                retry = !context.queue.is_empty();
             }
             *current_desired = Arc::clone(&desired);
             if retry
@@ -505,6 +503,50 @@ fn handle_control(
             Ok(())
         }
     }
+}
+
+/// Take one convergence action toward `desired`, yielding to any event
+/// that arrives meanwhile. `Ok(true)` while the shard may still differ.
+fn converge_once(
+    shard: &mut Shard,
+    desired: &[DesiredIndex],
+    context: &ControlContext<'_>,
+) -> Result<bool, ShardError> {
+    let action = shard.converge_indexes(desired, {
+        let queue = context.queue.clone();
+        move || !queue.is_empty()
+    });
+    match action {
+        Ok(IndexAction::Created(_) | IndexAction::Dropped(_) | IndexAction::Cancelled) => Ok(true),
+        Ok(IndexAction::Unchanged) => Ok(false),
+        Err(error) if error.is_corruption() => {
+            recover_corruption(
+                shard,
+                context.shard_index,
+                context.boot_id,
+                context.commits,
+                context.retention_requested,
+                &error,
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!("eventd: adaptive index convergence failed: {error}");
+            Ok(false)
+        }
+    }
+}
+
+/// How long until no large batch lies within the shedding window: zero once
+/// the pressure that sheds indexes has subsided.
+fn until_quiet(history: &VecDeque<(Instant, bool)>, window: Duration) -> Duration {
+    history
+        .iter()
+        .rev()
+        .find(|(_, large)| *large)
+        .map_or(Duration::ZERO, |(at, _)| {
+            window.saturating_sub(at.elapsed())
+        })
 }
 
 fn handle_synthetic(
@@ -971,6 +1013,81 @@ mod tests {
         };
         assert_eq!(config_changes(&paths[0]), 0, "not in the full shard 0");
         assert_eq!(config_changes(&paths[1]), 1, "but in shard 1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1296 item 5 (TRM §3.4): an idle writer converges on its own once
+    // pressure subsides; it does not wait for the next policy broadcast.
+    #[test]
+    fn an_idle_writer_rebuilds_what_pressure_shed_once_the_window_is_quiet() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = Shard::open(&path, 1_000).unwrap();
+        let queue = handoff();
+        let mut config = Config::test_defaults();
+        config.max_batch_size = 10;
+        config.max_batch_latency = Duration::from_mins(1);
+        config.shedding_window = Duration::from_millis(300);
+        config.shedding_batch_percent = 50;
+        let runtime = config.shared();
+        let harness = Harness::new();
+        let index_present = || -> bool {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_events_process_guid')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let (shed, shed_signal) = sync_channel(1);
+        publish(
+            &queue,
+            WriterMessage::IndexPolicy(Arc::from([DesiredIndex {
+                field_path: "process_guid".into(),
+                priority: 0,
+                is_expression: false,
+            }])),
+        );
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !index_present() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the policy's index was built"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // One full batch: every batch in the window was large, so the
+            // graduated check sheds the index.
+            for sequence in 1..=10 {
+                publish(&queue, real_event(sequence));
+            }
+            publish(&queue, WriterMessage::Barrier(shed));
+            shed_signal.recv().unwrap().unwrap();
+            let shed_at = Instant::now();
+            assert!(!index_present(), "pressure shed it");
+            let deadline = shed_at + Duration::from_secs(10);
+            while !index_present() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the idle writer rebuilt the shed index"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                shed_at.elapsed() >= Duration::from_millis(200),
+                "but not before the shedding window had passed: {:?}",
+                shed_at.elapsed()
+            );
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -8,6 +8,7 @@ use core::fmt;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_utils::CachePadded;
 
@@ -90,6 +91,26 @@ impl<T> BoundedQueue<T> {
             let observed = self.inner.epoch.load(Ordering::Acquire);
             match self.pop() {
                 Pop::Empty => self.inner.park_until_change(observed),
+                result => return result,
+            }
+        }
+    }
+
+    /// Wait until an item arrives, all producers close the queue, or
+    /// `timeout` passes; [`Pop::Empty`] means the time ran out.
+    #[must_use]
+    pub fn pop_wait_timeout(&self, timeout: Duration) -> Pop<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observed = self.inner.epoch.load(Ordering::Acquire);
+            match self.pop() {
+                Pop::Empty => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Pop::Empty;
+                    }
+                    self.inner.park_until_change_or(observed, remaining);
+                }
                 result => return result,
             }
         }
@@ -248,6 +269,20 @@ impl<T> Inner<T> {
             );
         }
     }
+
+    fn park_until_change_or(&self, observed: u64, timeout: Duration) {
+        let guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.epoch.load(Ordering::Acquire) == observed {
+            drop(
+                self.wake
+                    .wait_timeout(guard, timeout)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+    }
 }
 
 impl<T> Drop for Inner<T> {
@@ -401,6 +436,27 @@ mod tests {
         let permit = queue.try_reserve(8).unwrap();
         permit.publish(42);
         assert_eq!(queue.pop(), Pop::Item(42));
+    }
+
+    #[test]
+    fn a_timed_wait_ends_empty_or_with_what_arrives() {
+        let queue = BoundedQueue::new(4, 64).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            queue.pop_wait_timeout(Duration::from_millis(50)),
+            Pop::<u32>::Empty
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        thread::scope(|scope| {
+            let sender = queue.clone();
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                sender.reserve(4).unwrap().publish(7);
+            });
+            assert_eq!(queue.pop_wait_timeout(Duration::from_secs(10)), Pop::Item(7));
+        });
+        queue.close();
+        assert_eq!(queue.pop_wait_timeout(Duration::from_secs(10)), Pop::Closed);
     }
 
     #[test]
