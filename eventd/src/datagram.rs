@@ -1,12 +1,14 @@
 //! Bounded nonblocking Unix datagram ingestion socket.
 
 use core::fmt;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SendError, Sender, channel};
 
 use peios::file::SecInfo;
 use peios::security::{SecurityDescriptor, sddl};
@@ -46,6 +48,82 @@ pub struct IngestionSocket {
     socket: UnixDatagram,
     path: PathBuf,
     identity: (u64, u64),
+    waker: Waker,
+}
+
+/// Rouses the thread waiting in [`IngestionSocket::wait_readable`] for
+/// something other than a datagram: a maintenance command, say, which would
+/// otherwise wait out the poll's timeout behind an idle socket (PEI-1315).
+///
+/// An eventfd in semaphore mode: each wake adds one and each wait the
+/// eventfd ends takes one away. The thread tries for a command on every
+/// pass of its loop, so the count never falls below the commands still
+/// waiting; a pass that finds none was woken early, which costs a pass.
+#[derive(Clone)]
+pub struct Waker(Arc<OwnedFd>);
+
+impl Waker {
+    pub fn new() -> std::io::Result<Self> {
+        // SAFETY: eventfd takes no pointers.
+        let descriptor = unsafe {
+            libc::eventfd(
+                0,
+                libc::EFD_CLOEXEC | libc::EFD_NONBLOCK | libc::EFD_SEMAPHORE,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is a fresh descriptor this call owns.
+        Ok(Self(Arc::new(unsafe { OwnedFd::from_raw_fd(descriptor) })))
+    }
+
+    pub fn wake(&self) {
+        let one = 1_u64;
+        // SAFETY: the write reads eight bytes from a live u64. It fails only
+        // with the count at its ceiling, when the eventfd is readable anyway.
+        let _ = unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                (&raw const one).cast(),
+                core::mem::size_of::<u64>(),
+            )
+        };
+    }
+
+    /// Take one wake, if there is one.
+    fn take(&self) {
+        let mut count = 0_u64;
+        // SAFETY: the read writes at most eight bytes to a live u64. With no
+        // wake to take it fails with EAGAIN, which leaves nothing to undo.
+        let _ = unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                (&raw mut count).cast(),
+                core::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
+
+/// A channel to an ingest thread whose every send wakes the thread.
+pub struct WakingSender<T> {
+    sender: Sender<T>,
+    waker: Waker,
+}
+
+impl<T> WakingSender<T> {
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.sender.send(value)?;
+        self.waker.wake();
+        Ok(())
+    }
+}
+
+/// A channel whose sends wake the thread `waker` belongs to.
+pub fn waking_channel<T>(waker: Waker) -> (WakingSender<T>, Receiver<T>) {
+    let (sender, receiver) = channel();
+    (WakingSender { sender, waker }, receiver)
 }
 
 impl IngestionSocket {
@@ -96,7 +174,13 @@ impl IngestionSocket {
             socket,
             path: path.to_owned(),
             identity: (metadata.dev(), metadata.ino()),
+            waker: Waker::new().map_err(SocketError::Io)?,
         })
+    }
+
+    /// The waker that ends this socket's [`wait_readable`](Self::wait_readable).
+    pub fn waker(&self) -> Waker {
+        self.waker.clone()
     }
 
     pub fn receive(&self, buffer: &mut [u8]) -> Result<Receive, SocketError> {
@@ -160,19 +244,30 @@ impl IngestionSocket {
         set_receive_buffer(&self.socket, datagram_ceiling)
     }
 
+    /// Wait until a datagram arrives, the socket's [`Waker`] is rung, or
+    /// the timeout passes.
     pub fn wait_readable(&self, timeout_milliseconds: i32) -> Result<(), SocketError> {
-        let mut descriptor = libc::pollfd {
-            fd: self.socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `descriptor` names one writable pollfd for the call.
-        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout_milliseconds) };
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.waker.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `descriptors` names two writable pollfds for the call.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout_milliseconds) };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
                 return Err(SocketError::Io(error));
             }
+        } else if descriptors[1].revents & libc::POLLIN != 0 {
+            self.waker.take();
         }
         Ok(())
     }
@@ -516,6 +611,28 @@ mod tests {
         assert_eq!(socket.receive(&mut buffer).unwrap(), Receive::Datagram(5));
         drop(socket);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn each_wake_ends_one_wait_and_no_more() {
+        let path = socket_path("waker");
+        let socket = IngestionSocket::unprotected(&path, 4_096).unwrap();
+        let (sender, commands) = waking_channel(socket.waker());
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        let waited = |socket: &IngestionSocket| {
+            let started = std::time::Instant::now();
+            socket.wait_readable(200).unwrap();
+            started.elapsed()
+        };
+        let short = std::time::Duration::from_millis(100);
+        // Two commands queued, two waits ended at once: the second command
+        // is not left behind the first's wake.
+        assert!(waited(&socket) < short);
+        assert!(waited(&socket) < short);
+        assert_eq!(commands.try_iter().collect::<Vec<_>>(), [1, 2]);
+        // With the wakes taken, an idle socket waits out its timeout.
+        assert!(waited(&socket) >= short);
     }
 
     #[test]
