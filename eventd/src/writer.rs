@@ -212,8 +212,7 @@ fn commit_batch(
                 commits.committed();
             }
             Err(error) if error.is_capacity() => {
-                record_lost(batch, pending_gaps);
-                request_retention(retention_requested, "event", &error);
+                batch_refused(batch, pending_gaps, retention_requested, &error);
                 return Ok(());
             }
             Err(error) if error.is_corruption() => {
@@ -232,8 +231,7 @@ fn commit_batch(
                         commits.committed();
                     }
                     Err(retry) if retry.is_capacity() => {
-                        record_lost(batch, pending_gaps);
-                        request_retention(retention_requested, "event", &retry);
+                        batch_refused(batch, pending_gaps, retention_requested, &retry);
                         return Ok(());
                     }
                     Err(retry) => return Err(retry),
@@ -245,8 +243,7 @@ fn commit_batch(
     match shard.commit(batch) {
         Ok(_) => count_committed(shard_index, batch),
         Err(error) if error.is_capacity() => {
-            record_lost(batch, pending_gaps);
-            request_retention(retention_requested, "event", &error);
+            batch_refused(batch, pending_gaps, retention_requested, &error);
             return Ok(());
         }
         Err(error) if error.is_corruption() => {
@@ -360,6 +357,43 @@ fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
         }
     }
     pending.truncate(output);
+}
+
+/// A batch refused for want of space: hold its ranges in the lost-batch
+/// list, request retention, and say on stderr which CPUs and sequences the
+/// list now holds unrecorded (TRM §9.2) — the only visibility there is while
+/// the disk stays full.
+fn batch_refused(
+    batch: &[IngestItem],
+    pending: &mut Vec<(u16, Gap)>,
+    requested: &AtomicBool,
+    error: &ShardError,
+) {
+    record_lost(batch, pending);
+    crate::diagnostics::event_error(error);
+    requested.store(true, Ordering::Release);
+    eprintln!(
+        "eventd: event store is full; batch discarded and retention requested; \
+         lost and not yet recorded: {}: {error}",
+        describe_lost(pending)
+    );
+}
+
+/// Render lost-batch ranges as `cpu 0 sequences 4-9, cpu 2 sequences 7-7`.
+fn describe_lost(pending: &[(u16, Gap)]) -> String {
+    if pending.is_empty() {
+        return "no sequences".to_owned();
+    }
+    pending
+        .iter()
+        .map(|(cpu_id, gap)| {
+            format!(
+                "cpu {cpu_id} sequences {}-{}",
+                gap.first_sequence, gap.last_sequence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
@@ -938,6 +972,34 @@ mod tests {
         assert_eq!(config_changes(&paths[0]), 0, "not in the full shard 0");
         assert_eq!(config_changes(&paths[1]), 1, "but in shard 1");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1296 item 8: the disk-full line names the CPUs and sequence
+    // ranges the lost-batch list holds.
+    #[test]
+    fn the_lost_batch_list_is_described_by_cpu_and_sequence_range() {
+        let batch: Vec<_> = (3..=5)
+            .map(|sequence| match real_event(sequence) {
+                WriterMessage::Event(item) => item,
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut pending = vec![(
+            2,
+            Gap {
+                timestamp: 1,
+                first_sequence: 7,
+                last_sequence: 7,
+                preceding_timestamp: None,
+                revealing_timestamp: 1,
+            },
+        )];
+        assert_eq!(describe_lost(&[]), "no sequences");
+        record_lost(&batch, &mut pending);
+        assert_eq!(
+            describe_lost(&pending),
+            "cpu 0 sequences 3-5, cpu 2 sequences 7-7"
+        );
     }
 
     #[test]
