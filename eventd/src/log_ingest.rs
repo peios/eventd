@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{BoundedQueue, LogRecord, LogStore, LogStoreError};
 use peios::msgpack::{Reader, Type};
@@ -45,7 +45,10 @@ pub fn run(
     });
     let mut buffer = vec![0_u8; datagram_ceiling];
     let mut batch = Vec::with_capacity(initial_batch_size);
-    let mut started = None;
+    // The open transaction: when its first record arrived, and the size and
+    // latency caps in force then. A live change to either bounds only the
+    // transactions opened after it (TRM §8.3).
+    let mut open: Option<(Instant, usize, Duration)> = None;
     while !stopping.load(Ordering::Acquire) {
         let (max_batch_size, max_batch_latency, checkpoint_pages, next_ceiling) =
             Config::read(runtime, |config| {
@@ -70,11 +73,11 @@ pub fn run(
                     continue;
                 };
                 for record in records {
-                    started.get_or_insert_with(Instant::now);
+                    let (started, size_cap, latency_cap) = *open.get_or_insert_with(|| {
+                        (Instant::now(), max_batch_size, max_batch_latency)
+                    });
                     batch.push(record);
-                    if batch.len() == max_batch_size
-                        || started.is_some_and(|time| time.elapsed() >= max_batch_latency)
-                    {
+                    if batch.len() >= size_cap || started.elapsed() >= latency_cap {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -84,7 +87,7 @@ pub fn run(
                             error_events,
                         )?;
                         batch.clear();
-                        started = None;
+                        open = None;
                     }
                 }
             }
@@ -100,7 +103,7 @@ pub fn run(
                     error_events,
                 )?;
                 batch.clear();
-                started = None;
+                open = None;
             }
         }
         process_maintenance(
@@ -111,6 +114,8 @@ pub fn run(
             error_events,
         )?;
     }
+    // The queue left at shutdown drains without the latency cap, the open
+    // transaction keeping the size cap it began with.
     loop {
         let max_batch_size = Config::read(runtime, |config| config.log_max_batch_size);
         match socket.receive(&mut buffer)? {
@@ -121,8 +126,11 @@ pub fn run(
                     continue;
                 };
                 for record in records {
+                    let (_, size_cap, _) = *open.get_or_insert_with(|| {
+                        (Instant::now(), max_batch_size, Duration::MAX)
+                    });
                     batch.push(record);
-                    if batch.len() == max_batch_size {
+                    if batch.len() >= size_cap {
                         commit_batch(
                             &mut store,
                             &batch,
@@ -132,6 +140,7 @@ pub fn run(
                             error_events,
                         )?;
                         batch.clear();
+                        open = None;
                     }
                 }
             }
@@ -672,8 +681,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PEI-1315: log_ingest::run rereads LogMaxBatchSize for every datagram, so a change \
-                rebounds the transaction already open"]
     fn a_log_batch_size_change_applies_only_to_later_transactions() {
         let log = LogThread::new(100);
         let socket = log.bind();
