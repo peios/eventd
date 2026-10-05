@@ -63,6 +63,8 @@ pub fn run(
     let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
     let mut batch_history = VecDeque::new();
+    // Whether the material indexes may still differ from `desired`.
+    let mut unconverged = false;
     loop {
         let (max_batch_size, max_batch_latency, checkpoint_pages, shedding) =
             Config::read(runtime, |config| {
@@ -78,22 +80,43 @@ pub fn run(
                 )
             });
         shard.set_checkpoint_pages(checkpoint_pages);
-        let first = queue.pop_wait();
+        let context = ControlContext {
+            commits,
+            queue,
+            retention_requested,
+            shard_index,
+            boot_id,
+        };
+        let first = if unconverged && queue.is_empty() {
+            // TRM §3.4: a quiet writer short of the desired set takes one
+            // convergence action, then rechecks pressure. Quiet means no
+            // pending events and no large batch within the shedding window,
+            // the measure that shed the indexes in the first place.
+            let pressure = until_quiet(&batch_history, shedding.window);
+            if pressure.is_zero() {
+                match converge_once(&mut shard, &desired, &context) {
+                    Ok(more) => unconverged = more,
+                    Err(error) => {
+                        crate::diagnostics::event_error(&error);
+                        stopping.store(true, Ordering::Release);
+                        queue.close();
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
+            match queue.pop_wait_timeout(pressure) {
+                Pop::Empty => continue,
+                popped => popped,
+            }
+        } else {
+            queue.pop_wait()
+        };
         match first {
             Pop::Item(WriterMessage::Event(item)) => batch.push(item),
             Pop::Item(control) => {
-                if let Err(error) = handle_control(
-                    &mut shard,
-                    control,
-                    &mut desired,
-                    &ControlContext {
-                        commits,
-                        queue,
-                        retention_requested,
-                        shard_index,
-                        boot_id,
-                    },
-                ) {
+                unconverged |= matches!(control, WriterMessage::IndexPolicy(_));
+                if let Err(error) = handle_control(&mut shard, control, &mut desired, &context) {
                     crate::diagnostics::event_error(&error);
                     stopping.store(true, Ordering::Release);
                     queue.close();
@@ -102,7 +125,7 @@ pub fn run(
                 continue;
             }
             Pop::Closed => return Ok(()),
-            Pop::Empty => unreachable!("pop_wait never returns Empty"),
+            Pop::Empty => unreachable!("only a timed wait returns Empty, and it is taken above"),
         }
         let started = Instant::now();
         let mut closed = false;
@@ -123,6 +146,7 @@ pub fn run(
                         retention_requested,
                         &desired,
                         &mut batch_history,
+                        &mut unconverged,
                     ) {
                         crate::diagnostics::event_error(&error);
                         fail_control(control, &error);
@@ -131,18 +155,9 @@ pub fn run(
                         return Err(error);
                     }
                     batch.clear();
-                    if let Err(error) = handle_control(
-                        &mut shard,
-                        control,
-                        &mut desired,
-                        &ControlContext {
-                            commits,
-                            queue,
-                            retention_requested,
-                            shard_index,
-                            boot_id,
-                        },
-                    ) {
+                    unconverged |= matches!(control, WriterMessage::IndexPolicy(_));
+                    if let Err(error) = handle_control(&mut shard, control, &mut desired, &context)
+                    {
                         crate::diagnostics::event_error(&error);
                         stopping.store(true, Ordering::Release);
                         queue.close();
@@ -170,6 +185,7 @@ pub fn run(
             retention_requested,
             &desired,
             &mut batch_history,
+            &mut unconverged,
         ) {
             crate::diagnostics::event_error(&error);
             stopping.store(true, Ordering::Release);
@@ -200,6 +216,7 @@ fn commit_batch(
     retention_requested: &AtomicBool,
     desired: &[DesiredIndex],
     history: &mut VecDeque<(Instant, bool)>,
+    unconverged: &mut bool,
 ) -> Result<(), ShardError> {
     if batch.is_empty() {
         return Ok(());
@@ -212,8 +229,7 @@ fn commit_batch(
                 commits.committed();
             }
             Err(error) if error.is_capacity() => {
-                record_lost(batch, pending_gaps);
-                request_retention(retention_requested, "event", &error);
+                batch_refused(batch, pending_gaps, retention_requested, &error);
                 return Ok(());
             }
             Err(error) if error.is_corruption() => {
@@ -232,8 +248,7 @@ fn commit_batch(
                         commits.committed();
                     }
                     Err(retry) if retry.is_capacity() => {
-                        record_lost(batch, pending_gaps);
-                        request_retention(retention_requested, "event", &retry);
+                        batch_refused(batch, pending_gaps, retention_requested, &retry);
                         return Ok(());
                     }
                     Err(retry) => return Err(retry),
@@ -245,8 +260,7 @@ fn commit_batch(
     match shard.commit(batch) {
         Ok(_) => count_committed(shard_index, batch),
         Err(error) if error.is_capacity() => {
-            record_lost(batch, pending_gaps);
-            request_retention(retention_requested, "event", &error);
+            batch_refused(batch, pending_gaps, retention_requested, &error);
             return Ok(());
         }
         Err(error) if error.is_corruption() => {
@@ -281,7 +295,10 @@ fn commit_batch(
             .any(|pressure| pressure.load(Ordering::Acquire) >= shedding.emergency_buffer_percent);
     if emergency {
         match shard.shed_all_indexes() {
-            Ok(shed) => crate::health::index_shed(Shed::Emergency, shed),
+            Ok(shed) => {
+                *unconverged |= shed != 0;
+                crate::health::index_shed(Shed::Emergency, shed);
+            }
             Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
         }
         return Ok(());
@@ -293,7 +310,10 @@ fn commit_batch(
             .saturating_mul(shedding.batch_percent as usize)
     {
         match shard.shed_lowest_index(desired) {
-            Ok(shed) => crate::health::index_shed(Shed::Pressure, usize::from(shed.is_some())),
+            Ok(shed) => {
+                *unconverged |= shed.is_some();
+                crate::health::index_shed(Shed::Pressure, usize::from(shed.is_some()));
+            }
             Err(error) => eprintln!("eventd: adaptive event-index shedding failed: {error}"),
         }
     }
@@ -360,6 +380,43 @@ fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
         }
     }
     pending.truncate(output);
+}
+
+/// A batch refused for want of space: hold its ranges in the lost-batch
+/// list, request retention, and say on stderr which CPUs and sequences the
+/// list now holds unrecorded (TRM §9.2) — the only visibility there is while
+/// the disk stays full.
+fn batch_refused(
+    batch: &[IngestItem],
+    pending: &mut Vec<(u16, Gap)>,
+    requested: &AtomicBool,
+    error: &ShardError,
+) {
+    record_lost(batch, pending);
+    crate::diagnostics::event_error(error);
+    requested.store(true, Ordering::Release);
+    eprintln!(
+        "eventd: event store is full; batch discarded and retention requested; \
+         lost and not yet recorded: {}: {error}",
+        describe_lost(pending)
+    );
+}
+
+/// Render lost-batch ranges as `cpu 0 sequences 4-9, cpu 2 sequences 7-7`.
+fn describe_lost(pending: &[(u16, Gap)]) -> String {
+    if pending.is_empty() {
+        return "no sequences".to_owned();
+    }
+    pending
+        .iter()
+        .map(|(cpu_id, gap)| {
+            format!(
+                "cpu {cpu_id} sequences {}-{}",
+                gap.first_sequence, gap.last_sequence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
@@ -432,33 +489,8 @@ fn handle_control(
         }
         WriterMessage::IndexPolicy(desired) => {
             let mut retry = !context.queue.is_empty();
-            while !retry {
-                let action = shard.converge_indexes(&desired, {
-                    let queue = context.queue.clone();
-                    move || !queue.is_empty()
-                });
-                match action {
-                    Ok(IndexAction::Created(_) | IndexAction::Dropped(_)) => {
-                        retry = !context.queue.is_empty();
-                    }
-                    Ok(IndexAction::Cancelled) => retry = true,
-                    Ok(IndexAction::Unchanged) => break,
-                    Err(error) if error.is_corruption() => {
-                        recover_corruption(
-                            shard,
-                            context.shard_index,
-                            context.boot_id,
-                            context.commits,
-                            context.retention_requested,
-                            &error,
-                        )?;
-                        retry = true;
-                    }
-                    Err(error) => {
-                        eprintln!("eventd: adaptive index convergence failed: {error}");
-                        break;
-                    }
-                }
+            while !retry && converge_once(shard, &desired, context)? {
+                retry = !context.queue.is_empty();
             }
             *current_desired = Arc::clone(&desired);
             if retry
@@ -471,6 +503,50 @@ fn handle_control(
             Ok(())
         }
     }
+}
+
+/// Take one convergence action toward `desired`, yielding to any event
+/// that arrives meanwhile. `Ok(true)` while the shard may still differ.
+fn converge_once(
+    shard: &mut Shard,
+    desired: &[DesiredIndex],
+    context: &ControlContext<'_>,
+) -> Result<bool, ShardError> {
+    let action = shard.converge_indexes(desired, {
+        let queue = context.queue.clone();
+        move || !queue.is_empty()
+    });
+    match action {
+        Ok(IndexAction::Created(_) | IndexAction::Dropped(_) | IndexAction::Cancelled) => Ok(true),
+        Ok(IndexAction::Unchanged) => Ok(false),
+        Err(error) if error.is_corruption() => {
+            recover_corruption(
+                shard,
+                context.shard_index,
+                context.boot_id,
+                context.commits,
+                context.retention_requested,
+                &error,
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!("eventd: adaptive index convergence failed: {error}");
+            Ok(false)
+        }
+    }
+}
+
+/// How long until no large batch lies within the shedding window: zero once
+/// the pressure that sheds indexes has subsided.
+fn until_quiet(history: &VecDeque<(Instant, bool)>, window: Duration) -> Duration {
+    history
+        .iter()
+        .rev()
+        .find(|(_, large)| *large)
+        .map_or(Duration::ZERO, |(at, _)| {
+            window.saturating_sub(at.elapsed())
+        })
 }
 
 fn handle_synthetic(
@@ -486,8 +562,10 @@ fn handle_synthetic(
             Ok(())
         }
         Err(error) if error.is_capacity() => {
+            // Not stored: say so, and the sender tries the next shard
+            // (TRM §2.6). The writer itself carries on.
             request_retention(context.retention_requested, "event", &error);
-            let _ = sender.send(Ok(()));
+            let _ = sender.send(Err(error.to_string()));
             Ok(())
         }
         Err(error) if error.is_corruption() => {
@@ -503,6 +581,11 @@ fn handle_synthetic(
                 Ok(()) => {
                     context.commits.committed();
                     let _ = sender.send(Ok(()));
+                    Ok(())
+                }
+                Err(retry) if retry.is_capacity() => {
+                    request_retention(context.retention_requested, "event", &retry);
+                    let _ = sender.send(Err(retry.to_string()));
                     Ok(())
                 }
                 Err(retry) => {
@@ -819,6 +902,222 @@ mod tests {
         });
         assert_eq!(stored_events(&path), 0);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A shard with no room left for another row.
+    fn full_shard(path: &std::path::Path) -> Shard {
+        let mut shard = Shard::open(path, 1_000).unwrap();
+        shard.cap_pages_for_test().unwrap();
+        let filler = crate::synthetic::shutdown([1; 16], &[(0, 1)], 1);
+        for _ in 0..100_000 {
+            match shard.commit_synthetic(&filler) {
+                Ok(()) => {}
+                Err(error) if error.is_capacity() => return shard,
+                Err(error) => panic!("filling the shard: {error}"),
+            }
+        }
+        panic!("the shard did not fill");
+    }
+
+    // PEI-1292: a daemon-wide record the shard has no room for is reported
+    // to its sender, which then tries the next shard, rather than being
+    // acknowledged as stored and dropped. The writer carries on.
+    #[test]
+    fn a_synthetic_event_refused_for_space_is_reported_to_its_sender() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = full_shard(&path);
+        let queue = handoff();
+        let runtime = batched_by_size(100);
+        let harness = Harness::new();
+        let (sent, result) = sync_channel(1);
+        let (after, after_result) = sync_channel(1);
+        publish(
+            &queue,
+            WriterMessage::Synthetic(crate::synthetic::shutdown([1; 16], &[], 2), sent),
+        );
+        publish(&queue, WriterMessage::Barrier(after));
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let reply = result.recv().unwrap();
+            assert!(
+                reply.as_ref().is_err_and(|error| error.contains("full")),
+                "the sender learns the record was not stored: {reply:?}"
+            );
+            assert_eq!(
+                after_result.recv().unwrap(),
+                Ok(()),
+                "the writer carries on"
+            );
+            assert!(harness.retention_requested.load(Ordering::Acquire));
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1292 (TRM §2.6): daemon-wide events go to shard 0, else to the
+    // lowest-numbered writable active shard.
+    #[test]
+    fn a_daemon_wide_record_goes_to_the_next_writable_shard_when_shard_0_is_full() {
+        let directory = temporary_directory();
+        let paths = [
+            directory.join("shard-0000.db"),
+            directory.join("shard-0001.db"),
+        ];
+        let shards = [
+            full_shard(&paths[0]),
+            Shard::open(&paths[1], 1_000).unwrap(),
+        ];
+        let queues = [handoff(), handoff()];
+        let runtime = batched_by_size(100);
+        let harnesses = [Harness::new(), Harness::new()];
+        let change = crate::config::AppliedChange {
+            key: "LogRetentionDays",
+            old_value_type: "REG_DWORD",
+            old_value: Some("14".into()),
+            new_value_type: "REG_DWORD",
+            new_value: Some("9".into()),
+        };
+        let event = crate::synthetic::config_change([1; 16], &change, 5);
+
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = shards
+                .into_iter()
+                .zip(&queues)
+                .zip(&harnesses)
+                .map(|((shard, queue), harness)| {
+                    let runtime = &runtime;
+                    scope.spawn(move || harness.run(shard, queue, runtime))
+                })
+                .collect();
+            let _closing = (CloseOnDrop(&queues[0]), CloseOnDrop(&queues[1]));
+            assert_eq!(
+                crate::pipeline::commit_synthetic_fallback(&queues, &event),
+                Ok(())
+            );
+            for queue in &queues {
+                queue.close();
+            }
+            for writer in writers {
+                writer.join().unwrap().unwrap();
+            }
+        });
+        let config_changes = |path: &std::path::Path| -> i64 {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM events WHERE event_type = 'synthetic.config_change'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(config_changes(&paths[0]), 0, "not in the full shard 0");
+        assert_eq!(config_changes(&paths[1]), 1, "but in shard 1");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1296 item 5 (TRM §3.4): an idle writer converges on its own once
+    // pressure subsides; it does not wait for the next policy broadcast.
+    #[test]
+    fn an_idle_writer_rebuilds_what_pressure_shed_once_the_window_is_quiet() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = Shard::open(&path, 1_000).unwrap();
+        let queue = handoff();
+        let mut config = Config::test_defaults();
+        config.max_batch_size = 10;
+        config.max_batch_latency = Duration::from_mins(1);
+        config.shedding_window = Duration::from_millis(300);
+        config.shedding_batch_percent = 50;
+        let runtime = config.shared();
+        let harness = Harness::new();
+        let index_present = || -> bool {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_events_process_guid')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let (shed, shed_signal) = sync_channel(1);
+        publish(
+            &queue,
+            WriterMessage::IndexPolicy(Arc::from([DesiredIndex {
+                field_path: "process_guid".into(),
+                priority: 0,
+                is_expression: false,
+            }])),
+        );
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let _closing = CloseOnDrop(&queue);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !index_present() {
+                assert!(Instant::now() < deadline, "the policy's index was built");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // One full batch: every batch in the window was large, so the
+            // graduated check sheds the index.
+            for sequence in 1..=10 {
+                publish(&queue, real_event(sequence));
+            }
+            publish(&queue, WriterMessage::Barrier(shed));
+            shed_signal.recv().unwrap().unwrap();
+            let shed_at = Instant::now();
+            assert!(!index_present(), "pressure shed it");
+            let deadline = shed_at + Duration::from_secs(10);
+            while !index_present() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the idle writer rebuilt the shed index"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                shed_at.elapsed() >= Duration::from_millis(200),
+                "but not before the shedding window had passed: {:?}",
+                shed_at.elapsed()
+            );
+            queue.close();
+            writer.join().unwrap().unwrap();
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1296 item 8: the disk-full line names the CPUs and sequence
+    // ranges the lost-batch list holds.
+    #[test]
+    fn the_lost_batch_list_is_described_by_cpu_and_sequence_range() {
+        let batch: Vec<_> = (3..=5)
+            .map(|sequence| match real_event(sequence) {
+                WriterMessage::Event(item) => item,
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut pending = vec![(
+            2,
+            Gap {
+                timestamp: 1,
+                first_sequence: 7,
+                last_sequence: 7,
+                preceding_timestamp: None,
+                revealing_timestamp: 1,
+            },
+        )];
+        assert_eq!(describe_lost(&[]), "no sequences");
+        record_lost(&batch, &mut pending);
+        assert_eq!(
+            describe_lost(&pending),
+            "cpu 0 sequences 3-5, cpu 2 sequences 7-7"
+        );
     }
 
     #[test]

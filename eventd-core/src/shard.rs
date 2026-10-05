@@ -550,6 +550,18 @@ impl Shard {
         &self.path
     }
 
+    /// Cap this connection's database at its current page count, so that a
+    /// write needing a new page fails as a full disk does (`SQLITE_FULL`).
+    /// A test seam for the capacity paths above the shard; eventd never
+    /// calls it.
+    #[doc(hidden)]
+    pub fn cap_pages_for_test(&self) -> Result<(), ShardError> {
+        // SQLite clamps the maximum to the current size.
+        self.connection
+            .query_row("PRAGMA max_page_count = 1", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    }
+
     fn checkpoint_if_needed(&self) -> Result<(), ShardError> {
         let mut wal_name = self.path.as_os_str().to_owned();
         wal_name.push("-wal");
