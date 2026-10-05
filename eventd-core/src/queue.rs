@@ -453,7 +453,10 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
                 sender.reserve(4).unwrap().publish(7);
             });
-            assert_eq!(queue.pop_wait_timeout(Duration::from_secs(10)), Pop::Item(7));
+            assert_eq!(
+                queue.pop_wait_timeout(Duration::from_secs(10)),
+                Pop::Item(7)
+            );
         });
         queue.close();
         assert_eq!(queue.pop_wait_timeout(Duration::from_secs(10)), Pop::Closed);
