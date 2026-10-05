@@ -72,25 +72,52 @@ impl MetaStore {
 
     /// Open the reconstructible database, replacing malformed state with defaults.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, MetaStoreError> {
+        Self::open_recovering(path, checkpoint_pages).map(|(store, _)| store)
+    }
+
+    /// Open the database, replacing malformed state with defaults, and say
+    /// why when an existing database was thrown away (§3.5).
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        checkpoint_pages: u32,
+    ) -> Result<(Self, Option<String>), MetaStoreError> {
         let path = path.as_ref();
         let existed = path.try_exists().map_err(MetaStoreError::Io)?;
-        let mut connection = open_connection(path)?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
-        } else if validate_schema(&connection).is_err() {
-            drop(connection);
-            remove_database(path)?;
-            connection = open_connection(path)?;
-            connection.execute_batch(CREATE_SCHEMA)?;
-        }
+        let mut recreated = None;
+        let connection = match open_connection(path) {
+            // No schema at all, as a power cut leaves a database whose
+            // creating transaction never reached the disk, is new too.
+            Ok(connection) if !existed || is_empty(&connection)? => {
+                connection.execute_batch(CREATE_SCHEMA)?;
+                connection
+            }
+            Ok(connection) => match validate_schema(&connection) {
+                Ok(()) => connection,
+                Err(error) => {
+                    recreated = Some(error.to_string());
+                    drop(connection);
+                    recreate(path)?
+                }
+            },
+            // A file SQLite cannot read at all is as invalid as one with a
+            // bad schema, and as reconstructible.
+            Err(error) if existed && error.is_corruption() => {
+                recreated = Some(error.to_string());
+                recreate(path)?
+            }
+            Err(error) => return Err(error),
+        };
         validate_schema(&connection)?;
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-        Ok(Self {
-            connection,
-            path: path.to_owned(),
-            checkpoint_pages,
-            page_size,
-        })
+        Ok((
+            Self {
+                connection,
+                path: path.to_owned(),
+                checkpoint_pages,
+                page_size,
+            },
+            recreated,
+        ))
     }
 
     /// Persist diagnostic sequence coverage after all event writers have flushed.
@@ -195,6 +222,9 @@ impl MetaStore {
         self.checkpoint_if_needed()
     }
 
+    /// The `-wal` file's size measures the log because `journal_size_limit=0`
+    /// truncates it when a commit restarts the log after a checkpoint;
+    /// otherwise `SQLite` reuses the file at its high-water size.
     fn checkpoint_if_needed(&self) -> Result<(), MetaStoreError> {
         let bytes = sidecar_size(&self.path, "-wal")?;
         if bytes / self.page_size.max(1) >= u64::from(self.checkpoint_pages) {
@@ -217,6 +247,7 @@ fn open_connection(path: &Path) -> Result<Connection, MetaStoreError> {
         "PRAGMA journal_mode=WAL;\
          PRAGMA synchronous=NORMAL;\
          PRAGMA wal_autocheckpoint=0;\
+         PRAGMA journal_size_limit=0;\
          PRAGMA temp_store=MEMORY;",
     )?;
     Ok(connection)
@@ -268,6 +299,19 @@ fn validate_schema(connection: &Connection) -> Result<(), MetaStoreError> {
     Ok(())
 }
 
+fn is_empty(connection: &Connection) -> Result<bool, MetaStoreError> {
+    let objects: i64 =
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    Ok(objects == 0)
+}
+
+fn recreate(path: &Path) -> Result<Connection, MetaStoreError> {
+    remove_database(path)?;
+    let connection = open_connection(path)?;
+    connection.execute_batch(CREATE_SCHEMA)?;
+    Ok(connection)
+}
+
 fn remove_database(path: &Path) -> Result<(), MetaStoreError> {
     remove_if_present(path)?;
     for suffix in ["-wal", "-shm"] {
@@ -315,6 +359,20 @@ pub enum MetaStoreError {
     IntegerRange,
 }
 
+impl MetaStoreError {
+    /// Whether `SQLite` has declared the database image corrupt.
+    const fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    }
+}
+
 impl fmt::Display for MetaStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -350,6 +408,105 @@ impl From<rusqlite::Error> for MetaStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_directory() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "eventd-meta-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_file_sqlite_cannot_read_is_recreated() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        std::fs::write(&path, "this is not a database ".repeat(400)).unwrap();
+        let store = MetaStore::open(&path, 1_000).unwrap();
+        assert_eq!(store.load_index_state().unwrap(), (vec![], vec![]));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_recreation_is_reported_and_a_creation_or_valid_open_is_not() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recreated, None, "a database created where none was");
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(
+            recreated, None,
+            "a database whose creation a power cut took"
+        );
+        drop(store);
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recreated, None, "a valid database");
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM meta WHERE key = 'schema_version';")
+            .unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert!(
+            recreated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("schema_version")),
+            "{recreated:?}"
+        );
+        drop(store);
+        std::fs::write(&path, "this is not a database ".repeat(400)).unwrap();
+        let (store, recreated) = MetaStore::open_recovering(&path, 1_000).unwrap();
+        assert!(recreated.is_some());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_wal_below_the_threshold_is_not_checkpointed_after_the_first_crossing() {
+        let directory = temporary_directory();
+        let path = directory.join("eventd-meta.db");
+        let mut store = MetaStore::open(&path, 10).unwrap();
+        let wal = directory.join("eventd-meta.db-wal");
+        let wal_salt = || std::fs::read(&wal).unwrap()[16..24].to_vec();
+        let counters = |count: usize| -> Vec<IndexCounter> {
+            (0..count)
+                .map(|index| IndexCounter {
+                    field_path: format!("field.{index}.{}", "x".repeat(200)),
+                    query_count: 1,
+                    window_start: 1,
+                })
+                .collect()
+        };
+        let first = wal_salt();
+        while wal_salt() == first {
+            store.write_index_state(&counters(100), &[]).unwrap();
+        }
+        // Replacing a hundred counters by one rewrites enough pages to cross
+        // the threshold again; after that the writes are small.
+        store.write_index_state(&counters(1), &[]).unwrap();
+        store.write_index_state(&counters(1), &[]).unwrap();
+        let restarted = wal_salt();
+        store.write_index_state(&counters(1), &[]).unwrap();
+        store
+            .write_sequence_checkpoints(&[1; 16], &[(0, 1)], 1)
+            .unwrap();
+        assert_eq!(wal_salt(), restarted);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn recreates_malformed_metadata_and_writes_checkpoints() {
