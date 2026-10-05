@@ -155,13 +155,19 @@ const fn rotate(counter: &mut Counter, now: u64, window_ns: u64) {
 
 pub enum PolicyMessage {
     Recompute,
-    Checkpoint {
-        boot_id: [u8; 16],
-        sequences: Vec<(u16, u64)>,
-        updated_at: u64,
+    /// Graceful shutdown: the final policy run, then — policy activity
+    /// having stopped (TRM §3.5) — the sequence checkpoints, then exit.
+    Stop {
+        checkpoint: Option<SequenceCheckpoint>,
         reply: SyncSender<Result<(), String>>,
     },
-    Stop(SyncSender<Result<(), String>>),
+}
+
+/// Each CPU's highest contiguously covered sequence, for diagnostics.
+pub struct SequenceCheckpoint {
+    pub boot_id: [u8; 16],
+    pub sequences: Vec<(u16, u64)>,
+    pub updated_at: u64,
 }
 
 pub fn run(
@@ -197,33 +203,28 @@ pub fn run(
                     return Err(error);
                 }
             }
-            Ok(PolicyMessage::Checkpoint {
-                boot_id,
-                sequences,
-                updated_at,
-                reply,
-            }) => {
-                let result = store
-                    .write_sequence_checkpoints(&boot_id, &sequences, updated_at)
-                    .map_err(|error| error.to_string());
-                let failed = result.is_err();
-                let _ = reply.send(result);
-                if failed {
-                    let error = IndexError::Metadata("checkpoint write failed".into());
+            Ok(PolicyMessage::Stop { checkpoint, reply }) => {
+                // No broadcast: the writers are stopping, and the next
+                // startup broadcasts the persisted set.
+                let flushed = recompute(&mut store, tracker, desired, &[], config)
+                    .map_err(|error| format!("final policy flush failed: {error}"));
+                let checkpointed = checkpoint.map_or(Ok(()), |checkpoint| {
+                    store
+                        .write_sequence_checkpoints(
+                            &checkpoint.boot_id,
+                            &checkpoint.sequences,
+                            checkpoint.updated_at,
+                        )
+                        .map_err(|error| format!("checkpoint write failed: {error}"))
+                });
+                let result = flushed.and(checkpointed);
+                if let Err(error) = &result {
+                    let error = IndexError::Metadata(error.clone());
                     crate::diagnostics::metadata_error(&error);
+                    let _ = reply.send(result);
                     return Err(error);
                 }
-            }
-            Ok(PolicyMessage::Stop(reply)) => {
-                let result = recompute(&mut store, tracker, desired, queues, config)
-                    .map_err(|error| error.to_string());
-                let failed = result.is_err();
                 let _ = reply.send(result);
-                if failed {
-                    let error = IndexError::Metadata("final policy flush failed".into());
-                    crate::diagnostics::metadata_error(&error);
-                    return Err(error);
-                }
                 return Ok(());
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -322,6 +323,83 @@ impl From<eventd_core::MetaStoreError> for IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PEI-1297 item 8 (TRM §3.5): graceful shutdown writes the sequence
+    // checkpoints after policy activity has stopped, so the final policy
+    // run comes first, in the same Stop, and broadcasts nothing to writers
+    // that are stopping.
+    #[test]
+    fn stop_runs_the_final_policy_then_writes_the_sequence_checkpoints() {
+        use eventd_core::Pop;
+
+        let mut directory = std::env::temp_dir();
+        directory.push(format!(
+            "eventd-indexing-test-{}-{}",
+            std::process::id(),
+            realtime_ns().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("eventd-meta.db");
+        let runtime = Config::test_defaults().shared();
+        let tracker = Arc::new(Tracker::from_persisted(Vec::new(), Arc::clone(&runtime)));
+        tracker.prioritize("process_guid");
+        let desired = Arc::new(RwLock::new(Vec::new()));
+        let queues: Arc<[BoundedQueue<WriterMessage>]> =
+            Arc::from(vec![BoundedQueue::new(16, 1 << 20).unwrap()]);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (reply, replied) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(PolicyMessage::Stop {
+                checkpoint: Some(SequenceCheckpoint {
+                    boot_id: [1; 16],
+                    sequences: vec![(0, 42)],
+                    updated_at: 7,
+                }),
+                reply,
+            })
+            .unwrap();
+        run(
+            MetaStore::open(&path, 1_000).unwrap(),
+            &tracker,
+            &desired,
+            &queues,
+            &runtime,
+            &receiver,
+        )
+        .unwrap();
+        assert_eq!(replied.recv().unwrap(), Ok(()));
+        assert!(
+            matches!(queues[0].pop(), Pop::Item(WriterMessage::IndexPolicy(set)) if set.is_empty()),
+            "the startup broadcast"
+        );
+        assert!(
+            matches!(queues[0].pop(), Pop::Empty),
+            "and none from the final run"
+        );
+
+        let (_, persisted) = MetaStore::open(&path, 1_000)
+            .unwrap()
+            .load_index_state()
+            .unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|index| index.field_path.as_str())
+                .collect::<Vec<_>>(),
+            ["process_guid"],
+            "the final policy run was persisted"
+        );
+        let sequence: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT sequence FROM sequence_checkpoints WHERE cpu_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 42, "and the checkpoints after it");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn event_queries_account_once_per_referenced_predicate_field() {
