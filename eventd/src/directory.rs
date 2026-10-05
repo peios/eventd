@@ -39,15 +39,20 @@ impl StoreDirectory {
 }
 
 /// Whether `actual` grants exactly what [`REQUIRED_SDDL`] does.
+fn has_required_protection(actual: &[u8]) -> Result<bool, peios::Error> {
+    grants_as_required(actual, sddl::parse(REQUIRED_SDDL)?.as_bytes())
+}
+
+/// Whether the descriptor `actual` grants exactly what `required` does.
 ///
 /// Compared as access, not as text: a descriptor applied with `GA` may be
 /// stored with the generic bits already mapped through the file generic
 /// mapping (`FA`), which is the same grant (PEI-1316). Everything else —
 /// owner, group, the DACL's protection and inheritance, and each ACE's type,
-/// flags and trustee — must match exactly.
-fn has_required_protection(actual: &[u8]) -> Result<bool, peios::Error> {
-    let required = sddl::parse(REQUIRED_SDDL)?;
-    let required = SdView::parse(required.as_bytes())?;
+/// flags and trustee — must match exactly. A part neither descriptor
+/// carries, as an owner where only the DACL was read, matches.
+pub fn grants_as_required(actual: &[u8], required: &[u8]) -> Result<bool, peios::Error> {
+    let required = SdView::parse(required)?;
     let actual = SdView::parse(actual)?;
     let dacl_control =
         Control::DACL_PRESENT | Control::DACL_PROTECTED | Control::DACL_AUTO_INHERITED;

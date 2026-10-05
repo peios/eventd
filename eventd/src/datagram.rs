@@ -14,6 +14,8 @@ use peios::file::SecInfo;
 use peios::security::{SecurityDescriptor, sddl};
 use peios::token::Token;
 
+use crate::directory::grants_as_required;
+
 /// The service manager is SYSTEM without the Service-logon group. Every
 /// phase-2 service, including a SYSTEM service, carries `SU` (S-1-5-6). The
 /// explicit deny therefore keeps services from forging peinit's log origins,
@@ -157,7 +159,8 @@ impl IngestionSocket {
     ) -> Result<Self, SocketError> {
         match occupant(path).map_err(SocketError::Io)? {
             Some(metadata) if metadata.file_type().is_socket() => {
-                remove_stale(path, protection, &establish)?;
+                remove_stale(path, || establish(path, protection).is_ok())
+                    .map_err(SocketError::Io)?;
             }
             Some(_) => return Err(SocketError::Occupied(path.to_owned())),
             None => {}
@@ -316,9 +319,9 @@ fn establish_protection_with(
     let descriptor = sddl::parse(protection.sddl()).map_err(SocketError::Security)?;
     set(path, &descriptor).map_err(SocketError::Security)?;
     let actual = get(path).map_err(SocketError::Security)?;
-    let actual = sddl::format(actual.as_bytes()).map_err(SocketError::Security)?;
-    let expected = sddl::format(descriptor.as_bytes()).map_err(SocketError::Security)?;
-    if actual != expected {
+    if !grants_as_required(actual.as_bytes(), descriptor.as_bytes())
+        .map_err(SocketError::Security)?
+    {
         return Err(SocketError::Protection(path.to_owned()));
     }
     Ok(())
@@ -337,7 +340,7 @@ impl Drop for IngestionSocket {
 /// its owner, holds only the owner's implicit `READ_CONTROL | WRITE_DAC`;
 /// `lstat` then fails, and a socket eventd left behind could be neither
 /// recognised as stale nor unlinked.
-fn occupant(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+pub fn occupant(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
     match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -351,30 +354,28 @@ fn occupant(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 
 /// Unlink the stale socket at `path`. Where its descriptor no longer grants
 /// eventd `DELETE` and the directory does not grant `FILE_DELETE_CHILD`,
-/// eventd's own descriptor is put back first — the owner's implicit
-/// `WRITE_DAC` allows that, and the descriptor grants the owner `DELETE` —
-/// and the unlink is tried once more.
-fn remove_stale(
-    path: &Path,
-    protection: Protection,
-    establish: &impl Fn(&Path, Protection) -> Result<(), SocketError>,
-) -> Result<(), SocketError> {
+/// eventd's own descriptor is put back first by `reclaim` — the owner's
+/// implicit `WRITE_DAC` allows that, and the descriptor grants the owner
+/// `DELETE` — and, if it could be, the unlink is tried once more.
+pub fn remove_stale(path: &Path, reclaim: impl FnOnce() -> bool) -> std::io::Result<()> {
     let unlink = || match std::fs::remove_file(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,
     };
     match unlink() {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            if establish(path, protection).is_err() {
-                return Err(SocketError::Io(error));
+            if !reclaim() {
+                return Err(error);
             }
-            unlink().map_err(SocketError::Io)
+            unlink()
         }
-        result => result.map_err(SocketError::Io),
+        result => result,
     }
 }
 
-fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
+/// Unlink `path` if it is still the socket eventd bound there, whose
+/// device and inode are `identity`.
+pub fn unlink_if_owned(path: &Path, identity: (u64, u64)) {
     let owned = match occupant(path) {
         Ok(Some(metadata)) => {
             metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
@@ -531,6 +532,20 @@ mod tests {
             assert!(client.send_to(b"probe", &path).is_err());
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    // As for the store directory (PEI-1316): a descriptor applied with GA
+    // may read back with the generic bits mapped to file rights.
+    #[test]
+    fn a_socket_whose_descriptor_reads_back_with_mapped_generic_rights_is_bound() {
+        let path = socket_path("mapped");
+        let socket = IngestionSocket::bind_with(
+            &path,
+            4_096,
+            Protection::MetricPublishers,
+            establish_reading_back("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FW;;;AU)"),
+        );
+        assert!(socket.is_ok(), "{:?}", socket.err());
     }
 
     #[test]
