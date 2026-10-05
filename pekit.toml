@@ -16,7 +16,7 @@ mkdir -p "$CARGO_HOME" "$PEKIT_OUT"
 
 # The lock must retain the libpeios-0.5-compatible peios-rs commit the
 # workspace pins: the one libgxwi uses, so eventd-client can share it.
-PEIOS_RS_REV=2a2a6bb022192f6e98d4e4a6a7efdbdd40d53b35
+PEIOS_RS_REV=02c87cb643c30eef6b74cd1d9d8b0ae067bed69a
 grep -F "peios-rs.git?rev=$PEIOS_RS_REV#$PEIOS_RS_REV" Cargo.lock >/dev/null
 cargo vendor --locked "$PEKIT_OUT/vendor" > "$PEKIT_OUT/cargo-config.toml"
 test -s "$PEKIT_OUT/cargo-config.toml"
