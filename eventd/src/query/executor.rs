@@ -1225,6 +1225,10 @@ fn metric_comparison(number: f64, operator: Operator, value: &Literal) -> bool {
 struct Row {
     record: Record,
     identifier: String,
+    /// The record's timestamp, which orders and windows it whether or not
+    /// the caller may read its `timestamp` field: an internal key with no
+    /// access-control identity, like `tie` (TRM §6.2).
+    at: i64,
     tie: Tie,
 }
 
@@ -1415,6 +1419,7 @@ fn next_event(
         return Ok(Some(Row {
             record,
             identifier,
+            at: timestamp,
             tie: Tie::Event { shard, id },
         }));
     }
@@ -1612,6 +1617,7 @@ fn scan_logs(
         let row = Row {
             record,
             identifier,
+            at: timestamp,
             tie: Tie::Single(id),
         };
         if visit(row)? == Flow::Enough {
@@ -1990,11 +1996,8 @@ fn sort_rows(rows: &mut [Row], query: &Query) {
     });
 }
 
-fn timestamp(row: &Row) -> i64 {
-    match row.record.get("timestamp") {
-        Some(Value::Signed(value)) => *value,
-        _ => 0,
-    }
+const fn timestamp(row: &Row) -> i64 {
+    row.at
 }
 
 /// An aggregation's groups, folded as rows pass, so what is held is the
@@ -2138,6 +2141,8 @@ impl<'q> Groups<'q> {
             .map(|(index, record)| Row {
                 record,
                 identifier: String::new(),
+                // A group is no record and has no time of its own.
+                at: 0,
                 tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
             })
             .collect())
@@ -3420,6 +3425,7 @@ fn metric_template(name: &str, metric_type: i64, labels: &Record) -> Result<Row,
     Ok(Row {
         record,
         identifier: name.to_owned(),
+        at: 0,
         tie: Tie::Single(0),
     })
 }
@@ -3497,6 +3503,7 @@ fn read_metric_input(
         row: Row {
             record,
             identifier: name.to_owned(),
+            at: timestamp,
             tie: Tie::Single(id),
         },
         number,
@@ -3595,6 +3602,7 @@ fn transform_metric_inputs(
                 let mut row = Row {
                     record: later.row.record.clone(),
                     identifier: later.row.identifier.clone(),
+                    at: later.row.at,
                     tie: later.row.tie,
                 };
                 row.record.insert("value".into(), finite_value(value)?);
@@ -3892,6 +3900,7 @@ fn metric_aggregate_row(
     Ok(Row {
         record,
         identifier: output_name.to_owned(),
+        at: output_timestamp,
         tie: Tie::Single(tie),
     })
 }
@@ -4514,6 +4523,7 @@ mod tests {
                 ("k".into(), Value::Signed(1)),
             ]),
             identifier: "t".into(),
+            at: timestamp,
             tie: Tie::Event { shard, id },
         };
         // The older event in the lower shard, the newer in the higher, and
@@ -4545,6 +4555,7 @@ mod tests {
                 ("is_error".into(), Value::Bool(false)),
             ]),
             identifier: "o".into(),
+            at: timestamp,
             tie: Tie::Single(id),
         };
         // The newer line inserted first: row id and time disagree.
@@ -4797,6 +4808,7 @@ mod tests {
                             row: Row {
                                 record,
                                 identifier: name.into(),
+                                at,
                                 tie: Tie::Single(core * 1_000 + index),
                             },
                             number,
@@ -4919,6 +4931,7 @@ mod tests {
                         .row
                         .record
                         .insert("timestamp".into(), Value::Signed(at));
+                    input.row.at = at;
                     if let Some(point) = transformer.push(input)? {
                         sink.push(point, held)?;
                     }
@@ -5272,6 +5285,7 @@ mod tests {
                 ("value".into(), value),
             ]),
             identifier: "test".into(),
+            at: timestamp,
             tie: Tie::Single(timestamp),
         }
     }
@@ -5290,6 +5304,41 @@ mod tests {
             number: 0.0,
             histogram: Some(test_histogram(total_count, final_count)),
         }
+    }
+
+    // PEI-1296, TRM §7.3: a sample whose timestamp field the caller may
+    // not read is still placed by its time, as range and window membership
+    // need, and its result still lacks the field.
+    #[test]
+    fn a_sample_with_its_timestamp_hidden_is_still_placed_by_its_time() {
+        let since = 1_000;
+        // What authorize_row leaves of a sample when timestamp is denied.
+        let hidden = |at| {
+            let mut input = test_metric_input(at, 2.0);
+            input.row.record.remove("timestamp");
+            input
+        };
+        let point = Transformer::new(None, since)
+            .push(hidden(5_000))
+            .unwrap()
+            .expect("the sample is in range");
+        assert_eq!(point.row.record.get("timestamp"), None, "and stays hidden");
+        assert!(
+            Transformer::new(None, since)
+                .push(hidden(500))
+                .unwrap()
+                .is_none(),
+            "one before SINCE is out of range still"
+        );
+        let budget = budget(usize::MAX);
+        let mut held = Held::new(&budget);
+        let mut windows = Windows::new(1_000);
+        windows.push(&point, &mut held).unwrap();
+        assert_eq!(
+            windows.folds.keys().copied().collect::<Vec<_>>(),
+            [5_000],
+            "a window takes it by its time"
+        );
     }
 
     fn test_histogram(total_count: u64, final_count: u64) -> Vec<u8> {
@@ -5365,6 +5414,7 @@ mod tests {
                 Row {
                     record,
                     identifier: "t".into(),
+                    at: 0,
                     tie: Tie::Single(index),
                 }
             })
@@ -5534,6 +5584,7 @@ mod tests {
             .map(|(index, record)| Row {
                 record,
                 identifier: String::new(),
+                at: 0,
                 tie: Tie::Single(i64::try_from(index).unwrap()),
             })
             .collect();
@@ -5686,6 +5737,7 @@ mod tests {
             .map(|index| Row {
                 record: BTreeMap::from([("n".into(), Value::Signed((index * 7_919) % 5_003))]),
                 identifier: "t".into(),
+                at: 0,
                 tie: Tie::Single(index),
             })
             .collect();
@@ -5739,6 +5791,7 @@ mod tests {
             let row = Row {
                 record: BTreeMap::from([("k".into(), Value::String(format!("value {index}")))]),
                 identifier: "t".into(),
+                at: 0,
                 tie: Tie::Single(index),
             };
             groups.add(&row, &mut held).err()
