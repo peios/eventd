@@ -99,7 +99,7 @@ impl LogStore {
         // Until the store is verified, closing must not checkpoint the WAL
         // into a database that may be quarantined (§3.3).
         connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        connection.busy_timeout(std::time::Duration::ZERO)?;
+        crate::writer_lock::configure(&connection)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=NORMAL;\
