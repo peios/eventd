@@ -400,7 +400,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 boot_id,
                 retention_stopping,
                 retention_thread_requested,
-            )
+            );
+            Ok(())
         })?;
     notify_ready()?;
     let config_stopping = Arc::clone(&stopping);
@@ -826,7 +827,7 @@ fn flush_event_queues(queues: &[BoundedQueue<WriterMessage>]) -> Result<(), Stri
 /// Commit a daemon-wide synthetic event to shard 0, else to the lowest-
 /// numbered active shard that takes it (TRM §2.6). An error means no shard
 /// could; the caller logs it and goes on.
-pub(crate) fn commit_synthetic_fallback(
+pub fn commit_synthetic_fallback(
     queues: &[BoundedQueue<WriterMessage>],
     event: &eventd_core::SyntheticEvent,
 ) -> Result<(), String> {

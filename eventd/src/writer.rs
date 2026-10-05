@@ -946,7 +946,11 @@ mod tests {
                 reply.as_ref().is_err_and(|error| error.contains("full")),
                 "the sender learns the record was not stored: {reply:?}"
             );
-            assert_eq!(after_result.recv().unwrap(), Ok(()), "the writer carries on");
+            assert_eq!(
+                after_result.recv().unwrap(),
+                Ok(()),
+                "the writer carries on"
+            );
             assert!(harness.retention_requested.load(Ordering::Acquire));
             queue.close();
             writer.join().unwrap().unwrap();
@@ -1057,10 +1061,7 @@ mod tests {
             let _closing = CloseOnDrop(&queue);
             let deadline = Instant::now() + Duration::from_secs(10);
             while !index_present() {
-                assert!(
-                    Instant::now() < deadline,
-                    "the policy's index was built"
-                );
+                assert!(Instant::now() < deadline, "the policy's index was built");
                 std::thread::sleep(Duration::from_millis(10));
             }
             // One full batch: every batch in the window was large, so the

@@ -49,12 +49,10 @@ pub fn run(
     boot_id: [u8; 16],
     stopping: Arc<AtomicBool>,
     requested: Arc<AtomicBool>,
-) -> Result<(), String> {
+) {
     let initial = Config::read(&runtime, retention_config);
-    let mut historical_shards = open_historical(
-        &mut stores.historical_event_paths,
-        initial.checkpoint_pages,
-    );
+    let mut historical_shards =
+        open_historical(&mut stores.historical_event_paths, initial.checkpoint_pages);
     let mut backoff = Duration::ZERO;
     while wait_interval(
         &stopping,
@@ -86,7 +84,6 @@ pub fn run(
             }
         }
     }
-    Ok(())
 }
 
 const FIRST_RETRY: Duration = Duration::from_secs(1);
@@ -361,8 +358,12 @@ fn retain_event_size(
     while !stopping.load(Ordering::Acquire)
         && over(total_live_size(paths)?, current().event_max_bytes)
     {
-        let deleted =
-            delete_boot_once(queues, historical_shards, current_boot, current().batch_rows)?;
+        let deleted = delete_boot_once(
+            queues,
+            historical_shards,
+            current_boot,
+            current().batch_rows,
+        )?;
         if deleted == 0 {
             break;
         }
@@ -819,7 +820,8 @@ mod tests {
         let (log_sender, _log_commands) = channel();
         let (metric_sender, _metric_commands) = channel();
         let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from(Vec::new());
-        let result = run(
+        // It returns, rather than failing, once it has opened its shards.
+        run(
             Config::test_defaults().shared(),
             Stores {
                 event_paths: Vec::new(),
@@ -831,11 +833,10 @@ mod tests {
             log_sender,
             metric_sender,
             [1; 16],
-            // Already stopping: run returns once it has opened its shards.
+            // Already stopping, so no pass runs.
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
         );
-        assert_eq!(result, Ok(()));
 
         // It is also left out of what retention measures.
         let good = directory.join("shard-0008.db");
@@ -863,8 +864,8 @@ mod tests {
 
     /// Run one pass, configured by `runtime`, against two stub event
     /// writers and stub log and metric writers. Each stub records what
-    /// reached it, in arrival order (as "events 0: DeleteBefore",
-    /// "logs: Checkpoint", "logs: DeleteOldest by size", …), and answers
+    /// reached it, in arrival order (as `events 0: DeleteBefore`,
+    /// `logs: Checkpoint`, `logs: DeleteOldest by size`, …), and answers
     /// with `answer` for that arrival.
     fn pass_against_stubs(
         runtime: &SharedConfig,
