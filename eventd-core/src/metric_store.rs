@@ -8,8 +8,10 @@ use hashlink::LinkedHashMap;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 use crate::Guid;
+use crate::schema::Contents;
 
 const CREATE_SCHEMA: &str = r"
+BEGIN IMMEDIATE;
 CREATE TABLE series (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -52,6 +54,7 @@ CREATE INDEX idx_rollups_window ON rollups(window_start);
 INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+COMMIT;
 ";
 
 /// Metric series type stored as a stable integer.
@@ -207,7 +210,6 @@ impl MetricStore {
         cache_capacity: usize,
     ) -> Result<Self, MetricStoreError> {
         let path = path.as_ref();
-        let existed = path.try_exists().map_err(MetricStoreError::Io)?;
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -222,8 +224,10 @@ impl MetricStore {
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
+        match crate::schema::contents(&connection)? {
+            Contents::Empty => connection.execute_batch(CREATE_SCHEMA)?,
+            Contents::Unrecognised => return Err(MetricStoreError::UnrecognisedContents),
+            Contents::Store => {}
         }
         validate_schema(&connection)?;
         let page_size = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
@@ -750,6 +754,8 @@ pub enum MetricStoreError {
     InvalidSchema(&'static str),
     /// Unsupported schema version.
     UnknownVersion(String),
+    /// Schema objects without the metadata entries of a metric store.
+    UnrecognisedContents,
     /// Retention batch size exceeds `SQLite`'s integer range.
     IntegerRange,
     /// A query submitted an internally inconsistent adaptive-rollup row.
@@ -767,7 +773,8 @@ impl MetricStoreError {
         )
     }
 
-    /// Whether `SQLite` has declared the database image corrupt.
+    /// Whether `SQLite` has declared the database image corrupt, or it holds
+    /// contents that are not a metric store at all.
     #[must_use]
     pub const fn is_corruption(&self) -> bool {
         matches!(
@@ -777,7 +784,7 @@ impl MetricStoreError {
                     error.code,
                     rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
                 )
-        )
+        ) || matches!(self, Self::UnrecognisedContents)
     }
 }
 
@@ -791,6 +798,9 @@ impl fmt::Display for MetricStoreError {
             }
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported metric-store schema {version}")
+            }
+            Self::UnrecognisedContents => {
+                formatter.write_str("unrecognised metric-store contents: no metadata entries")
             }
             Self::IntegerRange => {
                 formatter.write_str("metric retention batch size exceeds SQLite range")
@@ -807,6 +817,7 @@ impl std::error::Error for MetricStoreError {
             Self::Io(error) => Some(error),
             Self::InvalidSchema(_)
             | Self::UnknownVersion(_)
+            | Self::UnrecognisedContents
             | Self::IntegerRange
             | Self::InvalidRollup => None,
         }
@@ -914,6 +925,70 @@ mod tests {
         store.commit(&[named("b")]).unwrap();
         assert_eq!(selects(&store), 4, "b, least recently used, was evicted");
         drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn quarantined(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn a_store_whose_creation_was_lost_is_created_afresh() {
+        // What PEI-1317's power cut left: a 4096-byte WAL-mode header page
+        // with no schema, and a 56-byte WAL holding no complete frame.
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        std::fs::write(directory.join("metrics.db-wal"), [0; 56]).unwrap();
+        let (mut store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+        assert_eq!(recovery, None);
+        store
+            .commit(&[record(MetricType::Gauge, MetricValue::Number(1.0))])
+            .unwrap();
+        assert!(quarantined(&directory).is_empty());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partly_created_store_is_quarantined_but_a_missing_schema_version_fails() {
+        let directory = temporary_directory();
+        let path = directory.join("metrics.db");
+        for partial in [
+            "CREATE TABLE series (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE series (id INTEGER PRIMARY KEY);\
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        ] {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(partial)
+                .unwrap();
+            let before = quarantined(&directory).len();
+            let (store, recovery) = MetricStore::open_recovering(&path, 1_000, 10).unwrap();
+            assert!(recovery.is_some(), "{partial}");
+            assert_eq!(quarantined(&directory).len(), before + 1, "{partial}");
+            drop(store);
+            std::fs::remove_file(&path).unwrap();
+        }
+        drop(MetricStore::open(&path, 1_000, 10).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM metadata WHERE key = 'schema_version';")
+            .unwrap();
+        let before = quarantined(&directory).len();
+        assert!(matches!(
+            MetricStore::open_recovering(&path, 1_000, 10),
+            Err(MetricStoreError::InvalidSchema(_))
+        ));
+        assert_eq!(quarantined(&directory).len(), before);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

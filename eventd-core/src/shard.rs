@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
+use crate::schema::Contents;
 use crate::{DesiredIndex, Gap, Guid, IngestItem, Interval, SyntheticEvent};
 
 const SCHEMA_VERSION: &str = "1";
 
 const CREATE_SCHEMA: &str = r"
+BEGIN IMMEDIATE;
 CREATE TABLE events (
     id INTEGER PRIMARY KEY,
     boot_id BLOB NOT NULL,
@@ -42,6 +44,7 @@ CREATE INDEX idx_events_timestamp ON events(timestamp);
 INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
 INSERT INTO metadata(key, value)
 VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+COMMIT;
 ";
 
 /// The only read-write connection to one event shard.
@@ -92,7 +95,6 @@ impl Shard {
     /// Open or create one active shard and verify its required schema.
     pub fn open(path: impl AsRef<Path>, checkpoint_pages: u32) -> Result<Self, ShardError> {
         let path = path.as_ref();
-        let existed = path.try_exists().map_err(ShardError::Io)?;
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -108,8 +110,10 @@ impl Shard {
              PRAGMA foreign_keys=ON;\
              PRAGMA temp_store=MEMORY;",
         )?;
-        if !existed {
-            connection.execute_batch(CREATE_SCHEMA)?;
+        match crate::schema::contents(&connection)? {
+            Contents::Empty => connection.execute_batch(CREATE_SCHEMA)?,
+            Contents::Unrecognised => return Err(ShardError::UnrecognisedContents),
+            Contents::Store => {}
         }
         validate_schema(&connection)?;
 
@@ -776,6 +780,8 @@ pub enum ShardError {
     InvalidSchema(&'static str),
     /// The shard uses an unsupported schema version.
     UnknownVersion(String),
+    /// Schema objects without the metadata entries of an event shard.
+    UnrecognisedContents,
     /// An unsigned kernel value cannot fit `SQLite`'s signed `INTEGER`.
     IntegerRange(&'static str),
     /// The direct-write API was given a non-synthetic event type.
@@ -793,7 +799,8 @@ impl ShardError {
         )
     }
 
-    /// Whether `SQLite` has declared the database image corrupt.
+    /// Whether `SQLite` has declared the database image corrupt, or it holds
+    /// contents that are not an event shard at all.
     #[must_use]
     pub const fn is_corruption(&self) -> bool {
         matches!(
@@ -803,7 +810,7 @@ impl ShardError {
                     error.code,
                     rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
                 )
-        )
+        ) || matches!(self, Self::UnrecognisedContents)
     }
 }
 
@@ -817,6 +824,9 @@ impl fmt::Display for ShardError {
             }
             Self::UnknownVersion(version) => {
                 write!(formatter, "unsupported event shard schema {version}")
+            }
+            Self::UnrecognisedContents => {
+                formatter.write_str("unrecognised event shard contents: no metadata entries")
             }
             Self::IntegerRange(field) => write!(formatter, "{field} exceeds SQLite INTEGER range"),
             Self::InvalidSyntheticType => {
@@ -833,6 +843,7 @@ impl std::error::Error for ShardError {
             Self::Io(error) => Some(error),
             Self::InvalidSchema(_)
             | Self::UnknownVersion(_)
+            | Self::UnrecognisedContents
             | Self::IntegerRange(_)
             | Self::InvalidSyntheticType => None,
         }
@@ -1086,6 +1097,65 @@ mod tests {
                 .starts_with("shard-0000.db.corrupt.")
         }));
         drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn quarantined(directory: &Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn a_shard_whose_creation_was_lost_is_created_afresh() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        let (mut shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+        assert_eq!(recovery, None);
+        shard.commit(&[event(1, "example.test")]).unwrap();
+        assert!(quarantined(&directory).is_empty());
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partly_created_shard_is_quarantined_but_a_missing_schema_version_fails() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        for partial in [
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);\
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        ] {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(partial)
+                .unwrap();
+            let before = quarantined(&directory).len();
+            let (shard, recovery) = Shard::open_recovering(&path, 1_000).unwrap();
+            assert!(recovery.is_some(), "{partial}");
+            assert_eq!(quarantined(&directory).len(), before + 1, "{partial}");
+            drop(shard);
+            std::fs::remove_file(&path).unwrap();
+        }
+        drop(Shard::open(&path, 1_000).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM metadata WHERE key = 'schema_version';")
+            .unwrap();
+        let before = quarantined(&directory).len();
+        assert!(matches!(
+            Shard::open_recovering(&path, 1_000),
+            Err(ShardError::InvalidSchema(_))
+        ));
+        assert_eq!(quarantined(&directory).len(), before);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

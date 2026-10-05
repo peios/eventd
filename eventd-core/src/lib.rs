@@ -12,6 +12,7 @@ pub mod queue;
 pub mod receipt;
 pub mod reconcile;
 pub mod routing;
+mod schema;
 pub mod shard;
 
 pub use boot_id::{BootId, BootIdError};
