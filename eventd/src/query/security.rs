@@ -210,10 +210,7 @@ impl Authorizer {
                 guid: *guid,
             });
         }
-        let audit_context = format!(
-            "{}:{pattern}",
-            namespace.registry_name().to_ascii_lowercase()
-        );
+        let audit_context = audit_context(namespace_kind(namespace), Some(pattern))?;
         let request = peios_sys::peios_access_request {
             token_fd: self.token.as_raw_fd(),
             sd: descriptor.as_bytes().as_ptr().cast(),
@@ -262,6 +259,7 @@ impl Authorizer {
         let Some(descriptor) = self.descriptors.admin()? else {
             return Ok(false);
         };
+        let audit_context = audit_context("eventd-admin", None)?;
         let request = peios_sys::peios_access_request {
             token_fd: self.token.as_raw_fd(),
             sd: descriptor.as_bytes().as_ptr().cast(),
@@ -277,12 +275,12 @@ impl Authorizer {
             local_claims_len: 0,
             pip_type: 0,
             pip_trust: 0,
-            audit_context: b"admin".as_ptr().cast(),
-            audit_context_len: 5,
+            audit_context: audit_context.as_ptr().cast(),
+            audit_context_len: audit_context.len(),
         };
         let mut granted = 0_u32;
-        // SAFETY: the request borrows the live token, descriptor and static
-        // audit context for this call; granted is a writable out-parameter.
+        // SAFETY: the request borrows the live token, descriptor and audit
+        // context for this call; granted is a writable out-parameter.
         let result = unsafe {
             peios_sys::peios_access_check(
                 &raw const request,
@@ -324,6 +322,40 @@ fn may_read_fields(fields: &[String], descriptor: &SecurityDescriptor) -> Vec<[u
         .collect();
     guids.extend(granted);
     guids
+}
+
+/// The `object.kind` of a check against `namespace`'s patterns, as
+/// eventd's fragment names it.
+const fn namespace_kind(namespace: Namespace) -> &'static str {
+    match namespace {
+        Namespace::Events => "event-namespace",
+        Namespace::Logs => "log-namespace",
+        Namespace::Metrics => "metric-namespace",
+    }
+}
+
+/// The audit context of a check eventd asks KACS to make, naming the
+/// object it guards (PGSS §6.7): `{kind: <kind>}`, and with a pattern
+/// `{kind: <kind>, <kind>: {pattern: <pattern>}}`. KACS copies it into
+/// its record of the check as `object.kind` and
+/// `object.<kind>.pattern`. The pattern is the one the descriptor was
+/// written for, which for a log origin never holds a producer after a
+/// `/`: the walk to it starts at the service.
+fn audit_context(kind: &str, pattern: Option<&str>) -> Result<Vec<u8>, SecurityError> {
+    let mut writer = peios::msgpack::Writer::new();
+    if let Some(pattern) = pattern {
+        writer
+            .write_map(2)
+            .write_str("kind")
+            .write_str(kind)
+            .write_str(kind)
+            .write_map(1)
+            .write_str("pattern")
+            .write_str(pattern);
+    } else {
+        writer.write_map(1).write_str("kind").write_str(kind);
+    }
+    writer.to_bytes().map_err(SecurityError::Peios)
 }
 
 #[derive(Clone)]
@@ -383,7 +415,10 @@ impl DescriptorCache {
                 }
                 continue;
             };
-            let audit_context = format!("metric-publish:{pattern}");
+            // Publishing and reading share the namespace's kind: which of
+            // the two was checked is the record's `access.requested`.
+            let audit_context =
+                audit_context(namespace_kind(Namespace::Metrics), Some(pattern.as_str()))?;
             let request = peios_sys::peios_access_request {
                 token_fd: token.as_raw_fd(),
                 sd: descriptor.as_bytes().as_ptr().cast(),
@@ -875,8 +910,9 @@ mod tests {
     #[test]
     fn eventd_and_its_clients_derive_the_same_field_guids() {
         for field in [
+            "event.time",
+            "emitter.true-token.guid",
             "timestamp",
-            "event_type",
             "source.name",
             "granted_access",
             "core",
@@ -903,7 +939,7 @@ mod tests {
              (OA;;0x1;e2bd1ef2-4a1f-5a4d-8b2b-6a2b43ff4a5f;;AU)",
         )
         .unwrap();
-        let fields = ["timestamp".to_owned(), "event_type".to_owned()];
+        let fields = ["event.time".to_owned(), "event.type".to_owned()];
         let guids = may_read_fields(&fields, &descriptor);
         for namespace in Namespace::ALL {
             assert!(
@@ -914,8 +950,8 @@ mod tests {
         assert_eq!(
             guids[..2],
             [
-                eventd_core::field_guid("timestamp"),
-                eventd_core::field_guid("event_type")
+                eventd_core::field_guid("event.time"),
+                eventd_core::field_guid("event.type")
             ],
             "the fields asked about come first, in order"
         );
@@ -943,6 +979,52 @@ mod tests {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .healthy
+        );
+    }
+
+    // PGSS §6.7, PEI-1279: the audit context is one map holding `kind` and,
+    // under the kind's own name, the object's identifying fields, and
+    // nothing else; KACS refuses any other shape.
+    #[test]
+    fn audit_contexts_name_the_object_by_kind_and_pattern() {
+        use peios::msgpack::Reader;
+
+        let kinds: Vec<_> = Namespace::ALL
+            .iter()
+            .map(|ns| namespace_kind(*ns))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["event-namespace", "log-namespace", "metric-namespace"]
+        );
+        for kind in kinds {
+            let bytes = audit_context(kind, Some("kacs.audit")).unwrap();
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(reader.read_map().unwrap(), 2);
+            assert_eq!(reader.read_str().unwrap(), "kind");
+            assert_eq!(reader.read_str().unwrap(), kind);
+            assert_eq!(reader.read_str().unwrap(), kind);
+            assert_eq!(reader.read_map().unwrap(), 1);
+            assert_eq!(reader.read_str().unwrap(), "pattern");
+            assert_eq!(reader.read_str().unwrap(), "kacs.audit");
+            assert_eq!(reader.remaining(), 0);
+        }
+
+        let bytes = audit_context("eventd-admin", None).unwrap();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.read_map().unwrap(), 1);
+        assert_eq!(reader.read_str().unwrap(), "kind");
+        assert_eq!(reader.read_str().unwrap(), "eventd-admin");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    // The pattern a log check names is the service's: a producer after `/`
+    // is never part of it (eventd.evman, object.log-namespace.pattern).
+    #[test]
+    fn a_log_origins_patterns_stop_before_its_producer() {
+        assert_eq!(
+            eventd_client::access::candidates("jellyfin.web/ExecStartPre[0]"),
+            ["jellyfin.web", "jellyfin", "*"]
         );
     }
 

@@ -5,7 +5,7 @@ use eventd_core::{Guid, SyntheticEvent};
 use crate::config::AppliedChange;
 
 /// The event-type namespace eventd writes its own records under (TRM §2.6).
-/// No KMES event in it is stored, so `event_type` alone tells a record
+/// No KMES event in it is stored, so `event.type` alone tells a record
 /// eventd wrote from one any emitter sent (TRM §3.1).
 pub const RESERVED_PREFIX: &str = "synthetic.";
 

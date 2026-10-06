@@ -1268,12 +1268,12 @@ mod tests {
     #[test]
     fn parses_event_query_with_reordered_clauses() {
         let query = parse(
-            "EVENTS kacs.* TAKE 100 WHERE origin_class == kacs SINCE 1h ago SORT timestamp DESC",
+            "EVENTS kacs.* TAKE 100 WHERE emitter.class == kacs SINCE 1h ago SORT event.time DESC",
         )
         .unwrap();
         assert_eq!(query.take, Some(100));
         assert!(matches!(query.since, Some(TimeExpr::Relative { .. })));
-        assert_eq!(query.sort[0].field, "timestamp");
+        assert_eq!(query.sort[0].field, "event.time");
     }
 
     #[test]
@@ -1396,7 +1396,7 @@ mod tests {
     #[test]
     fn rejects_invalid_combinations_and_binary_ordering() {
         assert!(parse("METRIC cpu STREAM").is_err());
-        assert!(parse("EVENTS DISTINCT event_type STREAM TAKE 1").is_err());
+        assert!(parse("EVENTS DISTINCT event.type STREAM TAKE 1").is_err());
         assert!(parse("EVENTS WHERE payload > x\"01\"").is_err());
     }
 }
