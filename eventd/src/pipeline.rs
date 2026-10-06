@@ -157,7 +157,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         match commit_direct_fallback(&mut shards, &event) {
             Ok(()) => {}
             Err(write_error) if write_error.is_capacity() => eprintln!(
-                "eventd: no event shard is writable; synthetic.storage_error for the {store} \
+                "eventd: no event shard is writable; eventd.store.quarantined for the {store} \
                  store skipped: {write_error}"
             ),
             Err(write_error) => return Err(write_error.into()),
@@ -345,14 +345,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let startup = crate::synthetic::startup(
         boot_id,
-        &canonical_boot_id,
         restart,
         shard_count,
         &resume_points,
         realtime_nanoseconds()?,
     );
     if let Err(error) = commit_synthetic_fallback(&queues, &startup) {
-        eprintln!("eventd: cannot persist synthetic.startup: {error}");
+        eprintln!("eventd: cannot persist eventd.daemon.started: {error}");
     }
 
     let query_stores = Arc::new(crate::query::Stores {
@@ -674,16 +673,21 @@ fn supervise(
         .copied()
         .map(|cpu_id| (cpu_id, 0))
         .collect::<Vec<_>>();
-    match load_coverage(active_paths, historical_paths) {
+    // Whether `sequences` says what was committed. When coverage cannot be
+    // read they stay 0, which the checkpoint below tolerates, but the
+    // shutdown record leaves them out rather than claim it (PEI-1394).
+    let coverage_read = match load_coverage(active_paths, historical_paths) {
         Ok(coverage) => {
             for (cpu_id, sequence) in &mut sequences {
                 *sequence = coverage.highest_contiguous(&boot_id, *cpu_id);
             }
+            true
         }
         Err(error) => {
             first_error.get_or_insert_with(|| error.to_string());
+            false
         }
-    }
+    };
     let timestamp = realtime_nanoseconds();
     // The final policy run, then the sequence checkpoints once policy
     // activity has stopped (TRM §3.5), then the policy thread exits.
@@ -708,11 +712,15 @@ fn supervise(
     }
     match timestamp {
         Ok(timestamp) => {
-            let shutdown = crate::synthetic::shutdown(boot_id, &sequences, timestamp);
+            let shutdown = crate::synthetic::shutdown(
+                boot_id,
+                coverage_read.then_some(sequences.as_slice()),
+                timestamp,
+            );
             // With no writable shard the record is skipped and the failure
             // logged (TRM §8.4); it does not fail the shutdown.
             if let Err(error) = commit_synthetic_fallback(queues, &shutdown) {
-                eprintln!("eventd: cannot persist synthetic.shutdown: {error}");
+                eprintln!("eventd: cannot persist eventd.daemon.stopped: {error}");
             }
         }
         Err(error) => {
@@ -1030,7 +1038,6 @@ mod tests {
             shard
                 .commit(&[eventd_core::IngestItem {
                     gaps: vec![eventd_core::Gap {
-                        timestamp: 10,
                         first_sequence: 1,
                         last_sequence: 2,
                         preceding_timestamp: None,
@@ -1075,10 +1082,10 @@ mod tests {
                 );
             }
             let gap = &rows[0];
-            assert_eq!(gap.0, "synthetic.gap");
-            // The gap record's first field is `cpu_id`, a positive fixint.
-            assert_eq!(&gap.2[1..8], b"\xa6cpu_id");
-            assert_eq!(gap.2[8], u8::try_from(cpu_id).unwrap());
+            assert_eq!(gap.0, "eventd.events.lost");
+            // The record opens with `buffer: {cpu: N}`, N a positive fixint.
+            assert_eq!(&gap.2[1..13], b"\xa6buffer\x81\xa3cpu");
+            assert_eq!(gap.2[13], u8::try_from(cpu_id).unwrap());
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1142,7 +1149,7 @@ mod tests {
         let full = |path: PathBuf| {
             let mut shard = Shard::open(path, 1_000).unwrap();
             shard.cap_pages_for_test().unwrap();
-            let filler = crate::synthetic::shutdown([1; 16], &[(0, 1)], 1);
+            let filler = crate::synthetic::shutdown([1; 16], Some(&[(0, 1)]), 1);
             while shard.commit_synthetic(&filler).is_ok() {}
             shard
         };
@@ -1151,7 +1158,7 @@ mod tests {
             rusqlite::Connection::open(shard.path())
                 .unwrap()
                 .query_row(
-                    "SELECT count(*) FROM events WHERE event_type = 'synthetic.storage_error'",
+                    "SELECT count(*) FROM events WHERE event_type = 'eventd.store.quarantined'",
                     [],
                     |row| row.get(0),
                 )

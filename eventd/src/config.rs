@@ -14,7 +14,7 @@ use peios::registry::{Key, KeyAccess, NotifyFilter, OpenFlags, ValueRecord, Valu
 use crate::indexing::PolicyMessage;
 use crate::writer::WriterMessage;
 
-const ROOT_KEY: &str = r"Machine\System\eventd";
+pub const ROOT_KEY: &str = r"Machine\System\eventd";
 
 pub const HANDOFF_SLOTS: usize = 4_096;
 pub const HANDOFF_BYTES: usize = 16 * 1024 * 1024;
@@ -25,13 +25,25 @@ const MAX_INGEST_DATAGRAM_BYTES: u32 = 1024 * 1024;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 
+/// One configuration value whose change a reload applied: the record of an
+/// `eventd.config.changed` event. Every value eventd reloads at runtime is
+/// a `REG_DWORD` or `REG_QWORD`, so each side is an integer or absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedChange {
+    /// The value's name under [`ROOT_KEY`].
     pub key: &'static str,
-    pub old_value_type: &'static str,
-    pub old_value: Option<String>,
-    pub new_value_type: &'static str,
-    pub new_value: Option<String>,
+    /// What was in force before; `None` when the value was not set.
+    pub previous: Option<AppliedValue>,
+    /// What is in force now; `None` when the change removed the value.
+    pub current: Option<AppliedValue>,
+}
+
+/// One side of an [`AppliedChange`]: the registry type the value is read
+/// as, and the integer in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedValue {
+    pub registry_type: ValueType,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,15 +697,15 @@ impl Config {
     pub fn applied_changes(&self, next: &Self) -> Vec<AppliedChange> {
         let mut changes = Vec::new();
         macro_rules! value {
-            ($field:ident, $key:literal, $kind:literal) => {
+            ($field:ident, $key:literal, $kind:ident) => {
                 if self.$field != next.$field {
                     changes.push(applied_change(
                         self,
                         next,
                         $key,
-                        $kind,
-                        self.$field.to_string(),
-                        next.$field.to_string(),
+                        ValueType::$kind,
+                        saturating_u64(self.$field),
+                        saturating_u64(next.$field),
                     ));
                 }
             };
@@ -705,9 +717,9 @@ impl Config {
                         self,
                         next,
                         $key,
-                        "REG_DWORD",
-                        self.$field.as_millis().to_string(),
-                        next.$field.as_millis().to_string(),
+                        ValueType::DWORD,
+                        saturating_u64(self.$field.as_millis()),
+                        saturating_u64(next.$field.as_millis()),
                     ));
                 }
             };
@@ -719,35 +731,27 @@ impl Config {
                         self,
                         next,
                         $key,
-                        "REG_DWORD",
-                        (self.$field.as_secs() / $divisor).to_string(),
-                        (next.$field.as_secs() / $divisor).to_string(),
+                        ValueType::DWORD,
+                        self.$field.as_secs() / $divisor,
+                        next.$field.as_secs() / $divisor,
                     ));
                 }
             };
         }
-        value!(wal_checkpoint_pages, "WalCheckpointPages", "REG_DWORD");
-        value!(max_batch_size, "MaxBatchSize", "REG_DWORD");
+        value!(wal_checkpoint_pages, "WalCheckpointPages", DWORD);
+        value!(max_batch_size, "MaxBatchSize", DWORD);
         milliseconds!(max_batch_latency, "MaxBatchLatencyMs");
-        value!(log_max_batch_size, "LogMaxBatchSize", "REG_DWORD");
+        value!(log_max_batch_size, "LogMaxBatchSize", DWORD);
         milliseconds!(log_max_batch_latency, "LogMaxBatchLatencyMs");
-        value!(max_log_datagram_bytes, "MaxLogDatagramBytes", "REG_DWORD");
-        value!(metric_max_batch_size, "MetricMaxBatchSize", "REG_DWORD");
+        value!(max_log_datagram_bytes, "MaxLogDatagramBytes", DWORD);
+        value!(metric_max_batch_size, "MetricMaxBatchSize", DWORD);
         milliseconds!(metric_max_batch_latency, "MetricMaxBatchLatencyMs");
-        value!(
-            max_metric_datagram_bytes,
-            "MaxMetricDatagramBytes",
-            "REG_DWORD"
-        );
-        value!(
-            metric_series_cache_size,
-            "MetricSeriesCacheSize",
-            "REG_DWORD"
-        );
+        value!(max_metric_datagram_bytes, "MaxMetricDatagramBytes", DWORD);
+        value!(metric_series_cache_size, "MetricSeriesCacheSize", DWORD);
         value!(
             metric_authorization_cache_size,
             "MetricAuthorizationCacheSize",
-            "REG_DWORD"
+            DWORD
         );
         seconds!(health_metric_interval, "HealthMetricIntervalSeconds", 1);
         seconds!(adaptive_index_window, "AdaptiveIndexWindowHours", 3_600);
@@ -759,71 +763,51 @@ impl Config {
         value!(
             adaptive_index_create_threshold,
             "AdaptiveIndexCreateThreshold",
-            "REG_DWORD"
+            DWORD
         );
         value!(
             adaptive_index_drop_threshold,
             "AdaptiveIndexDropThreshold",
-            "REG_DWORD"
+            DWORD
         );
         seconds!(shedding_window, "SheddingWindowSeconds", 1);
-        value!(shedding_batch_percent, "SheddingBatchPercent", "REG_DWORD");
+        value!(shedding_batch_percent, "SheddingBatchPercent", DWORD);
         value!(
             emergency_shedding_buffer_percent,
             "EmergencySheddingBufferPercent",
-            "REG_DWORD"
+            DWORD
         );
         seconds!(event_retention, "EventRetentionDays", 86_400);
-        value!(
-            event_retention_max_bytes,
-            "EventRetentionMaxBytes",
-            "REG_QWORD"
-        );
+        value!(event_retention_max_bytes, "EventRetentionMaxBytes", QWORD);
         seconds!(log_retention, "LogRetentionDays", 86_400);
-        value!(log_retention_max_bytes, "LogRetentionMaxBytes", "REG_QWORD");
+        value!(log_retention_max_bytes, "LogRetentionMaxBytes", QWORD);
         seconds!(metric_retention, "MetricRetentionDays", 86_400);
-        value!(
-            metric_retention_max_bytes,
-            "MetricRetentionMaxBytes",
-            "REG_QWORD"
-        );
+        value!(metric_retention_max_bytes, "MetricRetentionMaxBytes", QWORD);
         seconds!(retention_interval, "RetentionCheckIntervalMinutes", 60);
         value!(
             retention_delete_batch_rows,
             "RetentionDeleteBatchRows",
-            "REG_DWORD"
+            DWORD
         );
         milliseconds!(query_timeout, "QueryTimeoutMs");
-        value!(max_concurrent_queries, "MaxConcurrentQueries", "REG_DWORD");
-        value!(max_streaming_queries, "MaxStreamingQueries", "REG_DWORD");
-        value!(max_queries_per_user, "MaxQueriesPerUser", "REG_DWORD");
-        value!(
-            max_distinct_stream_values,
-            "MaxDistinctStreamValues",
-            "REG_DWORD"
-        );
-        value!(max_query_request_bytes, "MaxQueryRequestBytes", "REG_DWORD");
+        value!(max_concurrent_queries, "MaxConcurrentQueries", DWORD);
+        value!(max_streaming_queries, "MaxStreamingQueries", DWORD);
+        value!(max_queries_per_user, "MaxQueriesPerUser", DWORD);
+        value!(max_distinct_stream_values, "MaxDistinctStreamValues", DWORD);
+        value!(max_query_request_bytes, "MaxQueryRequestBytes", DWORD);
         value!(
             query_response_target_bytes,
             "QueryResponseTargetBytes",
-            "REG_DWORD"
+            DWORD
         );
-        value!(max_query_held_bytes, "MaxQueryHeldBytes", "REG_DWORD");
+        value!(max_query_held_bytes, "MaxQueryHeldBytes", DWORD);
         value!(
             adaptive_rollup_min_samples,
             "AdaptiveRollupMinSamples",
-            "REG_DWORD"
+            DWORD
         );
-        value!(
-            adaptive_rollup_batch_rows,
-            "AdaptiveRollupBatchRows",
-            "REG_DWORD"
-        );
-        value!(
-            adaptive_rollup_max_rows,
-            "AdaptiveRollupMaxRows",
-            "REG_DWORD"
-        );
+        value!(adaptive_rollup_batch_rows, "AdaptiveRollupBatchRows", DWORD);
+        value!(adaptive_rollup_max_rows, "AdaptiveRollupMaxRows", DWORD);
         milliseconds!(cross_type_window, "CrossTypeWindowMs");
         seconds!(cross_type_max_lookback, "CrossTypeMaxLookbackSeconds", 1);
         changes
@@ -842,53 +826,55 @@ fn copy_raw(
     }
 }
 
+fn saturating_u64<T: TryInto<u64>>(value: T) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
 fn applied_change(
     current: &Config,
     next: &Config,
     key: &'static str,
-    expected_type: &'static str,
-    old_fallback: String,
-    new_fallback: String,
+    expected_type: ValueType,
+    previous_in_force: u64,
+    current_in_force: u64,
 ) -> AppliedChange {
-    let (old_value_type, old_value) = render_applied(
-        current.raw_values.get(key.as_bytes()),
-        expected_type,
-        old_fallback,
-    );
-    let (new_value_type, new_value) = render_applied(
-        next.raw_values.get(key.as_bytes()),
-        expected_type,
-        new_fallback,
-    );
     AppliedChange {
         key,
-        old_value_type,
-        old_value,
-        new_value_type,
-        new_value,
+        previous: applied_value(
+            current.raw_values.get(key.as_bytes()),
+            expected_type,
+            previous_in_force,
+        ),
+        current: applied_value(
+            next.raw_values.get(key.as_bytes()),
+            expected_type,
+            current_in_force,
+        ),
     }
 }
 
-fn render_applied(
+/// One side of a change: absent when no value is stored, even though a
+/// compiled default then applies; otherwise the stored integer, or the
+/// integer in force when what is stored is not of `expected_type`.
+fn applied_value(
     record: Option<&ValueRecord>,
-    expected_type: &'static str,
-    fallback: String,
-) -> (&'static str, Option<String>) {
-    let Some(record) = record else {
-        return ("absent", None);
-    };
-    let rendered = match expected_type {
-        "REG_DWORD" if record.ty == ValueType::DWORD && record.data.len() == 4 => {
-            u32::from_le_bytes(record.data.as_slice().try_into().expect("length checked"))
-                .to_string()
-        }
-        "REG_QWORD" if record.ty == ValueType::QWORD && record.data.len() == 8 => {
+    expected_type: ValueType,
+    in_force: u64,
+) -> Option<AppliedValue> {
+    let record = record?;
+    let value = match expected_type {
+        ValueType::DWORD if record.ty == ValueType::DWORD && record.data.len() == 4 => u64::from(
+            u32::from_le_bytes(record.data.as_slice().try_into().expect("length checked")),
+        ),
+        ValueType::QWORD if record.ty == ValueType::QWORD && record.data.len() == 8 => {
             u64::from_le_bytes(record.data.as_slice().try_into().expect("length checked"))
-                .to_string()
         }
-        _ => fallback,
+        _ => in_force,
     };
-    (expected_type, Some(rendered))
+    Some(AppliedValue {
+        registry_type: expected_type,
+        value,
+    })
 }
 
 pub struct ConfigWatch {
@@ -1413,19 +1399,64 @@ mod tests {
             vec![
                 AppliedChange {
                     key: "MaxBatchLatencyMs",
-                    old_value_type: "REG_DWORD",
-                    old_value: Some("100".into()),
-                    new_value_type: "REG_DWORD",
-                    new_value: Some("250".into()),
+                    previous: Some(AppliedValue {
+                        registry_type: ValueType::DWORD,
+                        value: 100,
+                    }),
+                    current: Some(AppliedValue {
+                        registry_type: ValueType::DWORD,
+                        value: 250,
+                    }),
                 },
                 AppliedChange {
                     key: "EventRetentionMaxBytes",
-                    old_value_type: "REG_QWORD",
-                    old_value: Some("0".into()),
-                    new_value_type: "REG_QWORD",
-                    new_value: Some("99".into()),
+                    previous: Some(AppliedValue {
+                        registry_type: ValueType::QWORD,
+                        value: 0,
+                    }),
+                    current: Some(AppliedValue {
+                        registry_type: ValueType::QWORD,
+                        value: 99,
+                    }),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_stored_value_of_the_wrong_type_reports_the_integer_in_force() {
+        let mut current = Config::test_defaults();
+        current.raw_values.insert(
+            b"EventRetentionMaxBytes".to_vec(),
+            ValueRecord {
+                name: b"EventRetentionMaxBytes".to_vec(),
+                ty: ValueType::SZ,
+                data: b"lots\0".to_vec(),
+            },
+        );
+        let mut next = current.clone();
+        next.event_retention_max_bytes = 4_096;
+        next.raw_values.insert(
+            b"EventRetentionMaxBytes".to_vec(),
+            ValueRecord {
+                name: b"EventRetentionMaxBytes".to_vec(),
+                ty: ValueType::QWORD,
+                data: 4_096_u64.to_le_bytes().to_vec(),
+            },
+        );
+        assert_eq!(
+            current.applied_changes(&next),
+            vec![AppliedChange {
+                key: "EventRetentionMaxBytes",
+                previous: Some(AppliedValue {
+                    registry_type: ValueType::QWORD,
+                    value: current.event_retention_max_bytes,
+                }),
+                current: Some(AppliedValue {
+                    registry_type: ValueType::QWORD,
+                    value: 4_096,
+                }),
+            }]
         );
     }
 
@@ -1444,10 +1475,11 @@ mod tests {
             current.applied_changes(&next),
             vec![AppliedChange {
                 key: "MaxBatchSize",
-                old_value_type: "REG_DWORD",
-                old_value: Some("20000".into()),
-                new_value_type: "absent",
-                new_value: None,
+                previous: Some(AppliedValue {
+                    registry_type: ValueType::DWORD,
+                    value: 20_000,
+                }),
+                current: None,
             }]
         );
     }

@@ -27,7 +27,10 @@ pub use metric_store::{
     Histogram, MetricCommitStats, MetricRecord, MetricRollup, MetricStore, MetricStoreError,
     MetricType, MetricTypeMismatch, MetricValue,
 };
-pub use model::{Gap, Guid, IngestItem, RealEvent, SyntheticEvent};
+pub use model::{
+    CONFIG_CHANGED, DAEMON_STARTED, DAEMON_STOPPED, EVENTS_LOST, Gap, Guid, IngestItem, RealEvent,
+    STORE_QUARANTINED, STORE_WRITTEN_TYPES, SyntheticEvent, is_store_written,
+};
 pub use payload_index::{PayloadIndexValue, query_key as payload_query_key};
 pub use queue::{BoundedQueue, Pop, QueueConfigError, ReserveError};
 pub use receipt::{Coverage, Interval};

@@ -8,7 +8,9 @@ use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use crate::schema::Contents;
-use crate::{DesiredIndex, Gap, Guid, IngestItem, Interval, SyntheticEvent};
+use crate::{
+    DesiredIndex, EVENTS_LOST, Gap, Guid, IngestItem, Interval, SyntheticEvent, is_store_written,
+};
 
 const SCHEMA_VERSION: &str = "1";
 
@@ -164,7 +166,7 @@ impl Shard {
             )?;
             let mut insert_gap = transaction.prepare_cached(
                 "INSERT INTO events (boot_id, timestamp, cpu_id, event_type, payload) \
-                 VALUES (?1, ?2, ?3, 'synthetic.gap', ?4)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             let mut insert_type = transaction
                 .prepare_cached("INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)")?;
@@ -172,16 +174,17 @@ impl Shard {
             for item in items {
                 let event = &item.event;
                 for gap in &item.gaps {
-                    if !self.known_types.contains("synthetic.gap")
-                        && pending_types.insert("synthetic.gap".into())
+                    if !self.known_types.contains(EVENTS_LOST)
+                        && pending_types.insert(EVENTS_LOST.into())
                     {
-                        insert_type.execute(["synthetic.gap"])?;
+                        insert_type.execute([EVENTS_LOST])?;
                     }
                     let payload = encode_gap_payload(event.cpu_id, *gap);
                     insert_gap.execute(params![
                         &event.boot_id[..],
-                        sqlite_integer(gap.timestamp, "gap timestamp")?,
+                        sqlite_integer(gap.revealing_timestamp, "gap timestamp")?,
                         i64::from(event.cpu_id),
+                        EVENTS_LOST,
                         payload,
                     ])?;
                 }
@@ -269,24 +272,25 @@ impl Shard {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !self.known_types.contains("synthetic.gap") {
+        if !self.known_types.contains(EVENTS_LOST) {
             transaction.execute(
-                "INSERT OR IGNORE INTO event_types(event_type) VALUES ('synthetic.gap')",
-                [],
+                "INSERT OR IGNORE INTO event_types(event_type) VALUES (?1)",
+                [EVENTS_LOST],
             )?;
         }
         let receipt_rows;
         {
             let mut insert_gap = transaction.prepare_cached(
                 "INSERT INTO events (boot_id, timestamp, cpu_id, event_type, payload) \
-                 VALUES (?1, ?2, ?3, 'synthetic.gap', ?4)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             let mut receipts: HashMap<u16, Vec<Interval>> = HashMap::new();
             for (cpu_id, gap) in gaps {
                 insert_gap.execute(params![
                     &boot_id[..],
-                    sqlite_integer(gap.timestamp, "gap timestamp")?,
+                    sqlite_integer(gap.revealing_timestamp, "gap timestamp")?,
                     i64::from(*cpu_id),
+                    EVENTS_LOST,
                     encode_gap_payload(*cpu_id, *gap),
                 ])?;
                 receipts.entry(*cpu_id).or_default().push(Interval {
@@ -314,7 +318,7 @@ impl Shard {
             receipt_rows = receipts.values().map(Vec::len).sum();
         }
         transaction.commit()?;
-        self.known_types.insert("synthetic.gap".into());
+        self.known_types.insert(EVENTS_LOST.into());
         if let Err(error) = self.checkpoint_if_needed()
             && !error.is_capacity()
         {
@@ -344,7 +348,7 @@ impl Shard {
 
     /// Commit one daemon-generated event in its own durability transaction.
     pub fn commit_synthetic(&mut self, event: &SyntheticEvent) -> Result<(), ShardError> {
-        if !event.event_type.starts_with("synthetic.") {
+        if !is_store_written(&event.event_type) {
             return Err(ShardError::InvalidSyntheticType);
         }
         let transaction = self
@@ -809,25 +813,34 @@ fn sqlite_limit(limit: usize) -> Result<i64, ShardError> {
     i64::try_from(limit).map_err(|_| ShardError::IntegerRange("retention batch size"))
 }
 
+/// The `eventd.events.lost` payload: `{buffer: {cpu}, loss: {sequence,
+/// sequence-last, count, preceding-time?}}`, nested by path (PGSS §6.4).
+/// The reveal time is the record's own `event.time`, not a field, and
+/// `loss.preceding-time` is left out, never nil, when nothing preceded the
+/// gap.
 fn encode_gap_payload(cpu_id: u16, gap: crate::Gap) -> Vec<u8> {
-    let mut output = Vec::with_capacity(144);
-    output.push(0x86); // fixmap, six entries
-    pack_str(&mut output, "cpu_id");
+    let mut output = Vec::with_capacity(96);
+    output.push(0x82); // fixmap: buffer, loss
+    pack_str(&mut output, "buffer");
+    output.push(0x81);
+    pack_str(&mut output, "cpu");
     pack_u64(&mut output, u64::from(cpu_id));
-    pack_str(&mut output, "first_sequence");
+    pack_str(&mut output, "loss");
+    output.push(if gap.preceding_timestamp.is_some() {
+        0x84
+    } else {
+        0x83
+    });
+    pack_str(&mut output, "sequence");
     pack_u64(&mut output, gap.first_sequence);
-    pack_str(&mut output, "last_sequence");
+    pack_str(&mut output, "sequence-last");
     pack_u64(&mut output, gap.last_sequence);
     pack_str(&mut output, "count");
     pack_u64(&mut output, gap.count());
-    pack_str(&mut output, "last_seen_timestamp");
     if let Some(timestamp) = gap.preceding_timestamp {
+        pack_str(&mut output, "preceding-time");
         pack_u64(&mut output, timestamp);
-    } else {
-        output.push(0xc0);
     }
-    pack_str(&mut output, "revealing_timestamp");
-    pack_u64(&mut output, gap.revealing_timestamp);
     output
 }
 
@@ -876,7 +889,7 @@ fn pack_u64(output: &mut Vec<u8>, value: u64) {
 pub struct CommitStats {
     /// Queue items consumed.
     pub items: usize,
-    /// Real plus synthetic event rows inserted.
+    /// Real event rows plus `eventd.events.lost` rows inserted.
     pub event_rows: usize,
     /// Merged receipt rows inserted or already present.
     pub receipt_rows: usize,
@@ -897,7 +910,7 @@ pub enum ShardError {
     UnrecognisedContents,
     /// An unsigned kernel value cannot fit `SQLite`'s signed `INTEGER`.
     IntegerRange(&'static str),
-    /// The direct-write API was given a non-synthetic event type.
+    /// The direct-write API was given a type outside `STORE_WRITTEN_TYPES`.
     InvalidSyntheticType,
 }
 
@@ -943,7 +956,7 @@ impl fmt::Display for ShardError {
             }
             Self::IntegerRange(field) => write!(formatter, "{field} exceeds SQLite INTEGER range"),
             Self::InvalidSyntheticType => {
-                formatter.write_str("direct event type does not begin with synthetic.")
+                formatter.write_str("direct event type is not one eventd writes itself")
             }
         }
     }
@@ -1002,7 +1015,6 @@ mod tests {
         let mut shard = Shard::open(&path, 1_000).unwrap();
         let mut first = event(4, "example.test");
         first.gaps.push(Gap {
-            timestamp: 40,
             first_sequence: 1,
             last_sequence: 3,
             preceding_timestamp: None,
@@ -1130,19 +1142,131 @@ mod tests {
             .commit_synthetic(&SyntheticEvent {
                 boot_id: [1; 16],
                 timestamp: 42,
-                event_type: "synthetic.startup".into(),
+                event_type: crate::DAEMON_STARTED.into(),
                 payload: [0x80].into(),
             })
             .unwrap();
         let count: u32 = shard
             .connection
             .query_row(
-                "SELECT count(*) FROM events WHERE event_type = 'synthetic.startup'",
+                "SELECT count(*) FROM events WHERE event_type = 'eventd.daemon.started'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(count, 1);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PEI-1294: the direct-write path takes exactly the five store-written
+    // types, not a prefix: the rest of the `eventd` root, and the retired
+    // `synthetic.` names, are refused.
+    #[test]
+    fn the_direct_write_path_takes_only_the_store_written_types() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        for event_type in [
+            "eventd.daemon.restarted",
+            "eventd.daemon",
+            "eventd.config.changed.extra",
+            "synthetic.startup",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    shard.commit_synthetic(&SyntheticEvent {
+                        boot_id: [1; 16],
+                        timestamp: 42,
+                        event_type: event_type.into(),
+                        payload: [0x80].into(),
+                    }),
+                    Err(ShardError::InvalidSyntheticType)
+                ),
+                "{event_type} is refused"
+            );
+        }
+        for event_type in crate::STORE_WRITTEN_TYPES {
+            shard
+                .commit_synthetic(&SyntheticEvent {
+                    boot_id: [1; 16],
+                    timestamp: 42,
+                    event_type: event_type.into(),
+                    payload: [0x80].into(),
+                })
+                .unwrap();
+        }
+        let count: u32 = shard
+            .connection
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
+        drop(shard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PGSS §6.4/§6.5 and C6 Q4: nested maps, no nil, and the reveal time is
+    // the row's timestamp rather than a payload field.
+    #[test]
+    fn a_gap_is_stored_as_events_lost_at_its_reveal_time_with_nested_fields() {
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let mut shard = Shard::open(&path, 1_000).unwrap();
+        let gap = |first_sequence, preceding_timestamp| Gap {
+            first_sequence,
+            last_sequence: first_sequence + 2,
+            preceding_timestamp,
+            revealing_timestamp: 600,
+        };
+        shard
+            .commit_gaps(&[1; 16], &[(3, gap(4, Some(300))), (3, gap(10, None))])
+            .unwrap();
+        let rows: Vec<(String, i64, i64, Vec<u8>)> = {
+            let mut statement = shard
+                .connection
+                .prepare("SELECT event_type, timestamp, cpu_id, payload FROM events ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let mut with_preceding = vec![0x82, 0xa6];
+        with_preceding.extend_from_slice(b"buffer");
+        with_preceding.extend_from_slice(&[0x81, 0xa3]);
+        with_preceding.extend_from_slice(b"cpu");
+        with_preceding.extend_from_slice(&[0x03, 0xa4]);
+        with_preceding.extend_from_slice(b"loss");
+        let mut without_preceding = with_preceding.clone();
+        for (payload, entries, first) in [
+            (&mut with_preceding, 0x84, 4),
+            (&mut without_preceding, 0x83, 10),
+        ] {
+            payload.push(entries);
+            payload.push(0xa8);
+            payload.extend_from_slice(b"sequence");
+            payload.push(first);
+            payload.push(0xad);
+            payload.extend_from_slice(b"sequence-last");
+            payload.push(first + 2);
+            payload.push(0xa5);
+            payload.extend_from_slice(b"count");
+            payload.push(3);
+        }
+        with_preceding.push(0xae);
+        with_preceding.extend_from_slice(b"preceding-time");
+        with_preceding.extend_from_slice(&[0xcd, 0x01, 0x2c]);
+        assert_eq!(
+            rows,
+            [
+                ("eventd.events.lost".to_owned(), 600, 3, with_preceding),
+                ("eventd.events.lost".to_owned(), 600, 3, without_preceding),
+            ]
+        );
         drop(shard);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1165,13 +1289,12 @@ mod tests {
         let startup = SyntheticEvent {
             boot_id: [1; 16],
             timestamp: 42,
-            event_type: "synthetic.startup".into(),
+            event_type: crate::DAEMON_STARTED.into(),
             payload: [0x80].into(),
         };
         shard.commit_synthetic(&startup).unwrap();
         shard.commit_synthetic(&startup).unwrap();
         let gap = |first_sequence| Gap {
-            timestamp: 40,
             first_sequence,
             last_sequence: first_sequence,
             preceding_timestamp: None,
@@ -1196,8 +1319,8 @@ mod tests {
         assert_eq!(
             attempts,
             [
-                ("synthetic.gap".to_owned(), 1),
-                ("synthetic.startup".to_owned(), 1)
+                ("eventd.daemon.started".to_owned(), 1),
+                ("eventd.events.lost".to_owned(), 1)
             ]
         );
         drop(shard);
@@ -1322,7 +1445,6 @@ mod tests {
             (
                 2,
                 Gap {
-                    timestamp: 40,
                     first_sequence: 4,
                     last_sequence: 5,
                     preceding_timestamp: Some(30),
@@ -1332,7 +1454,6 @@ mod tests {
             (
                 2,
                 Gap {
-                    timestamp: 60,
                     first_sequence: 6,
                     last_sequence: 6,
                     preceding_timestamp: None,
@@ -1414,7 +1535,7 @@ mod tests {
             .commit_synthetic(&SyntheticEvent {
                 boot_id: [1; 16],
                 timestamp: 1,
-                event_type: "synthetic.startup".into(),
+                event_type: crate::DAEMON_STARTED.into(),
                 payload: [0x80].into(),
             })
             .unwrap();

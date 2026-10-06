@@ -1,0 +1,250 @@
+--- field object.event-namespace.pattern
+type: str
+asserted: true
+
+The event-namespace pattern whose security descriptor eventd checked a
+caller's access against. It is the pattern the descriptor was written for,
+not the event type the caller asked about: eventd looks for a descriptor
+under the event type itself, then under each shorter dotted prefix of it,
+then under `*`, and uses the first it finds. A read of
+`kacs.audit.access.checked` therefore records `kacs` or `*` when that is
+where the descriptor lives, so a search for one event type by its full name
+misses checks made under a broader pattern.
+
+The value is eventd's claim, copied by the kernel from the check's audit
+context, so a record carrying it also carries `fields.attestation.userspace`.
+
+--- field object.metric-namespace.pattern
+type: str
+asserted: true
+
+The metric-namespace pattern whose security descriptor eventd checked a
+caller's access against. As with `object.event-namespace.pattern`, it is the
+pattern the descriptor was written for, not the metric name: eventd tries the
+name, then each shorter dotted prefix, then `*`, and uses the first that has
+a descriptor.
+
+eventd checks metric namespaces for two different things, reading stored
+metrics and publishing a sample, and this field is the same for both. Which
+one was checked is in `access.requested`, not here.
+
+The value is eventd's claim, copied by the kernel from the check's audit
+context, so a record carrying it also carries `fields.attestation.userspace`.
+
+--- field object.log-namespace.pattern
+type: str
+asserted: true
+
+The log-store namespace pattern whose security descriptor eventd checked a
+caller's access against. As with `object.event-namespace.pattern`, it is the
+pattern the descriptor was written for, not the log origin the caller asked
+about: eventd tries the origin, then each shorter dotted prefix, then `*`,
+and uses the first that has a descriptor.
+
+An origin may name a producer within a service after a `/`, such as
+`jobs/<guid>`, and that part is never a pattern: the walk starts at the
+service. A service's hooks, reloads and health checks therefore record the
+service's own pattern, and a search for the full origin finds none of them.
+
+The value is eventd's claim, copied by the kernel from the check's audit
+context, so a record carrying it also carries `fields.attestation.userspace`.
+
+--- field store.kind
+type: str.enum
+values: event | log | metric
+closed: false
+
+Which of eventd's stores a record is about: the sharded event store, the log
+store or the metric store. On a storage error this is the store eventd found
+corrupt and quarantined, and with `store.shard` it is the field worth alerting
+on. The set is open because the database eventd keeps its own metadata in
+may be reported on separately later; today eventd rebuilds that database
+when it is damaged, and writes no record of it.
+
+--- field store.shard
+type: uint
+
+The index of the event-store shard a record is about, counting from 0.
+Present only when `store.kind` is `event`; the log and metric stores are not
+sharded, so a record about either has no shard.
+
+--- field store.shard-count
+type: uint
+
+How many active event-store shards eventd is running with, after resolving
+its configured shard count. Historical shards kept only for reading are not
+counted.
+
+--- field store.restarted
+type: bool
+
+Whether this boot's events were already in the store when eventd started,
+which is to say eventd had already run during this boot and this start is a
+restart. It is false on eventd's first start in a boot. Counting the records
+where it is true answers how often eventd restarted during a boot, without
+inferring it from gaps.
+
+A historical shard that cannot be opened at startup is left out of the
+decision, so on a damaged store a restart can be reported as false.
+
+--- field store.resume.cpus
+type: uint[]
+
+The CPUs whose KMES rings eventd resumed reading at startup, one entry per
+logical CPU in ascending order. Parallel to `store.resume.sequences`: entry
+`i` of that array is where reading resumed for the CPU in entry `i` of this
+one.
+
+--- field store.resume.sequences
+type: uint[]
+
+For each CPU in `store.resume.cpus`, the highest event sequence of this boot
+already committed with no gap before it, which is where eventd resumed
+reading that CPU's ring. Parallel to `store.resume.cpus`.
+
+**0 is a value, not an absence.** It means no unbroken run of committed
+events starting at sequence 1 exists for that CPU in this boot: nothing was
+committed yet, or the first events were lost. Events committed after a gap
+are not reflected here.
+
+--- field store.committed.cpus
+type: uint[]
+
+The CPUs whose KMES rings eventd was reading when it shut down, one entry per
+logical CPU in ascending order. Parallel to `store.committed.sequences`.
+
+--- field store.committed.sequences
+type: uint[]
+
+For each CPU in `store.committed.cpus`, the highest event sequence of this
+boot committed with no gap before it, taken during a graceful shutdown after
+eventd had stopped reading the rings and committed everything it had read.
+Parallel to `store.committed.cpus`. It is diagnostic only: when
+eventd next starts it works out where to resume from the store itself, never
+from this record.
+
+0 means no unbroken run from sequence 1 exists for that CPU, as in
+`store.resume.sequences`. When eventd cannot read its record of what was
+committed, it leaves both arrays out of the shutdown record rather than
+write zeroes (PEI-1394), so a 0 here is always a real value.
+
+--- event eventd.daemon.started
+tier: essential
+gating: none — written on every start
+cardinality: once per start of eventd
+
+The record that eventd started, attached to KMES and decided where to resume
+reading each CPU's ring. Like the other four types eventd writes about
+itself (`eventd.daemon.stopped`, `eventd.events.lost`,
+`eventd.store.quarantined` and `eventd.config.changed`), eventd writes it
+straight into its event store and never through KMES. It
+therefore has no `event.sequence` and no `emitter.*`: only `event.type`,
+`event.time` (when eventd wrote it) and `event.boot.guid`.
+
+Essential because the audit store starting is rare, and a start with no
+matching stop is the evidence that eventd crashed. No emission policy
+applies to it or to the other four: eventd is their emitter, and an
+essential type is always written (PGSS §6.9). No KMES event of any of the
+five types is stored, so `event.type` alone marks a record eventd wrote.
+
+Replaces `synthetic.startup` (PEI-617). It carries no boot ID of its own,
+because that is always the record's `event.boot.guid` (PEI-1390).
+
+field: store.restarted                 required
+field: store.shard-count               required
+field: store.resume.cpus               required
+field: store.resume.sequences          required
+
+--- event eventd.daemon.stopped
+tier: essential
+gating: none — written on every graceful shutdown
+cardinality: once per graceful shutdown
+
+The record that eventd shut down gracefully, written after it stopped
+reading the rings and committed everything it had read. A crash writes
+nothing, which is how a crash is told apart from a shutdown.
+
+Replaces `synthetic.shutdown` (PEI-617).
+
+field: store.committed.cpus            optional
+  Absent when eventd could not read its record of what it had committed
+  (PEI-1394), rather than written as zeroes.
+field: store.committed.sequences       optional
+  Present exactly when `store.committed.cpus` is.
+
+--- event eventd.events.lost
+tier: essential
+gating: none — every gap found is recorded
+cardinality: once per contiguous run of missing sequence numbers on one ring
+
+The record that eventd found events missing from a CPU's ring: sequence
+numbers it never read and never stored. KMES overwrote them before eventd
+read them, or eventd consumed them while it had nowhere to store them.
+
+`event.time` is the time of the ring event that revealed the gap, so
+`loss.preceding-time` and `event.time` bound when the lost events were
+written, and the record sorts beside that event. It is not when eventd
+noticed, which after a restart can be much later. Where eventd consumed the
+events itself while it had nowhere to store them, it is the time of the
+last of them. The record also carries the ring's CPU as `event.cpu`.
+
+Replaces `synthetic.gap` (PEI-617). Its `cpu_id` became `buffer.cpu`
+(PEI-1390), and its `revealing_timestamp` the record's `event.time`.
+
+field: buffer.cpu                      required
+field: loss.sequence                   required
+field: loss.sequence-last              required
+field: loss.count                      required
+field: loss.preceding-time             optional
+
+--- event eventd.store.quarantined
+tier: essential
+gating: none — every quarantine is recorded
+cardinality: once per store or shard quarantined
+
+The record that eventd found one of its stores corrupt, moved it aside and
+started a new one in its place. Whatever the quarantined file held is no
+longer queryable. This is what an operator alerts on.
+
+It is written only for a quarantine. A store that is full, or a write that
+fails for any other reason, writes none. The record goes to shard 0, else to
+the lowest-numbered writable event shard, and never to a failed shard
+until it has been replaced.
+
+Replaces `synthetic.storage_error` (PEI-617).
+
+field: store.kind                      required
+field: store.shard                     when store.kind == event
+  Absent for the log and metric stores, which are not sharded (PEI-1394).
+field: outcome.detail                  required
+  The error eventd found, as it describes it. Its wording is not stable.
+
+--- event eventd.config.changed
+tier: essential
+gating: none — every applied change is recorded
+cardinality: once per configuration value whose change was applied
+
+The record that eventd applied a change to one of its configuration values
+at runtime. A change to retention or to the stores is a change to what the
+audit trail keeps, which is why this is essential.
+
+Every value eventd reloads at runtime is a `REG_DWORD` or a `REG_QWORD`, so
+each side of a change is an integer or absent. A side is absent when no
+value is stored, even though eventd's compiled default then applies. A
+stored value of the wrong type is reported as the expected type, holding
+the integer eventd actually uses.
+
+Replaces `synthetic.config_change` (PEI-617). Its values were decimal
+strings and its absent values nil.
+
+field: config.key.path                 required
+  Always `Machine\System\eventd`.
+field: config.name                     required
+field: config.type                     optional
+  Absent when the change removed the value. Present exactly when
+  `config.value` is.
+field: config.type-previous            optional
+  Absent when the value was not set before. Present exactly when
+  `config.value-previous` is.
+field: config.value                    optional
+field: config.value-previous           optional

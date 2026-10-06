@@ -11,7 +11,8 @@ itself, and it answers every query for that data.
 .B Events
 are structured records stamped by the kernel. eventd drains them from the
 KMES per-CPU ring buffers into sharded SQLite stores, with sequence numbers,
-gap detection and a synthetic record written whenever events are lost.
+gap detection and an eventd.events.lost record written whenever events are
+lost.
 .PP
 .B Logs
 are text lines, mostly forwarded by the service manager from services'

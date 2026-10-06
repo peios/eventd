@@ -36,18 +36,49 @@ impl RealEvent {
     }
 }
 
+/// eventd started, attached to KMES and decided where to resume each ring.
+pub const DAEMON_STARTED: &str = "eventd.daemon.started";
+/// eventd shut down gracefully.
+pub const DAEMON_STOPPED: &str = "eventd.daemon.stopped";
+/// Sequence numbers missing from one CPU's ring: the gap record.
+pub const EVENTS_LOST: &str = "eventd.events.lost";
+/// A corrupt store was moved aside and replaced.
+pub const STORE_QUARANTINED: &str = "eventd.store.quarantined";
+/// A configuration value changed at runtime and the change was applied.
+pub const CONFIG_CHANGED: &str = "eventd.config.changed";
+
+/// Every event type eventd writes straight into its own store (TRM §2.6).
+///
+/// eventd stores no KMES event of these types, so `event.type` alone tells
+/// a record eventd wrote from one an emitter sent (PEI-1294). The list is
+/// exact on purpose: the rest of the `eventd` root stays open, so eventd may
+/// still emit through KMES under it.
+pub const STORE_WRITTEN_TYPES: [&str; 5] = [
+    DAEMON_STARTED,
+    DAEMON_STOPPED,
+    EVENTS_LOST,
+    STORE_QUARANTINED,
+    CONFIG_CHANGED,
+];
+
+/// Whether `event_type` is one eventd writes itself, which a KMES event may
+/// not claim.
+#[must_use]
+pub fn is_store_written(event_type: &str) -> bool {
+    STORE_WRITTEN_TYPES.contains(&event_type)
+}
+
 /// A missing inclusive sequence interval revealed by a real event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gap {
-    /// eventd clock at gap-record generation, nanoseconds since the epoch.
-    pub timestamp: u64,
     /// First missing sequence.
     pub first_sequence: u64,
     /// Last missing sequence.
     pub last_sequence: u64,
     /// Timestamp of the preceding event, when one was observed.
     pub preceding_timestamp: Option<u64>,
-    /// Timestamp of the event that revealed the gap.
+    /// Timestamp of the event that revealed the gap, which is the gap
+    /// record's own `event.time`.
     pub revealing_timestamp: u64,
 }
 
@@ -84,9 +115,9 @@ pub struct SyntheticEvent {
     pub boot_id: Guid,
     /// Nanoseconds since the Unix epoch.
     pub timestamp: u64,
-    /// Event type beginning with `synthetic.`.
+    /// One of [`STORE_WRITTEN_TYPES`].
     pub event_type: Box<str>,
-    /// `MessagePack` map following the stable synthetic-event schema.
+    /// `MessagePack` map of the type's fields, nested by path (PGSS §6.4).
     pub payload: Box<[u8]>,
 }
 
