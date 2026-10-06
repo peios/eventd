@@ -153,18 +153,16 @@ impl Authorizer {
         let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
             return Ok(None);
         };
-        let guids: Vec<[u8; 16]> = fields
-            .iter()
-            .map(|field| eventd_core::field_guid(field))
-            .collect();
-        let reads = self.reads(namespace, &pattern, &descriptor, &guids)?;
+        let reads = eventd_client::access::field_reads(namespace.root_guid(), fields, |tree| {
+            self.reads(namespace, &pattern, &descriptor, tree)
+        })?;
         let granted: HashSet<String> = fields
             .iter()
-            .zip(&reads[1..])
+            .zip(&reads.fields)
             .filter(|(_, reads)| **reads)
             .map(|(field, _)| field.clone())
             .collect();
-        if !reads[0] && granted.is_empty() {
+        if !reads.record && granted.is_empty() {
             return Ok(None);
         }
         Ok(Some(granted))
@@ -183,32 +181,31 @@ impl Authorizer {
         let Some((pattern, descriptor)) = self.descriptors.resolve(namespace, identifier)? else {
             return Ok(false);
         };
-        let guids = may_read_fields(fields, &descriptor);
-        let reads = self.reads(namespace, &pattern, &descriptor, &guids)?;
-        Ok(reads.iter().any(|reads| *reads) && reads[1..=fields.len()].iter().all(|reads| *reads))
+        // With fields named, records are visible exactly when every one of
+        // them may be read, since one readable field makes a record so.
+        if !fields.is_empty() {
+            let reads =
+                eventd_client::access::field_reads(namespace.root_guid(), fields, |tree| {
+                    self.reads(namespace, &pattern, &descriptor, tree)
+                })?;
+            return Ok(reads.fields.iter().all(|reads| *reads));
+        }
+        let tree = named_grants(namespace, &descriptor);
+        let reads = self.reads(namespace, &pattern, &descriptor, &tree)?;
+        Ok(reads.iter().any(|reads| *reads))
     }
 
-    /// Whether the caller may read the record (first) and each field in
-    /// `guids` under `descriptor`, the one `pattern` resolved to.
+    /// Whether the caller may read each node of `tree`, an object type
+    /// list, under `descriptor`, the one `pattern` resolved to.
     fn reads(
         &self,
         namespace: Namespace,
         pattern: &str,
         descriptor: &SecurityDescriptor,
-        guids: &[[u8; 16]],
+        tree: &[peios_sys::kacs_object_type_entry],
     ) -> Result<Vec<bool>, SecurityError> {
-        let mut tree = Vec::with_capacity(guids.len() + 1);
-        tree.push(peios_sys::kacs_object_type_entry {
-            level: 0,
-            _reserved: 0,
-            guid: namespace.root_guid(),
-        });
-        for guid in guids {
-            tree.push(peios_sys::kacs_object_type_entry {
-                level: 1,
-                _reserved: 0,
-                guid: *guid,
-            });
+        if tree.len() > eventd_client::access::MAX_OBJECT_TYPES {
+            return Err(SecurityError::TooManyFields);
         }
         let audit_context = audit_context(namespace_kind(namespace), Some(pattern))?;
         let request = peios_sys::peios_access_request {
@@ -309,19 +306,20 @@ impl Authorizer {
     }
 }
 
-/// The level-1 nodes `may_read` asks about: `fields`, in order, then each
-/// field `descriptor` grants by name that is not among them.
-fn may_read_fields(fields: &[String], descriptor: &SecurityDescriptor) -> Vec<[u8; 16]> {
-    let mut guids: Vec<[u8; 16]> = fields
-        .iter()
-        .map(|field| eventd_core::field_guid(field))
-        .collect();
-    let granted: Vec<[u8; 16]> = eventd_client::access::field_grants(descriptor)
-        .into_iter()
-        .filter(|guid| !guids.contains(guid))
-        .collect();
-    guids.extend(granted);
-    guids
+/// The list `may_read` asks about when no field is named: the root, and at
+/// level 1 each field `descriptor` grants by name. Their GUIDs do not say
+/// their paths, so they cannot be placed beneath their prefixes; asked
+/// about alone, each answers whether the caller may read records with that
+/// field unless a deny on a prefix comes first, which the check of each
+/// record then applies.
+fn named_grants(
+    namespace: Namespace,
+    descriptor: &SecurityDescriptor,
+) -> Vec<peios_sys::kacs_object_type_entry> {
+    eventd_client::access::flat_tree(
+        namespace.root_guid(),
+        &eventd_client::access::field_grants(descriptor),
+    )
 }
 
 /// The `object.kind` of a check against `namespace`'s patterns, as
@@ -939,27 +937,184 @@ mod tests {
              (OA;;0x1;e2bd1ef2-4a1f-5a4d-8b2b-6a2b43ff4a5f;;AU)",
         )
         .unwrap();
-        let fields = ["event.time".to_owned(), "event.type".to_owned()];
-        let guids = may_read_fields(&fields, &descriptor);
         for namespace in Namespace::ALL {
-            assert!(
-                !guids.contains(&namespace.root_guid()),
-                "{namespace:?}'s root is not a level-1 node"
+            let tree = named_grants(namespace, &descriptor);
+            assert_eq!(tree[0].level, 0);
+            assert_eq!(tree[0].guid, namespace.root_guid(), "the root is first");
+            assert_eq!(
+                tree.len(),
+                2,
+                "{namespace:?}: and below it only the one field granted by name"
             );
+            assert_eq!(tree[1].level, 1);
+            for other in Namespace::ALL {
+                assert_ne!(tree[1].guid, other.root_guid(), "no root is a field");
+            }
         }
+    }
+
+    // PEI-617: the list is the field paths' tree, root at level 0 and one
+    // node per segment, each prefix once, in preorder.
+    #[test]
+    fn the_object_type_list_is_the_tree_of_the_fields_dotted_paths() {
+        let fields = [
+            "subject.token.sid",
+            "event.time",
+            "subject.process.pid",
+            "subject.token.groups",
+            "event.boot.guid",
+            "n",
+        ];
+        let tree = eventd_client::access::field_tree(Namespace::Events.root_guid(), &fields);
+        let expected = [
+            (0, None),
+            (1, Some("subject")),
+            (2, Some("subject.token")),
+            (3, Some("subject.token.sid")),
+            (3, Some("subject.token.groups")),
+            (2, Some("subject.process")),
+            (3, Some("subject.process.pid")),
+            (1, Some("event")),
+            (2, Some("event.time")),
+            (2, Some("event.boot")),
+            (3, Some("event.boot.guid")),
+            (1, Some("n")),
+        ];
+        let shape: Vec<(u16, [u8; 16])> = tree
+            .entries
+            .iter()
+            .map(|entry| (entry.level, entry.guid))
+            .collect();
+        let want: Vec<(u16, [u8; 16])> = expected
+            .iter()
+            .map(|(level, path)| {
+                (
+                    *level,
+                    path.map_or(Namespace::Events.root_guid(), eventd_core::field_guid),
+                )
+            })
+            .collect();
+        assert_eq!(shape, want);
         assert_eq!(
-            guids[..2],
+            tree.fields,
+            [3, 8, 6, 4, 10, 11],
+            "each field asked about is the node at the end of its path"
+        );
+    }
+
+    // A prefix's GUID is the GUID of the prefix as a name, so a descriptor
+    // that names `subject` names the node every subject field is beneath,
+    // and one that names a full path names that field's node, as before.
+    #[test]
+    fn a_prefix_node_has_the_guid_of_the_prefix_and_a_field_keeps_its_own() {
+        let root = Namespace::Logs.root_guid();
+        let tree = eventd_client::access::field_tree(root, &["emitter.true-token.guid"]);
+        let guids: Vec<[u8; 16]> = tree.entries.iter().map(|entry| entry.guid).collect();
+        assert_eq!(
+            guids,
             [
-                eventd_core::field_guid("event.time"),
-                eventd_core::field_guid("event.type")
-            ],
-            "the fields asked about come first, in order"
+                root,
+                eventd_core::field_guid("emitter"),
+                eventd_core::field_guid("emitter.true-token"),
+                eventd_core::field_guid("emitter.true-token.guid"),
+            ]
         );
+    }
+
+    // Fields are not sorted into the tree as strings: `-` sorts before `.`,
+    // which would put `a.b-x` between `a.b` and `a.b.d` and make KACS take
+    // `a.b.d` for a child of `a.b-x`.
+    #[test]
+    fn a_node_is_its_paths_child_however_the_names_sort() {
+        let root = Namespace::Events.root_guid();
+        let tree = eventd_client::access::field_tree(root, &["a.b-x", "a.b.d", "a.b.c"]);
+        let shape: Vec<(u16, [u8; 16])> = tree
+            .entries
+            .iter()
+            .map(|entry| (entry.level, entry.guid))
+            .collect();
         assert_eq!(
-            guids.len(),
-            3,
-            "and the one field granted by name after them"
+            shape,
+            [
+                (0, root),
+                (1, eventd_core::field_guid("a")),
+                (2, eventd_core::field_guid("a.b-x")),
+                (2, eventd_core::field_guid("a.b")),
+                (3, eventd_core::field_guid("a.b.d")),
+                (3, eventd_core::field_guid("a.b.c")),
+            ]
         );
+        assert_eq!(tree.fields, [2, 4, 5]);
+    }
+
+    // A name that is a value in one place and a prefix in another, such as
+    // a payload's `emitter` beside the header's `emitter.class`, is one
+    // node: KACS refuses a list that names a GUID twice.
+    #[test]
+    fn a_field_that_is_also_a_prefix_is_one_node() {
+        let root = Namespace::Events.root_guid();
+        let fields = [
+            "emitter.class",
+            "emitter",
+            "emitter.process.guid",
+            "emitter",
+        ];
+        let tree = eventd_client::access::field_tree(root, &fields);
+        assert_eq!(tree.entries.len(), 5, "root, emitter, class, process, guid");
+        let mut guids: Vec<[u8; 16]> = tree.entries.iter().map(|entry| entry.guid).collect();
+        guids.sort_unstable();
+        guids.dedup();
+        assert_eq!(guids.len(), 5, "no GUID twice");
+        assert_eq!(tree.fields, [2, 1, 4, 1]);
+        assert!(tree.has_children(1), "emitter has nodes beneath it");
+        assert!(!tree.has_children(2) && !tree.has_children(4));
+    }
+
+    // PEI-617: a field that is also a prefix of another is checked again
+    // with only its ancestors, so that what is beneath it cannot decide it;
+    // every other field's verdict is its node's in the one list.
+    #[test]
+    fn a_field_that_is_also_a_prefix_is_checked_on_its_own() {
+        let root = Namespace::Events.root_guid();
+        let fields = ["emitter.class", "emitter", "n"];
+        let mut lists = Vec::new();
+        let reads = eventd_client::access::field_reads(root, &fields, |tree| {
+            lists.push(tree.to_vec());
+            // The whole tree grants everything but the root; alone,
+            // `emitter` is denied.
+            Ok::<_, ()>(if tree.len() == 2 {
+                vec![true, false]
+            } else {
+                tree.iter().map(|entry| entry.level > 0).collect()
+            })
+        })
+        .unwrap();
+        assert_eq!(lists.len(), 2, "one list for all, and one for emitter");
+        assert_eq!(
+            lists[1]
+                .iter()
+                .map(|entry| (entry.level, entry.guid))
+                .collect::<Vec<_>>(),
+            [(0, root), (1, eventd_core::field_guid("emitter"))]
+        );
+        assert_eq!(reads.fields, [true, false, true]);
+        assert!(!reads.record);
+    }
+
+    // KACS takes at most 1024 nodes in a list and no level limit: a deep
+    // path is as many levels as it has segments.
+    #[test]
+    fn a_path_is_as_deep_as_its_segments_with_no_level_limit() {
+        let path = (0..40)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let tree = eventd_client::access::field_tree(Namespace::Events.root_guid(), &[path]);
+        assert_eq!(tree.entries.len(), 41);
+        for (level, entry) in tree.entries.iter().enumerate() {
+            assert_eq!(usize::from(entry.level), level);
+        }
+        assert_eq!(tree.fields, [40]);
     }
 
     #[test]

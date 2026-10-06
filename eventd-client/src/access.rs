@@ -6,10 +6,13 @@
 //! events here" has to work it out itself, from the same descriptors eventd
 //! checks (eventd TRM §7). This module reads them and checks them the way
 //! eventd does: the caller's own token, eventd's generic mapping, and an
-//! object type list with the data type's root and each field.
+//! object type list with the data type's root, each field, and each prefix
+//! of a field's dotted path between them ([`field_tree`]).
 //!
 //! A record is visible only to a caller granted `EVENTD_READ` on the root;
 //! a field ACE then decides which fields it carries.
+
+use std::collections::HashMap;
 
 use peios::access::AccessCheck;
 use peios::registry::{Key, KeyAccess, OpenFlags, ValueType};
@@ -202,43 +205,203 @@ pub fn access(
     namespace: Namespace,
     fields: &[&str],
 ) -> Result<Access, peios::Error> {
-    let asked: Vec<[u8; 16]> = fields.iter().map(|field| field_guid(field)).collect();
-    let mut guids = asked.clone();
-    guids.extend(
-        field_grants(descriptor)
-            .into_iter()
-            .filter(|guid| !asked.contains(guid)),
-    );
+    let check = |tree: &[peios_sys::kacs_object_type_entry]| {
+        AccessCheck::new(
+            descriptor,
+            AccessMask::from_bits_retain(EVENTD_READ),
+            generic_mapping(),
+        )
+        .check_list(tree)
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| result.status == 0 && result.granted & EVENTD_READ != 0)
+                .collect::<Vec<bool>>()
+        })
+    };
+    let reads = field_reads(namespace.root_guid(), fields, check)?;
+    let granted: Vec<String> = fields
+        .iter()
+        .zip(&reads.fields)
+        .filter(|(_, reads)| **reads)
+        .map(|(field, _)| (*field).to_owned())
+        .collect();
+    let records = reads.record || !granted.is_empty() || {
+        let named = field_grants(descriptor);
+        !named.is_empty()
+            && check(&flat_tree(namespace.root_guid(), &named))?
+                .into_iter()
+                .any(|reads| reads)
+    };
+    Ok(Access {
+        records,
+        fields: granted,
+    })
+}
+
+/// The most nodes KACS accepts in one object type list
+/// (`KACS_ACCESS_CHECK_MAX_OBJECT_TYPE_COUNT`). It refuses a longer list
+/// with `EINVAL`. KACS sets no limit on a list's depth.
+pub const MAX_OBJECT_TYPES: usize = 1024;
+
+/// The object type list for `fields` of a record whose data type's root
+/// GUID is `root` (TRM §7.3), and where each field's node is in it.
+///
+/// A field's dotted name is a path. Every prefix of it that ends before a
+/// `.` is a node, with the prefix's [`field_guid`], one level below the
+/// prefix before it, and the field is the node at the end: `subject` at
+/// level 1, `subject.token` at 2, `subject.token.sid` at 3. Each node is
+/// listed once however many fields share it, and the list is in preorder,
+/// so a node's subtree follows it directly, as KACS requires. A name with
+/// no `.` is at level 1. There is no level limit: the list is as deep as
+/// the deepest name.
+#[must_use]
+pub fn field_tree<S: AsRef<str>>(root: [u8; 16], fields: &[S]) -> FieldTree {
+    /// One node: its path, and its children in the order first named.
+    struct Node<'a> {
+        path: &'a str,
+        children: Vec<usize>,
+    }
+    let mut nodes = vec![Node {
+        path: "",
+        children: Vec::new(),
+    }];
+    let mut found: HashMap<&str, usize> = HashMap::new();
+    let mut ends = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field = field.as_ref();
+        let mut parent = 0;
+        let prefixes = field
+            .match_indices('.')
+            .map(|(index, _)| &field[..index])
+            .chain([field]);
+        for path in prefixes {
+            parent = if let Some(&node) = found.get(path) {
+                node
+            } else {
+                nodes.push(Node {
+                    path,
+                    children: Vec::new(),
+                });
+                let node = nodes.len() - 1;
+                nodes[parent].children.push(node);
+                found.insert(path, node);
+                node
+            };
+        }
+        ends.push(parent);
+    }
+
+    // Preorder: each node, then its children's subtrees in turn.
+    let mut entries = Vec::with_capacity(nodes.len());
+    let mut position = vec![0; nodes.len()];
+    let mut stack = vec![(0_usize, 0_usize)];
+    while let Some((node, depth)) = stack.pop() {
+        position[node] = entries.len();
+        entries.push(peios_sys::kacs_object_type_entry {
+            // A level past u16 needs that many ancestors, which is far
+            // past MAX_OBJECT_TYPES, so such a list is refused whole.
+            level: u16::try_from(depth).unwrap_or(u16::MAX),
+            _reserved: 0,
+            guid: if node == 0 {
+                root
+            } else {
+                field_guid(nodes[node].path)
+            },
+        });
+        for &child in nodes[node].children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    FieldTree {
+        fields: ends.into_iter().map(|node| position[node]).collect(),
+        entries,
+    }
+}
+
+/// An object type list built by [`field_tree`].
+#[derive(Debug, Clone)]
+pub struct FieldTree {
+    /// The nodes, in preorder, the data type's root first.
+    pub entries: Vec<peios_sys::kacs_object_type_entry>,
+    /// For each field asked about, in order, its node's index in `entries`.
+    pub fields: Vec<usize>,
+}
+
+impl FieldTree {
+    /// Whether the node at `index` has nodes beneath it.
+    #[must_use]
+    pub fn has_children(&self, index: usize) -> bool {
+        self.entries
+            .get(index + 1)
+            .is_some_and(|next| next.level > self.entries[index].level)
+    }
+}
+
+/// The root at level 0 and each of `guids` at level 1 beneath it.
+///
+/// This is the list that asks whether a descriptor grants a caller any of
+/// the fields it names (`field_grants`). A GUID does not tell its field's
+/// path, and so not its place in a tree.
+#[must_use]
+pub fn flat_tree(root: [u8; 16], guids: &[[u8; 16]]) -> Vec<peios_sys::kacs_object_type_entry> {
     let mut tree = Vec::with_capacity(guids.len() + 1);
     tree.push(peios_sys::kacs_object_type_entry {
         level: 0,
         _reserved: 0,
-        guid: namespace.root_guid(),
+        guid: root,
     });
-    for guid in guids {
-        tree.push(peios_sys::kacs_object_type_entry {
+    tree.extend(guids.iter().filter(|guid| **guid != root).map(|guid| {
+        peios_sys::kacs_object_type_entry {
             level: 1,
             _reserved: 0,
-            guid,
+            guid: *guid,
+        }
+    }));
+    tree
+}
+
+/// What an access check over [`field_tree`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldReads {
+    /// The verdict on the root: the record as a whole.
+    pub record: bool,
+    /// The verdict on each field asked about, in order.
+    pub fields: Vec<bool>,
+}
+
+/// Whether the record and each of `fields` may be read, by `check`, which
+/// makes the access check over an object type list and answers per node.
+///
+/// A field is read when the first ACE to decide `EVENTD_READ` for it,
+/// in DACL order, allows it, of those that name its GUID, the GUID of any
+/// prefix of its path, the data type's root, or no object type at all.
+/// KACS makes that the verdict on a node that has nothing beneath it: an
+/// object ACE covers its node's subtree, and only decisions that
+/// propagate up from beneath reach a node otherwise. So a field that is
+/// also a prefix of another field asked about, such as a payload value at
+/// `emitter` beside the header's `emitter.class`, is checked again on its
+/// own, with only its ancestors in the list: as a parent, a grant on all
+/// of its children, or a deny on one, would decide it too.
+pub fn field_reads<S: AsRef<str>, E>(
+    root: [u8; 16],
+    fields: &[S],
+    mut check: impl FnMut(&[peios_sys::kacs_object_type_entry]) -> Result<Vec<bool>, E>,
+) -> Result<FieldReads, E> {
+    let tree = field_tree(root, fields);
+    let results = check(&tree.entries)?;
+    let mut reads = Vec::with_capacity(fields.len());
+    for (field, &node) in fields.iter().zip(&tree.fields) {
+        reads.push(if tree.has_children(node) {
+            let own = field_tree(root, &[field.as_ref()]);
+            check(&own.entries)?[own.fields[0]]
+        } else {
+            results[node]
         });
     }
-    let results = AccessCheck::new(
-        descriptor,
-        AccessMask::from_bits_retain(EVENTD_READ),
-        generic_mapping(),
-    )
-    .check_list(&tree)?;
-    let reads = |result: &peios_sys::kacs_node_result| {
-        result.status == 0 && result.granted & EVENTD_READ != 0
-    };
-    Ok(Access {
-        records: results.iter().any(reads),
-        fields: fields
-            .iter()
-            .zip(&results[1..])
-            .filter(|(_, result)| reads(result))
-            .map(|(field, _)| (*field).to_owned())
-            .collect(),
+    Ok(FieldReads {
+        record: results[0],
+        fields: reads,
     })
 }
 
