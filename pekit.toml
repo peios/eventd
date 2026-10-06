@@ -14,9 +14,9 @@ export CARGO_HOME=/tmp/cargo-eventd-vendor
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 mkdir -p "$CARGO_HOME" "$PEKIT_OUT"
 
-# The lock must retain the libpeios-0.5-compatible peios-rs commit the
-# workspace pins: the one libgxwi uses, so eventd-client can share it.
-PEIOS_RS_REV=02c87cb643c30eef6b74cd1d9d8b0ae067bed69a
+# The lock must retain the peios-rs commit the workspace pins (it binds
+# libpeios 0.5.8): the one libgxwi uses, so eventd-client can share it.
+PEIOS_RS_REV=f8c84930f2b71763bcf0550df0b1420a0f63b21e
 grep -F "peios-rs.git?rev=$PEIOS_RS_REV#$PEIOS_RS_REV" Cargo.lock >/dev/null
 cargo vendor --locked "$PEKIT_OUT/vendor" > "$PEKIT_OUT/cargo-config.toml"
 test -s "$PEKIT_OUT/cargo-config.toml"
@@ -220,7 +220,7 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.python.python3"       = "*"
 "org.llvm.clang-devel"     = ">= 22"
 "org.pkgconf.pkgconf"      = "*"
-"dev.peios.libpeios-devel" = ">= 0.5.0"
+"dev.peios.libpeios-devel" = ">= 0.5.8"
 "dev.peios.packaging-tools" = "*"
 
 [test]
@@ -327,7 +327,7 @@ done
 "org.python.python3"       = "*"
 "org.llvm.clang-devel"     = ">= 22"
 "org.pkgconf.pkgconf"      = "*"
-"dev.peios.libpeios-devel" = ">= 0.5.0"
+"dev.peios.libpeios-devel" = ">= 0.5.8"
 
 [clean]
 command = "cargo clean"
