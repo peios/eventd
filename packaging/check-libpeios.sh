@@ -4,8 +4,8 @@
 
 set -eu
 
-pkg-config --atleast-version=0.5.0 peios || {
-  echo "eventd: dev.peios.libpeios-devel >= 0.5.0 (ABI 0) is required" >&2
+pkg-config --atleast-version=0.5.8 peios || {
+  echo "eventd: dev.peios.libpeios-devel >= 0.5.8 (ABI 0) is required" >&2
   exit 1
 }
 readelf -dW "$(pkg-config --variable=libdir peios)/libpeios.so" |

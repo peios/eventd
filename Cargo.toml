@@ -17,8 +17,8 @@ libc = "0.2.175"
 # predates the libpeios 0.5 ABI. This is the one libgxwi uses: a program that
 # links eventd-client and libgxwi can hold only one peios-sys, which links
 # libpeios.
-peios = { git = "https://github.com/peios/peios-rs.git", rev = "02c87cb643c30eef6b74cd1d9d8b0ae067bed69a", package = "peios" }
-peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "02c87cb643c30eef6b74cd1d9d8b0ae067bed69a", package = "peios-sys" }
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "f8c84930f2b71763bcf0550df0b1420a0f63b21e", package = "peios" }
+peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "f8c84930f2b71763bcf0550df0b1420a0f63b21e", package = "peios-sys" }
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]
