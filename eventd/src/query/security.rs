@@ -7,8 +7,8 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use peios::registry::{CreateFlags, Key, KeyAccess, NotifyFilter, OpenFlags, ValueType};
-use peios::security::SecurityDescriptor;
+use peios::registry::{CreateFlags, Key, KeyAccess, NotifyFilter, OpenFlags, SecInfo, ValueType};
+use peios::security::{AceFlags, Control, SdView, SecurityDescriptor};
 use peios::token::Token;
 
 // What eventd and its clients must agree on comes from the client crate,
@@ -26,52 +26,87 @@ const EVENTD_GENERIC_MAPPING: peios_sys::kacs_generic_mapping = peios_sys::kacs_
     execute: GENERIC_EXECUTE,
     all: GENERIC_ALL,
 };
-const DEFAULT_DESCRIPTORS: [(&str, &str, &str, Option<&str>); 5] = [
-    (
-        "Events",
-        "*",
-        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)",
-        None,
-    ),
-    (
-        "Logs",
-        "*",
-        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
-        None,
-    ),
-    (
-        "Metrics",
-        "*",
-        "O:SYG:SYD:P(A;;0x00000009;;;SY)(A;;0x00000009;;;BA)(A;;0x00000001;;;AU)",
-        Some("O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)"),
-    ),
+/// One default descriptor: the namespace key (empty for the security root
+/// itself), the pattern key under it, the descriptor, and every descriptor
+/// an earlier eventd shipped there as its default. A stored value equal to
+/// one of those was never chosen by an administrator, so it is replaced.
+struct DefaultDescriptor {
+    namespace: &'static str,
+    name: &'static str,
+    sddl: &'static str,
+    former: &'static [&'static str],
+}
+
+// Each default carries a SACL that audits every failed attempt, by anyone,
+// at any eventd right (PEI-1279): a denied read, publish or `INDEX` becomes
+// a `kacs.audit.access.checked` record naming the pattern (TRM §7.4).
+const DEFAULT_DESCRIPTORS: [DefaultDescriptor; 5] = [
+    DefaultDescriptor {
+        namespace: "Events",
+        name: "*",
+        sddl: "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)S:(AU;FA;0x0000000d;;;WD)",
+        former: &["O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)"],
+    },
+    DefaultDescriptor {
+        namespace: "Logs",
+        name: "*",
+        sddl: "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)\
+               S:(AU;FA;0x0000000d;;;WD)",
+        former: &["O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)"],
+    },
+    DefaultDescriptor {
+        namespace: "Metrics",
+        name: "*",
+        sddl: "O:SYG:SYD:P(A;;0x00000009;;;SY)(A;;0x00000009;;;BA)(A;;0x00000001;;;AU)\
+               S:(AU;FA;0x0000000d;;;WD)",
+        former: &[
+            "O:SYG:SYD:P(A;;0x00000009;;;SY)(A;;0x00000009;;;BA)(A;;0x00000001;;;AU)",
+            "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
+        ],
+    },
     // eventd writes its own health straight into its store (TRM §5.7), so
     // nobody, not even an administrator, may publish under its prefix.
-    (
-        "Metrics",
-        "eventd",
-        "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)",
-        None,
-    ),
-    (
-        "",
-        "Admin",
-        "O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)",
-        None,
-    ),
+    DefaultDescriptor {
+        namespace: "Metrics",
+        name: "eventd",
+        sddl: "O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)\
+               S:(AU;FA;0x0000000d;;;WD)",
+        former: &["O:SYG:SYD:P(A;;0x00000001;;;SY)(A;;0x00000001;;;BA)(A;;0x00000001;;;AU)"],
+    },
+    DefaultDescriptor {
+        namespace: "",
+        name: "Admin",
+        sddl: "O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)S:(AU;FA;0x0000000d;;;WD)",
+        former: &["O:SYG:SYD:P(A;;0x00000004;;;SY)(A;;0x00000004;;;BA)"],
+    },
 ];
+
+/// Who may change the descriptors under [`SECURITY_ROOT`]. A descriptor is
+/// one registry value, so whoever may write it may also drop its SACL,
+/// without `SeSecurityPrivilege` (PEI-1279). Only SYSTEM and Administrators,
+/// who hold that privilege anyway, may write; Authenticated Users read, as
+/// eventd and its clients must. Protected, so a broader grant on
+/// `Machine\System\eventd` does not reach the audit policy.
+const SECURITY_ROOT_DACL: &str = "D:P(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)(A;OICI;KR;;;AU)";
 
 pub fn provision_defaults() -> Result<(), SecurityError> {
     let (security, _) = Key::create(
         None,
         SECURITY_ROOT,
-        KeyAccess::CREATE_SUB_KEY,
+        KeyAccess::CREATE_SUB_KEY | KeyAccess::READ_CONTROL | KeyAccess::WRITE_DAC,
         CreateFlags::default(),
         None,
         None,
     )
     .map_err(SecurityError::Peios)?;
-    for (namespace, name, sddl, legacy_sddl) in DEFAULT_DESCRIPTORS {
+    restrict_security_root(&security)?;
+    for DefaultDescriptor {
+        namespace,
+        name,
+        sddl,
+        former,
+    } in DEFAULT_DESCRIPTORS
+    {
         let namespace_key = if namespace.is_empty() {
             None
         } else {
@@ -98,11 +133,11 @@ pub fn provision_defaults() -> Result<(), SecurityError> {
         .map_err(SecurityError::Peios)?;
         match key.query_value(b"", None) {
             Ok(value)
-                if legacy_sddl.is_some_and(|legacy| {
-                    value.ty == ValueType::BINARY
-                        && peios::security::sddl::parse(legacy)
+                if value.ty == ValueType::BINARY
+                    && former.iter().any(|former| {
+                        peios::security::sddl::parse(former)
                             .is_ok_and(|descriptor| descriptor.as_bytes() == value.data)
-                }) =>
+                    }) =>
             {
                 let descriptor =
                     peios::security::sddl::parse(sddl).map_err(SecurityError::Peios)?;
@@ -122,6 +157,32 @@ pub fn provision_defaults() -> Result<(), SecurityError> {
         }
     }
     Ok(())
+}
+
+/// Give the security root [`SECURITY_ROOT_DACL`] while its DACL is still
+/// wholly inherited. A protected DACL, or one with an ACE of its own, is a
+/// choice somebody made, and is left as it is.
+fn restrict_security_root(security: &Key) -> Result<(), SecurityError> {
+    let current = security
+        .get_security(SecInfo::DACL)
+        .map_err(SecurityError::Peios)?;
+    let view = current.view().map_err(SecurityError::Peios)?;
+    if !dacl_is_wholly_inherited(&view) {
+        return Ok(());
+    }
+    let restricted =
+        peios::security::sddl::parse(SECURITY_ROOT_DACL).map_err(SecurityError::Peios)?;
+    security
+        .set_security(SecInfo::DACL, &restricted, None)
+        .map_err(SecurityError::Peios)
+}
+
+fn dacl_is_wholly_inherited(view: &SdView<'_>) -> bool {
+    !view.control().contains(Control::DACL_PROTECTED)
+        && view.dacl().is_some_and(|dacl| {
+            dacl.iter()
+                .all(|ace| ace.flags().contains(AceFlags::INHERITED))
+        })
 }
 
 pub struct Authorizer {
@@ -1119,8 +1180,11 @@ mod tests {
 
     #[test]
     fn default_descriptors_are_valid_and_cache_generation_advances() {
-        for (_, _, sddl, _) in DEFAULT_DESCRIPTORS {
-            peios::security::sddl::parse(sddl).unwrap();
+        for default in DEFAULT_DESCRIPTORS {
+            peios::security::sddl::parse(default.sddl).unwrap();
+            for former in default.former {
+                peios::security::sddl::parse(former).unwrap();
+            }
         }
         let cache = DescriptorCache::new();
         assert_eq!(cache.generation(), 0);
@@ -1134,6 +1198,60 @@ mod tests {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .healthy
+        );
+    }
+
+    // PEI-1279 item 5: every default audits failure, by anyone, at every
+    // eventd right, and nothing else; and no default is its own former, so
+    // a deployed former default is always upgraded to it.
+    #[test]
+    fn every_default_descriptor_audits_every_failed_access_by_everyone() {
+        use peios::security::{AceType, WellKnown};
+
+        let everyone = peios::security::Sid::well_known(WellKnown::Everyone);
+        for default in DEFAULT_DESCRIPTORS {
+            let descriptor = peios::security::sddl::parse(default.sddl).unwrap();
+            let view = descriptor.view().unwrap();
+            let sacl = view.sacl().expect("a SACL");
+            let aces: Vec<_> = sacl.iter().collect();
+            assert_eq!(aces.len(), 1, "{}", default.sddl);
+            assert_eq!(aces[0].ace_type(), AceType::SystemAudit);
+            assert_eq!(aces[0].flags(), AceFlags::FAILED_ACCESS);
+            assert_eq!(
+                aces[0].mask(),
+                EVENTD_READ | EVENTD_ADMINISTER | EVENTD_PUBLISH
+            );
+            assert_eq!(aces[0].sid(), Some(everyone.as_ref()));
+            for former in default.former {
+                assert_ne!(
+                    peios::security::sddl::parse(former).unwrap().as_bytes(),
+                    descriptor.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_wholly_inherited_dacl_is_replaced_on_the_security_root() {
+        let wholly_inherited = |sddl: &str| {
+            let descriptor = peios::security::sddl::parse(sddl).unwrap();
+            dacl_is_wholly_inherited(&descriptor.view().unwrap())
+        };
+        assert!(wholly_inherited(
+            "O:SYG:SYD:(A;OICIID;KA;;;SY)(A;OICIID;KA;;;BA)(A;OICIID;KR;;;AU)"
+        ));
+        assert!(!wholly_inherited(
+            "O:SYG:SYD:(A;OICIID;KA;;;SY)(A;OICI;KA;;;S-1-5-21-1-2-3-1000)"
+        ));
+        assert!(!wholly_inherited("O:SYG:SYD:P(A;OICIID;KA;;;SY)"));
+        assert!(!wholly_inherited(SECURITY_ROOT_DACL));
+        let restricted = peios::security::sddl::parse(SECURITY_ROOT_DACL).unwrap();
+        assert!(
+            restricted
+                .view()
+                .unwrap()
+                .control()
+                .contains(Control::DACL_PROTECTED)
         );
     }
 

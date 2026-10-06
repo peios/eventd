@@ -460,5 +460,13 @@ canonical: Machine\System\eventd\Security
 Query access policy. `Events`, `Logs` and `Metrics` contain descriptor values
 under identifier patterns; the most specific dot-prefix match wins and `*` is
 the fallback. `Admin` governs the EVENTD_ADMINISTER right used by `INDEX`.
-eventd provisions defaults only when the corresponding entries do not exist.
-Descriptor changes apply to the next query.
+eventd provisions defaults only when the corresponding entries do not exist,
+or still hold a default an earlier eventd shipped. Each default carries a
+SACL auditing every failed access by Everyone. Descriptor changes apply to
+the next query.
+
+A descriptor is one value, so whoever may write it may also remove its SACL,
+without SeSecurityPrivilege. eventd therefore gives this key a protected
+DACL (SYSTEM and Administrators full control, Authenticated Users read)
+while its DACL is still wholly inherited; grant write here only to those
+trusted to change audit policy.

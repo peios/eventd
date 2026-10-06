@@ -32,7 +32,6 @@ impl<'a> Reconciler<'a> {
         &mut self,
         sequence: u64,
         timestamp: u64,
-        observed_at: u64,
     ) -> Result<Observation, ReconcileError> {
         if sequence == 0 {
             return Err(ReconcileError::ZeroSequence);
@@ -51,7 +50,7 @@ impl<'a> Reconciler<'a> {
             });
         }
 
-        let gaps = self.uncovered_gaps(sequence, timestamp, observed_at);
+        let gaps = self.uncovered_gaps(sequence, timestamp);
         let store_event = !self.coverage.contains(&self.boot_id, self.cpu_id, sequence);
         self.next_sequence = sequence
             .checked_add(1)
@@ -60,7 +59,7 @@ impl<'a> Reconciler<'a> {
         Ok(Observation { store_event, gaps })
     }
 
-    fn uncovered_gaps(&self, sequence: u64, revealing: u64, observed_at: u64) -> Vec<Gap> {
+    fn uncovered_gaps(&self, sequence: u64, revealing: u64) -> Vec<Gap> {
         if sequence <= self.next_sequence {
             return Vec::new();
         }
@@ -76,13 +75,7 @@ impl<'a> Reconciler<'a> {
                 break;
             }
             if first < receipt.first {
-                gaps.push(make_gap(
-                    first,
-                    receipt.first - 1,
-                    preceding,
-                    revealing,
-                    observed_at,
-                ));
+                gaps.push(make_gap(first, receipt.first - 1, preceding, revealing));
             }
             first = first.max(receipt.last.saturating_add(1));
             // A receipt proves accounting but does not tell us the preceding
@@ -93,7 +86,7 @@ impl<'a> Reconciler<'a> {
             }
         }
         if first <= last {
-            gaps.push(make_gap(first, last, preceding, revealing, observed_at));
+            gaps.push(make_gap(first, last, preceding, revealing));
         }
         gaps
     }
@@ -104,10 +97,8 @@ const fn make_gap(
     last_sequence: u64,
     preceding_timestamp: Option<u64>,
     revealing_timestamp: u64,
-    timestamp: u64,
 ) -> Gap {
     Gap {
-        timestamp,
         first_sequence,
         last_sequence,
         preceding_timestamp,
@@ -171,17 +162,14 @@ mod tests {
             (boot, 2, Interval::new(6, 7).unwrap()),
         ]);
         let mut reconciler = Reconciler::new(&coverage, boot, 2);
-        let first = reconciler.observe(3, 30, 31).unwrap();
+        let first = reconciler.observe(3, 30).unwrap();
         assert!(!first.store_event);
         assert!(first.gaps.is_empty());
-        let survivor = reconciler.observe(9, 90, 91).unwrap();
+        let survivor = reconciler.observe(9, 90).unwrap();
         assert!(survivor.store_event);
         assert_eq!(
             survivor.gaps,
-            [
-                make_gap(4, 5, Some(30), 90, 91),
-                make_gap(8, 8, None, 90, 91),
-            ]
+            [make_gap(4, 5, Some(30), 90), make_gap(8, 8, None, 90),]
         );
     }
 
@@ -189,10 +177,10 @@ mod tests {
     fn live_jump_becomes_one_gap() {
         let coverage = Coverage::default();
         let mut reconciler = Reconciler::new(&coverage, [1; 16], 0);
-        assert!(reconciler.observe(1, 10, 11).unwrap().gaps.is_empty());
+        assert!(reconciler.observe(1, 10).unwrap().gaps.is_empty());
         assert_eq!(
-            reconciler.observe(4, 40, 41).unwrap().gaps,
-            [make_gap(2, 3, Some(10), 40, 41)]
+            reconciler.observe(4, 40).unwrap().gaps,
+            [make_gap(2, 3, Some(10), 40)]
         );
     }
 
@@ -201,21 +189,21 @@ mod tests {
         let boot = [1; 16];
         let coverage = Coverage::from_receipts([(boot, 0, Interval::new(2, 2).unwrap())]);
         let mut reconciler = Reconciler::new(&coverage, boot, 0);
-        assert!(reconciler.observe(5, 50, 51).unwrap().store_event);
+        assert!(reconciler.observe(5, 50).unwrap().store_event);
         // A receipted duplicate met while scanning is skipped, not fatal.
-        let duplicate = reconciler.observe(2, 20, 52).unwrap();
+        let duplicate = reconciler.observe(2, 20).unwrap();
         assert!(!duplicate.store_event);
         assert!(duplicate.gaps.is_empty());
         // An unreceipted one below the next expected sequence is fatal.
         assert_eq!(
-            reconciler.observe(4, 40, 53),
+            reconciler.observe(4, 40),
             Err(ReconcileError::Regression {
                 expected_at_least: 6,
                 observed: 4,
             })
         );
         assert_eq!(
-            reconciler.observe(5, 50, 54),
+            reconciler.observe(5, 50),
             Err(ReconcileError::Regression {
                 expected_at_least: 6,
                 observed: 5,

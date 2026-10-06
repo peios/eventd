@@ -23,6 +23,9 @@ license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-
 ":usr/share/regim/eventd-config.reg" = "usr/share/regim/eventd-config.reg"
 ":usr/share/regim/eventd-service.reg" = "usr/share/regim/eventd-service.reg"
 ":usr/share/regman/eventd.regman"    = "usr/share/regman/eventd.regman"
+# evman documentation for the five records eventd writes about itself and the
+# fields only eventd defines (PGSS §6.10).
+"@source:eventd.evman"               = "usr/share/evman/eventd.evman"
 ":var/state/eventd/events"           = "var/state/eventd/events"
 ":var/state/eventd/logs"             = "var/state/eventd/logs"
 ":var/state/eventd/metrics"          = "var/state/eventd/metrics"

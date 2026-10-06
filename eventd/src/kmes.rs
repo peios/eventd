@@ -4,7 +4,6 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
     BoundedQueue, Coverage, RealEvent, ReconcileError, Reconciler, ReserveError, StripeRouter,
@@ -125,15 +124,14 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
                     stamped: event.cpu_id,
                 });
             }
-            let observed_at = realtime_nanoseconds()?;
             let mut candidate = reconciler.clone();
             let observation = candidate
-                .observe(event.sequence, event.timestamp, observed_at)
+                .observe(event.sequence, event.timestamp)
                 .map_err(KmesError::Sequence)?;
-            // An event typed in eventd's own namespace would be
-            // indistinguishable from a record eventd writes, so it is not
-            // stored. It is still handed to the writer, so its sequence is
-            // receipted and no restart reports it lost.
+            // An event claiming one of the five types eventd writes itself
+            // would be indistinguishable from eventd's own record, so it is
+            // not stored. It is still handed to the writer, so its sequence
+            // is receipted and no restart reports it lost.
             let reserved = crate::synthetic::is_reserved(event.event_type);
             if reserved && observation.store_event {
                 crate::diagnostics::reserved_event_type();
@@ -309,13 +307,6 @@ fn advance(position: u64, event_size: usize) -> Result<u64, KmesError> {
         .ok_or(KmesError::PositionOverflow)
 }
 
-fn realtime_nanoseconds() -> Result<u64, KmesError> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| KmesError::Clock)?;
-    u64::try_from(elapsed.as_nanos()).map_err(|_| KmesError::Clock)
-}
-
 #[derive(Debug)]
 pub enum KmesError {
     Peios(peios::Error),
@@ -326,7 +317,6 @@ pub enum KmesError {
     CpuMismatch { attached: u16, stamped: u16 },
     NoBuffers,
     PositionOverflow,
-    Clock,
     WriterStopped,
     Writer(String),
 }
@@ -349,9 +339,6 @@ impl fmt::Display for KmesError {
             ),
             Self::NoBuffers => formatter.write_str("KMES exposed no attachable CPU buffers"),
             Self::PositionOverflow => formatter.write_str("KMES read position overflowed"),
-            Self::Clock => {
-                formatter.write_str("system realtime clock is outside the u64 nanosecond range")
-            }
             Self::WriterStopped => formatter.write_str("event writer stopped during recovery"),
             Self::Writer(error) => {
                 write!(formatter, "event writer failed during recovery: {error}")
@@ -371,7 +358,6 @@ impl std::error::Error for KmesError {
             | Self::CpuMismatch { .. }
             | Self::NoBuffers
             | Self::PositionOverflow
-            | Self::Clock
             | Self::WriterStopped
             | Self::Writer(_) => None,
         }

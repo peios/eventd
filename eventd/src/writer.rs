@@ -355,7 +355,6 @@ fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
             pending.push((
                 item.event.cpu_id,
                 Gap {
-                    timestamp: item.event.timestamp,
                     first_sequence: item.event.sequence,
                     last_sequence: item.event.sequence,
                     preceding_timestamp: None,
@@ -374,7 +373,6 @@ fn record_lost(batch: &[IngestItem], pending: &mut Vec<(u16, Gap)>) {
         {
             let previous = &mut pending[output - 1].1;
             previous.last_sequence = previous.last_sequence.max(gap.last_sequence);
-            previous.timestamp = previous.timestamp.max(gap.timestamp);
             previous.revealing_timestamp =
                 previous.revealing_timestamp.max(gap.revealing_timestamp);
         } else {
@@ -964,7 +962,7 @@ mod tests {
     fn full_shard(path: &std::path::Path) -> Shard {
         let mut shard = Shard::open(path, 1_000).unwrap();
         shard.cap_pages_for_test().unwrap();
-        let filler = crate::synthetic::shutdown([1; 16], &[(0, 1)], 1);
+        let filler = crate::synthetic::shutdown([1; 16], Some(&[(0, 1)]), 1);
         for _ in 0..100_000 {
             match shard.commit_synthetic(&filler) {
                 Ok(()) => {}
@@ -990,7 +988,7 @@ mod tests {
         let (after, after_result) = sync_channel(1);
         publish(
             &queue,
-            WriterMessage::Synthetic(crate::synthetic::shutdown([1; 16], &[], 2), sent),
+            WriterMessage::Synthetic(crate::synthetic::shutdown([1; 16], Some(&[]), 2), sent),
         );
         publish(&queue, WriterMessage::Barrier(after));
 
@@ -1032,10 +1030,14 @@ mod tests {
         let harnesses = [Harness::new(), Harness::new()];
         let change = crate::config::AppliedChange {
             key: "LogRetentionDays",
-            old_value_type: "REG_DWORD",
-            old_value: Some("14".into()),
-            new_value_type: "REG_DWORD",
-            new_value: Some("9".into()),
+            previous: Some(crate::config::AppliedValue {
+                registry_type: peios::registry::ValueType::DWORD,
+                value: 14,
+            }),
+            current: Some(crate::config::AppliedValue {
+                registry_type: peios::registry::ValueType::DWORD,
+                value: 9,
+            }),
         };
         let event = crate::synthetic::config_change([1; 16], &change, 5);
 
@@ -1065,7 +1067,7 @@ mod tests {
             rusqlite::Connection::open(path)
                 .unwrap()
                 .query_row(
-                    "SELECT count(*) FROM events WHERE event_type = 'synthetic.config_change'",
+                    "SELECT count(*) FROM events WHERE event_type = 'eventd.config.changed'",
                     [],
                     |row| row.get(0),
                 )
@@ -1161,7 +1163,6 @@ mod tests {
         let mut pending = vec![(
             2,
             Gap {
-                timestamp: 1,
                 first_sequence: 7,
                 last_sequence: 7,
                 preceding_timestamp: None,
@@ -1180,7 +1181,6 @@ mod tests {
     fn lost_batches_become_merged_per_cpu_gap_ranges() {
         let item = IngestItem {
             gaps: vec![Gap {
-                timestamp: 20,
                 first_sequence: 2,
                 last_sequence: 3,
                 preceding_timestamp: Some(10),
@@ -1203,7 +1203,6 @@ mod tests {
         let mut pending = vec![(
             7,
             Gap {
-                timestamp: 10,
                 first_sequence: 1,
                 last_sequence: 1,
                 preceding_timestamp: None,

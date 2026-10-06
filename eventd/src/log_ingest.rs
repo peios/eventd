@@ -275,7 +275,7 @@ fn recover_corruption(
     Ok(())
 }
 
-/// Report a storage error as the daemon-wide `synthetic.storage_error`:
+/// Report a quarantine as the daemon-wide `eventd.store.quarantined`:
 /// shard 0, else the lowest-numbered shard that takes it (TRM §2.6),
 /// committed off this thread.
 fn emit_storage_error(
@@ -783,7 +783,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(5))
                     .expect("the record reached shard 1")
                     .as_ref(),
-                "synthetic.storage_error"
+                "eventd.store.quarantined"
             );
         });
     }
