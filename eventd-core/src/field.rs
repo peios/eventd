@@ -30,6 +30,58 @@ pub fn payload_index_name(field: &str) -> Option<String> {
     Some(name)
 }
 
+/// The event header's queryable fields, each path with the events-table
+/// column that holds it (PSPU §3.22, PGSS §6.4). `event.boot.guid` is not
+/// in the record: it is the boot eventd read the record in.
+pub const HEADER_FIELDS: [(&str, &str); 9] = [
+    ("event.time", "timestamp"),
+    ("event.sequence", "sequence"),
+    ("event.cpu", "cpu_id"),
+    ("event.type", "event_type"),
+    ("event.boot.guid", "boot_id"),
+    ("emitter.class", "origin_class"),
+    ("emitter.token.guid", "effective_token_guid"),
+    ("emitter.true-token.guid", "true_token_guid"),
+    ("emitter.process.guid", "process_guid"),
+];
+
+/// The events-table column holding header field `field`, if it is one.
+#[must_use]
+pub fn header_column(field: &str) -> Option<&'static str> {
+    HEADER_FIELDS
+        .iter()
+        .find(|(path, _)| *path == field)
+        .map(|(_, column)| *column)
+}
+
+/// The header field a column held before the header was named by path.
+///
+/// Adaptive-index state written by an earlier eventd names header fields
+/// by their columns, and a payload key spelled like a column was then
+/// reserved, so such a name in that state can only mean the header field.
+#[must_use]
+pub fn legacy_header_path(column: &str) -> Option<&'static str> {
+    HEADER_FIELDS
+        .iter()
+        .find(|(_, legacy)| *legacy == column)
+        .map(|(path, _)| *path)
+}
+
+/// Whether `field` is a header path or lies beneath one.
+///
+/// The header wins over the payload at these paths (PSPU §3.22): a payload
+/// value there, or a map's whole subtree, is not a query-language field. A
+/// payload field beside a header path, such as `emitter.process.pid`, is
+/// not reserved.
+#[must_use]
+pub fn under_header_path(field: &str) -> bool {
+    HEADER_FIELDS.iter().any(|(path, _)| {
+        field
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
 /// Whether a name can be produced by event payload flattening.
 #[must_use]
 pub fn valid_field_path(field: &str) -> bool {
@@ -173,6 +225,38 @@ mod tests {
         );
         assert!(!valid_field_path("source..name"));
         assert!(!valid_field_path("source.1name"));
+        assert!(valid_field_path("emitter.true-token.guid"));
+        assert!(valid_field_path("object.event-namespace.pattern"));
+    }
+
+    // PSPU §3.22: only the header paths themselves, and what lies beneath
+    // them, are reserved.
+    #[test]
+    fn header_paths_reserve_themselves_and_their_subtrees_only() {
+        for (path, _) in HEADER_FIELDS {
+            assert!(under_header_path(path), "{path}");
+            assert!(under_header_path(&format!("{path}.x")), "{path}.x");
+        }
+        for beside in [
+            "emitter.process.pid",
+            "emitter.process",
+            "emitter",
+            "event",
+            "event.boot",
+            "event.typed",
+            "emitter.process.guidance",
+            "timestamp",
+            "event_type",
+        ] {
+            assert!(!under_header_path(beside), "{beside}");
+        }
+        assert_eq!(header_column("event.type"), Some("event_type"));
+        assert_eq!(header_column("event_type"), None);
+        assert_eq!(
+            legacy_header_path("process_guid"),
+            Some("emitter.process.guid")
+        );
+        assert_eq!(legacy_header_path("event.type"), None);
     }
 
     #[test]

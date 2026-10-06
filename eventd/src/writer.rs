@@ -1106,7 +1106,7 @@ mod tests {
         publish(
             &queue,
             WriterMessage::IndexPolicy(Arc::from([DesiredIndex {
-                field_path: "process_guid".into(),
+                field_path: "emitter.process.guid".into(),
                 priority: 0,
                 is_expression: false,
             }])),

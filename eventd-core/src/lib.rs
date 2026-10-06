@@ -17,7 +17,10 @@ pub mod shard;
 mod writer_lock;
 
 pub use boot_id::{BootId, BootIdError};
-pub use field::{field_guid, payload_index_name, valid_field_path};
+pub use field::{
+    HEADER_FIELDS, field_guid, header_column, legacy_header_path, payload_index_name,
+    under_header_path, valid_field_path,
+};
 pub use log_store::{LogRecord, LogStore, LogStoreError};
 pub use meta_store::{DesiredIndex, IndexCounter, MetaStore, MetaStoreError};
 pub use metric_store::{

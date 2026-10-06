@@ -335,7 +335,11 @@ fn execute_at(
         *left -= 1;
         Ok(if *left == 0 { Flow::Enough } else { Flow::More })
     };
-    let (scan_since, scan_until) = narrow_by_timestamp(&query.predicates, since, until);
+    let time_field = match query.source {
+        Source::Events { .. } => "event.time",
+        Source::Logs { .. } | Source::Metric { .. } => "timestamp",
+    };
+    let (scan_since, scan_until) = narrow_by_timestamp(&query.predicates, time_field, since, until);
     match &query.source {
         Source::Events { .. } => scan_events(
             &stores.event_paths,
@@ -559,11 +563,17 @@ fn record_size(record: &Record) -> usize {
 }
 
 /// The time range the stores are read over, narrowed by every top-level
-/// comparison of `timestamp` with an integer. The predicate is still
-/// evaluated against each row, so this narrows and never decides (TRM
-/// §6.3); what it buys is that a page of older records, `WHERE timestamp
-/// <= T`, starts reading at T instead of at the newest record.
-fn narrow_by_timestamp(predicates: &[Expr], mut since: i64, mut until: i64) -> (i64, i64) {
+/// comparison of the record's time, `time_field`, with an integer. The
+/// predicate is still evaluated against each row, so this narrows and
+/// never decides (TRM §6.3); what it buys is that a page of older records,
+/// `WHERE event.time <= T`, starts reading at T instead of at the newest
+/// record.
+fn narrow_by_timestamp(
+    predicates: &[Expr],
+    time_field: &str,
+    mut since: i64,
+    mut until: i64,
+) -> (i64, i64) {
     for predicate in predicates {
         let Expr::Compare {
             field,
@@ -573,7 +583,7 @@ fn narrow_by_timestamp(predicates: &[Expr], mut since: i64, mut until: i64) -> (
         else {
             continue;
         };
-        if field != "timestamp" {
+        if field != time_field {
             continue;
         }
         let bound = match value {
@@ -949,7 +959,7 @@ fn cross_event_timestamps(
     authorizer: &Authorizer,
     deadline: Option<Instant>,
 ) -> Result<Vec<i64>, QueryError> {
-    let fields = vec!["timestamp".to_owned()];
+    let fields = vec!["event.time".to_owned()];
     let identifiers = discover_event_identifiers(paths, Some(pattern), deadline)?;
     let mut authorization = AuthorizationCache::new(authorizer);
     let allowed = authorize_identifiers(
@@ -1225,7 +1235,8 @@ struct Row {
     record: Record,
     identifier: String,
     /// The record's timestamp, which orders and windows it whether or not
-    /// the caller may read its `timestamp` field: an internal key with no
+    /// the caller may read its time field (`event.time`, or a log's or
+    /// sample's `timestamp`): an internal key with no
     /// access-control identity, like `tie` (TRM §6.2).
     at: i64,
     tie: Tie,
@@ -1400,18 +1411,24 @@ fn next_event(
         let process: Option<Vec<u8>> = row.get(9)?;
         let payload: Option<Vec<u8>> = row.get(10)?;
         let mut record = Record::new();
-        record.insert("timestamp".into(), Value::Signed(timestamp));
-        record.insert("cpu_id".into(), option_unsigned(cpu_id));
-        record.insert("sequence".into(), option_unsigned(sequence));
-        record.insert("origin_class".into(), option_unsigned(origin_class));
-        record.insert("event_type".into(), Value::String(identifier.clone()));
+        record.insert("event.time".into(), Value::Signed(timestamp));
+        record.insert("event.cpu".into(), option_unsigned(cpu_id));
+        record.insert("event.sequence".into(), option_unsigned(sequence));
+        record.insert("emitter.class".into(), option_unsigned(origin_class));
+        record.insert("event.type".into(), Value::String(identifier.clone()));
         record.insert(
-            "effective_token_guid".into(),
+            "emitter.token.guid".into(),
             option_guid(effective.as_deref()),
         );
-        record.insert("true_token_guid".into(), option_guid(true_token.as_deref()));
-        record.insert("process_guid".into(), option_guid(process.as_deref()));
-        record.insert("boot_id".into(), option_guid(Some(&boot)));
+        record.insert(
+            "emitter.true-token.guid".into(),
+            option_guid(true_token.as_deref()),
+        );
+        record.insert(
+            "emitter.process.guid".into(),
+            option_guid(process.as_deref()),
+        );
+        record.insert("event.boot.guid".into(), option_guid(Some(&boot)));
         if let Some(payload) = payload {
             flatten_event_payload(&payload, &mut record);
         }
@@ -1440,7 +1457,7 @@ fn sql_header_constraint(expression: &Expr) -> Option<SqlConstraint> {
     else {
         return None;
     };
-    if field == "event_type" && *operator == Operator::Equal {
+    if field == "event.type" && *operator == Operator::Equal {
         let Literal::String(value) = value else {
             return None;
         };
@@ -1449,7 +1466,7 @@ fn sql_header_constraint(expression: &Expr) -> Option<SqlConstraint> {
             value: Some(rusqlite::types::Value::Text(value.clone())),
         });
     }
-    if !matches!(field.as_str(), "cpu_id" | "origin_class") {
+    if !matches!(field.as_str(), "event.cpu" | "emitter.class") {
         return None;
     }
     let value = match literal_value(field, value) {
@@ -1458,18 +1475,18 @@ fn sql_header_constraint(expression: &Expr) -> Option<SqlConstraint> {
         _ => return None,
     };
     let sql = match (field.as_str(), operator) {
-        ("cpu_id", Operator::Equal) => "cpu_id = ?5",
-        ("cpu_id", Operator::NotEqual) => "cpu_id <> ?5",
-        ("cpu_id", Operator::Greater) => "cpu_id > ?5",
-        ("cpu_id", Operator::GreaterEqual) => "cpu_id >= ?5",
-        ("cpu_id", Operator::Less) => "cpu_id < ?5",
-        ("cpu_id", Operator::LessEqual) => "cpu_id <= ?5",
-        ("origin_class", Operator::Equal) => "origin_class = ?5",
-        ("origin_class", Operator::NotEqual) => "origin_class <> ?5",
-        ("origin_class", Operator::Greater) => "origin_class > ?5",
-        ("origin_class", Operator::GreaterEqual) => "origin_class >= ?5",
-        ("origin_class", Operator::Less) => "origin_class < ?5",
-        ("origin_class", Operator::LessEqual) => "origin_class <= ?5",
+        ("event.cpu", Operator::Equal) => "cpu_id = ?5",
+        ("event.cpu", Operator::NotEqual) => "cpu_id <> ?5",
+        ("event.cpu", Operator::Greater) => "cpu_id > ?5",
+        ("event.cpu", Operator::GreaterEqual) => "cpu_id >= ?5",
+        ("event.cpu", Operator::Less) => "cpu_id < ?5",
+        ("event.cpu", Operator::LessEqual) => "cpu_id <= ?5",
+        ("emitter.class", Operator::Equal) => "origin_class = ?5",
+        ("emitter.class", Operator::NotEqual) => "origin_class <> ?5",
+        ("emitter.class", Operator::Greater) => "origin_class > ?5",
+        ("emitter.class", Operator::GreaterEqual) => "origin_class >= ?5",
+        ("emitter.class", Operator::Less) => "origin_class < ?5",
+        ("emitter.class", Operator::LessEqual) => "origin_class <= ?5",
         _ => return None,
     };
     Some(SqlConstraint {
@@ -1841,7 +1858,7 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
         Literal::Signed(value) => Value::Signed(*value),
         Literal::Unsigned(value) => Value::Unsigned(*value),
         Literal::Float(value) => Value::Float(*value),
-        Literal::String(value) if field == "origin_class" => {
+        Literal::String(value) if field == "emitter.class" => {
             match value.to_ascii_lowercase().as_str() {
                 "userspace" => Value::Unsigned(0),
                 "kmes" => Value::Unsigned(1),
@@ -1853,7 +1870,12 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
         Literal::String(value)
             if matches!(
                 field,
-                "effective_token_guid" | "true_token_guid" | "process_guid" | "boot_id" | "job_id"
+                "emitter.token.guid"
+                    | "emitter.true-token.guid"
+                    | "emitter.process.guid"
+                    | "event.boot.guid"
+                    | "boot_id"
+                    | "job_id"
             ) =>
         {
             canonical_guid_literal(value)
@@ -5141,7 +5163,7 @@ mod tests {
     #[test]
     fn header_constraints_preserve_query_language_comparison_semantics() {
         let event_type = Expr::Compare {
-            field: "event_type".into(),
+            field: "event.type".into(),
             operator: Operator::Equal,
             value: Literal::String("KACS.Denied".into()),
         };
@@ -5152,7 +5174,7 @@ mod tests {
             Some(rusqlite::types::Value::Text("KACS.Denied".into()))
         );
         let origin = Expr::Compare {
-            field: "origin_class".into(),
+            field: "emitter.class".into(),
             operator: Operator::Equal,
             value: Literal::String("kacs".into()),
         };
@@ -5160,6 +5182,25 @@ mod tests {
             sql_header_constraint(&origin).unwrap().value,
             Some(rusqlite::types::Value::Integer(2))
         );
+        let cpu = Expr::Compare {
+            field: "event.cpu".into(),
+            operator: Operator::GreaterEqual,
+            value: Literal::Unsigned(3),
+        };
+        assert_eq!(sql_header_constraint(&cpu).unwrap().sql, "cpu_id >= ?5");
+        // The columns' names are not fields: a payload field spelled like
+        // one is left to the payload.
+        for column in ["event_type", "origin_class", "cpu_id"] {
+            assert!(
+                sql_header_constraint(&Expr::Compare {
+                    field: column.into(),
+                    operator: Operator::Equal,
+                    value: Literal::Unsigned(2),
+                })
+                .is_none(),
+                "{column}"
+            );
+        }
     }
 
     #[test]
@@ -5247,7 +5288,7 @@ mod tests {
 
         // A field that is not an array, and a missing field, are false
         // rather than an error — as every other type mismatch is.
-        for field in ["event_type", "subject.token.nothing"] {
+        for field in ["event.type", "subject.token.nothing"] {
             assert!(!evaluate(
                 &Expr::Compare {
                     field: field.into(),
@@ -5782,28 +5823,36 @@ mod tests {
     fn timestamp_comparisons_narrow_the_range_read() {
         let narrowed = |text: &str| {
             let query = crate::query_language::parse(&format!("EVENTS WHERE {text}")).unwrap();
-            narrow_by_timestamp(&query.predicates, 0, 1_000)
+            narrow_by_timestamp(&query.predicates, "event.time", 0, 1_000)
         };
-        assert_eq!(narrowed("timestamp <= 500"), (0, 501));
-        assert_eq!(narrowed("timestamp < 500"), (0, 500));
+        assert_eq!(narrowed("event.time <= 500"), (0, 501));
+        assert_eq!(narrowed("event.time < 500"), (0, 500));
         assert_eq!(
-            narrowed("timestamp > 100 AND event_type == \"x\""),
+            narrowed("event.time > 100 AND event.type == \"x\""),
             (0, 1_000)
         );
-        assert_eq!(narrowed("timestamp > 100"), (101, 1_000));
-        assert_eq!(narrowed("timestamp >= 100"), (100, 1_000));
-        assert_eq!(narrowed("timestamp == 7"), (7, 8));
+        assert_eq!(narrowed("event.time > 100"), (101, 1_000));
+        assert_eq!(narrowed("event.time >= 100"), (100, 1_000));
+        assert_eq!(narrowed("event.time == 7"), (7, 8));
         // Only a predicate that must hold narrows: one under OR does not.
-        assert_eq!(narrowed("timestamp < 5 OR cpu_id == 1"), (0, 1_000));
+        assert_eq!(narrowed("event.time < 5 OR event.cpu == 1"), (0, 1_000));
         // Bounds beyond the domain.
-        assert_eq!(narrowed("timestamp <= 9223372036854775807"), (0, 1_000));
-        assert_eq!(narrowed("timestamp < -5"), (0, -5));
+        assert_eq!(narrowed("event.time <= 9223372036854775807"), (0, 1_000));
+        assert_eq!(narrowed("event.time < -5"), (0, -5));
         assert_eq!(
-            narrowed("timestamp > 18446744073709551615"),
+            narrowed("event.time > 18446744073709551615"),
             (i64::MAX, 1_000)
         );
         // A float bound narrows nothing; the predicate still applies.
-        assert_eq!(narrowed("timestamp < 5.5"), (0, 1_000));
+        assert_eq!(narrowed("event.time < 5.5"), (0, 1_000));
+        // An event's `timestamp` is a payload field, which narrows nothing.
+        assert_eq!(narrowed("timestamp <= 500"), (0, 1_000));
+        // A log record's time is still `timestamp`.
+        let query = crate::query_language::parse("LOGS WHERE timestamp <= 500").unwrap();
+        assert_eq!(
+            narrow_by_timestamp(&query.predicates, "timestamp", 0, 1_000),
+            (0, 501)
+        );
     }
 
     #[test]
@@ -6075,7 +6124,7 @@ mod tests {
         assert!(emitted.is_empty(), "and none of its records were allowed");
         assert!(
             authorizer
-                .check(Namespace::Events, "t", &["event_type".to_owned()])
+                .check(Namespace::Events, "t", &["event.type".to_owned()])
                 .is_err(),
             "the identifier is denied rather than allowed"
         );
@@ -6090,8 +6139,8 @@ mod tests {
         let descriptors = Arc::new(super::super::security::DescriptorCache::new());
         descriptors.resolve_as(Namespace::Events, "t", "*", &readable_by_everyone());
         let authorizer = authorizer_without_kacs(descriptors);
-        let fields = vec!["event_type".to_owned(), "timestamp".to_owned()];
-        let granted = HashSet::from(["event_type".to_owned(), "timestamp".to_owned()]);
+        let fields = vec!["event.type".to_owned(), "event.time".to_owned()];
+        let granted = HashSet::from(["event.type".to_owned(), "event.time".to_owned()]);
         let mut cache = AuthorizationCache::new(&authorizer);
         // The verdicts this query obtained while KACS still answered.
         cache

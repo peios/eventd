@@ -12,16 +12,6 @@ use crate::config::{Config, SharedConfig};
 use crate::query_language::{CrossFilter, Query, Source};
 use crate::writer::WriterMessage;
 
-const HEADER_FIELDS: [&str; 7] = [
-    "event_type",
-    "origin_class",
-    "cpu_id",
-    "effective_token_guid",
-    "true_token_guid",
-    "process_guid",
-    "boot_id",
-];
-
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyConfig {
     pub interval: Duration,
@@ -79,7 +69,7 @@ impl Tracker {
                         }
                     }
                 }
-                CrossFilter::EventExists { .. } => fields.push("event_type".to_owned()),
+                CrossFilter::EventExists { .. } => fields.push("event.type".to_owned()),
                 CrossFilter::LogExists { containing, .. } => {
                     fields.push("origin".to_owned());
                     if containing.is_some() {
@@ -108,7 +98,7 @@ impl Tracker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for field in fields {
-            if field == "timestamp" || field == "payload" {
+            if field == "event.time" || field == "payload" {
                 continue;
             }
             let counter = counters.entry(field).or_insert(Counter {
@@ -268,7 +258,7 @@ fn recompute(
         .map(|(priority, counter)| DesiredIndex {
             field_path: counter.field_path.clone(),
             priority: u64::try_from(priority).unwrap_or(u64::MAX),
-            is_expression: !HEADER_FIELDS.contains(&counter.field_path.as_str()),
+            is_expression: eventd_core::header_column(&counter.field_path).is_none(),
         })
         .collect();
     store.write_index_state(&counters, &indexes)?;
@@ -342,7 +332,7 @@ mod tests {
         let path = directory.join("eventd-meta.db");
         let runtime = Config::test_defaults().shared();
         let tracker = Arc::new(Tracker::from_persisted(Vec::new(), Arc::clone(&runtime)));
-        tracker.prioritize("process_guid");
+        tracker.prioritize("emitter.process.guid");
         let desired = Arc::new(RwLock::new(Vec::new()));
         let queues: Arc<[BoundedQueue<WriterMessage>]> =
             Arc::from(vec![BoundedQueue::new(16, 1 << 20).unwrap()]);
@@ -386,9 +376,10 @@ mod tests {
                 .iter()
                 .map(|index| index.field_path.as_str())
                 .collect::<Vec<_>>(),
-            ["process_guid"],
+            ["emitter.process.guid"],
             "the final policy run was persisted"
         );
+        assert!(!persisted[0].is_expression, "as the header column's index");
         let sequence: i64 = rusqlite::Connection::open(&path)
             .unwrap()
             .query_row(
@@ -408,19 +399,23 @@ mod tests {
         config.adaptive_index_create_threshold = 10;
         let tracker = Tracker::from_persisted(Vec::new(), config.shared());
         let query = crate::query_language::parse(
-            "EVENTS SINCE 1h ago WHERE event_type == kacs.denied \
-             WHERE payload.subject == alice",
+            "EVENTS SINCE 1h ago WHERE event.type == kacs.denied \
+             WHERE payload.subject == alice WHERE event.time > 0",
         )
         .unwrap();
         tracker.record_query(&query);
-        tracker.prioritize("process_guid");
+        tracker.prioritize("emitter.process.guid");
         let counters: HashMap<_, _> = tracker
             .snapshot()
             .into_iter()
             .map(|counter| (counter.field_path, counter.query_count))
             .collect();
-        assert_eq!(counters["event_type"], 1);
+        assert_eq!(counters["event.type"], 1);
         assert_eq!(counters["payload.subject"], 1);
-        assert_eq!(counters["process_guid"], 10);
+        assert_eq!(counters["emitter.process.guid"], 10);
+        assert!(
+            !counters.contains_key("event.time"),
+            "event.time is always indexed, so it is never counted"
+        );
     }
 }

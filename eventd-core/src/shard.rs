@@ -659,8 +659,10 @@ impl Shard {
     }
 }
 
+/// A header field's adaptive index, named for its column. `timestamp` is
+/// always indexed and `sequence` never is, so neither is adaptive.
 fn header_index_name(field: &str) -> Option<&'static str> {
-    match field {
+    match crate::header_column(field)? {
         "event_type" => Some("idx_events_event_type"),
         "origin_class" => Some("idx_events_origin_class"),
         "cpu_id" => Some("idx_events_cpu_id"),
@@ -1033,7 +1035,7 @@ mod tests {
         let path = directory.join("shard-0000.db");
         let mut shard = Shard::open(&path, 1_000).unwrap();
         let desired = [DesiredIndex {
-            field_path: "event_type".into(),
+            field_path: "event.type".into(),
             priority: 0,
             is_expression: false,
         }];
@@ -1771,7 +1773,7 @@ mod tests {
 
     fn event_type_index() -> [DesiredIndex; 1] {
         [DesiredIndex {
-            field_path: "event_type".into(),
+            field_path: "event.type".into(),
             priority: 0,
             is_expression: false,
         }]

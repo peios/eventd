@@ -1,7 +1,7 @@
 //! Query-language values, comparison, `MessagePack` encoding and payload flattening.
 
 use core::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use peios::msgpack::{Reader, Type, Writer};
 
@@ -296,37 +296,24 @@ fn read_value(reader: &mut Reader<'_>) -> Result<Value, peios::Error> {
     }
 }
 
+/// Add `payload`'s flattened fields to `record`. The header wins at its own
+/// paths (PSPU §3.22): a payload value at one is dropped, and so is a
+/// map's whole subtree, while a map holding one is still flattened, so
+/// `emitter.process.pid` is a field beside the header's
+/// `emitter.process.guid`.
 pub fn flatten_event_payload(payload: &[u8], record: &mut Record) {
     let Ok(Value::Map(entries)) = decode(payload) else {
         return;
     };
-    let reserved: HashSet<&str> = [
-        "timestamp",
-        "cpu_id",
-        "sequence",
-        "origin_class",
-        "event_type",
-        "effective_token_guid",
-        "true_token_guid",
-        "process_guid",
-        "boot_id",
-    ]
-    .into_iter()
-    .collect();
-    flatten_entries(&entries, "", record, &reserved);
+    flatten_entries(&entries, "", record);
 }
 
-fn flatten_entries(
-    entries: &[(Value, Value)],
-    prefix: &str,
-    record: &mut Record,
-    reserved: &HashSet<&str>,
-) {
+fn flatten_entries(entries: &[(Value, Value)], prefix: &str, record: &mut Record) {
     for (key, value) in entries {
         let Value::String(segment) = key else {
             continue;
         };
-        if !valid_segment(segment) || (prefix.is_empty() && reserved.contains(segment.as_str())) {
+        if !valid_segment(segment) {
             continue;
         }
         let path = if prefix.is_empty() {
@@ -334,11 +321,11 @@ fn flatten_entries(
         } else {
             format!("{prefix}.{segment}")
         };
-        if record.contains_key(&path) {
+        if eventd_core::header_column(&path).is_some() || record.contains_key(&path) {
             continue;
         }
         if let Value::Map(children) = value {
-            flatten_entries(children, &path, record, reserved);
+            flatten_entries(children, &path, record);
         } else {
             record.insert(path, value.clone());
         }
@@ -453,19 +440,70 @@ mod tests {
     fn payload_flattening_suppresses_headers_and_bad_paths() {
         let mut writer = Writer::new();
         writer
-            .write_map(3)
+            .write_map(4)
             .write_str("source")
             .write_map(1)
             .write_str("name")
             .write_str("x")
-            .write_str("timestamp")
+            .write_str("event")
+            .write_map(2)
+            .write_str("time")
             .write_uint(1)
+            .write_str("type")
+            .write_map(1)
+            .write_str("forged")
+            .write_str("y")
+            .write_str("emitter")
+            .write_map(1)
+            .write_str("process")
+            .write_map(2)
+            .write_str("guid")
+            .write_str("z")
+            .write_str("pid")
+            .write_uint(7)
             .write_str("bad.key")
             .write_uint(2);
         let mut record = Record::new();
         flatten_event_payload(&writer.to_bytes().unwrap(), &mut record);
         assert_eq!(record.get("source.name"), Some(&Value::String("x".into())));
-        assert!(!record.contains_key("timestamp"));
+        assert!(
+            !record.contains_key("event.time"),
+            "a value at a header path"
+        );
+        assert!(
+            !record.contains_key("event.type") && !record.contains_key("event.type.forged"),
+            "a map at a header path, subtree and all"
+        );
+        assert!(!record.contains_key("emitter.process.guid"));
+        assert!(
+            record
+                .get("emitter.process.pid")
+                .is_some_and(|pid| pid.language_equal(&Value::Unsigned(7))),
+            "a field beside a header path resolves: {record:?}"
+        );
         assert!(!record.contains_key("bad.key"));
+        assert_eq!(record.len(), 2);
+    }
+
+    // The old header names are ordinary payload names now.
+    #[test]
+    fn payload_fields_named_like_header_columns_resolve() {
+        let mut writer = Writer::new();
+        writer
+            .write_map(2)
+            .write_str("cpu_id")
+            .write_uint(3)
+            .write_str("timestamp")
+            .write_uint(4);
+        let mut record = Record::new();
+        flatten_event_payload(&writer.to_bytes().unwrap(), &mut record);
+        for (field, expected) in [("cpu_id", 3), ("timestamp", 4)] {
+            assert!(
+                record
+                    .get(field)
+                    .is_some_and(|value| value.language_equal(&Value::Unsigned(expected))),
+                "{field}: {record:?}"
+            );
+        }
     }
 }

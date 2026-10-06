@@ -151,7 +151,9 @@ impl MetaStore {
         self.checkpoint_if_needed()
     }
 
-    /// Load reconstructible adaptive-index state at startup.
+    /// Load reconstructible adaptive-index state at startup. A header field
+    /// stored under its column's name by an earlier eventd is read back
+    /// under its path, so its counter and its index survive the renaming.
     pub fn load_index_state(
         &self,
     ) -> Result<(Vec<IndexCounter>, Vec<DesiredIndex>), MetaStoreError> {
@@ -161,7 +163,7 @@ impl MetaStore {
         let counters = counters_statement
             .query_map([], |row| {
                 Ok(IndexCounter {
-                    field_path: row.get(0)?,
+                    field_path: current_field_path(row.get(0)?),
                     query_count: row.get(1)?,
                     window_start: row.get(2)?,
                 })
@@ -174,7 +176,7 @@ impl MetaStore {
         let desired = desired_statement
             .query_map([], |row| {
                 Ok(DesiredIndex {
-                    field_path: row.get(0)?,
+                    field_path: current_field_path(row.get(0)?),
                     priority: row.get(1)?,
                     is_expression: row.get::<_, i64>(2)? != 0,
                 })
@@ -342,6 +344,10 @@ fn sidecar_size(path: &Path, suffix: &str) -> Result<u64, MetaStoreError> {
 
 fn sqlite_integer(value: u64) -> Result<i64, MetaStoreError> {
     i64::try_from(value).map_err(|_| MetaStoreError::IntegerRange)
+}
+
+fn current_field_path(stored: String) -> String {
+    crate::legacy_header_path(&stored).map_or(stored, str::to_owned)
 }
 
 /// Metadata-store failure.
@@ -535,16 +541,37 @@ mod tests {
             .unwrap();
         assert_eq!(row, (9, 10));
         let counters = [IndexCounter {
-            field_path: "event_type".into(),
+            field_path: "event.type".into(),
             query_count: 12,
             window_start: 34,
         }];
         let desired = [DesiredIndex {
-            field_path: "event_type".into(),
+            field_path: "event.type".into(),
             priority: 0,
             is_expression: false,
         }];
         store.write_index_state(&counters, &desired).unwrap();
+        assert_eq!(
+            store.load_index_state().unwrap(),
+            (counters.clone().into(), desired.clone().into())
+        );
+
+        // State an earlier eventd wrote names the header field by its
+        // column, and is read back under the field's path.
+        store
+            .write_index_state(
+                &[IndexCounter {
+                    field_path: "event_type".into(),
+                    query_count: 12,
+                    window_start: 34,
+                }],
+                &[DesiredIndex {
+                    field_path: "event_type".into(),
+                    priority: 0,
+                    is_expression: false,
+                }],
+            )
+            .unwrap();
         assert_eq!(
             store.load_index_state().unwrap(),
             (counters.into(), desired.into())

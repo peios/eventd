@@ -6,17 +6,6 @@ use rusqlite::{Connection, Result as SqlResult};
 
 const FUNCTION: &str = "eventd_payload_key";
 const MAX_DEPTH: usize = 32;
-const RESERVED: [&str; 9] = [
-    "timestamp",
-    "cpu_id",
-    "sequence",
-    "origin_class",
-    "event_type",
-    "effective_token_guid",
-    "true_token_guid",
-    "process_guid",
-    "boot_id",
-];
 
 /// A query literal that can safely narrow through the payload index.
 #[derive(Clone, Copy)]
@@ -72,11 +61,7 @@ pub fn register(connection: &Connection) -> SqlResult<()> {
 /// SQL expression used by both index creation and query planning.
 #[must_use]
 pub fn expression(field: &str) -> Option<String> {
-    if !crate::valid_field_path(field) {
-        return None;
-    }
-    let root = field.split('.').next()?;
-    if RESERVED.contains(&root) {
+    if !crate::valid_field_path(field) || crate::under_header_path(field) {
         return None;
     }
     Some(format!("{FUNCTION}(payload, '{field}')"))
@@ -84,7 +69,7 @@ pub fn expression(field: &str) -> Option<String> {
 
 fn extract(payload: &[u8], field: &str) -> Option<Vec<u8>> {
     let segments: Vec<_> = field.split('.').collect();
-    if segments.is_empty() || !crate::valid_field_path(field) || RESERVED.contains(&segments[0]) {
+    if segments.is_empty() || !crate::valid_field_path(field) || crate::under_header_path(field) {
         return None;
     }
     let mut cursor = Cursor::new(payload);
@@ -349,14 +334,34 @@ mod tests {
         let payload = [
             0x83, 0xa6, b's', b'o', b'u', b'r', b'c', b'e', 0x81, 0xa4, b'n', b'a', b'm', b'e',
             0xa5, b'A', b'l', b'p', b'h', b'a', 0xa6, b's', b'o', b'u', b'r', b'c', b'e', 0x81,
-            0xa4, b'n', b'a', b'm', b'e', 0xa4, b'b', b'e', b't', b'a', 0xa9, b't', b'i', b'm',
-            b'e', b's', b't', b'a', b'm', b'p', 0xa3, b'b', b'a', b'd',
+            0xa4, b'n', b'a', b'm', b'e', 0xa4, b'b', b'e', b't', b'a', 0xa5, b'e', b'v', b'e',
+            b'n', b't', 0x81, 0xa4, b't', b'y', b'p', b'e', 0xa3, b'b', b'a', b'd',
         ];
         assert_eq!(
             extract(&payload, "source.name"),
             Some(query_key(PayloadIndexValue::String("alpha")))
         );
-        assert_eq!(extract(&payload, "timestamp"), None);
+        assert_eq!(extract(&payload, "event.type"), None);
+        assert_eq!(expression("event.type"), None);
+    }
+
+    // PSPU §3.22: a payload map at a header path's parent is flattened, and
+    // only the header path in it is suppressed.
+    #[test]
+    fn a_field_beside_a_header_path_is_indexed_and_the_header_path_is_not() {
+        // {emitter: {process: {guid: "g", name: "X"}}}
+        let payload = [
+            0x81, 0xa7, b'e', b'm', b'i', b't', b't', b'e', b'r', 0x81, 0xa7, b'p', b'r', b'o',
+            b'c', b'e', b's', b's', 0x82, 0xa4, b'g', b'u', b'i', b'd', 0xa1, b'g', 0xa4, b'n',
+            b'a', b'm', b'e', 0xa1, b'X',
+        ];
+        assert_eq!(
+            extract(&payload, "emitter.process.name"),
+            Some(query_key(PayloadIndexValue::String("x")))
+        );
+        assert!(expression("emitter.process.name").is_some());
+        assert_eq!(extract(&payload, "emitter.process.guid"), None);
+        assert_eq!(expression("emitter.process.guid"), None);
     }
 
     #[test]
