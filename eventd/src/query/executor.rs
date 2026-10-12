@@ -316,7 +316,7 @@ fn execute_at(
         if !authorize_row(authorizer, namespace, &mut row, &referenced, authorization)?
             || !predicates
                 .iter()
-                .all(|predicate| evaluate(predicate, &row.record))
+                .all(|predicate| evaluate(namespace, predicate, &row.record))
         {
             return Ok(Flow::More);
         }
@@ -1125,7 +1125,11 @@ fn resolve_cross_metric(
             "type".into(),
             Value::String(metric_type_name(metric_type)?.into()),
         );
-        if labels.is_some_and(|items| !items.iter().all(|item| evaluate(item, &selector))) {
+        if labels.is_some_and(|items| {
+            !items
+                .iter()
+                .all(|item| evaluate(Namespace::Metrics, item, &selector))
+        }) {
             continue;
         }
         if metric_type == 2 {
@@ -1245,6 +1249,7 @@ fn metric_comparison(number: f64, operator: Operator, value: &Literal) -> bool {
     let mut record = Record::new();
     record.insert("value".into(), Value::Float(number));
     evaluate(
+        Namespace::Metrics,
         &Expr::Compare {
             field: "value".into(),
             operator,
@@ -1493,7 +1498,7 @@ fn sql_header_constraint(expression: &Expr) -> Option<SqlConstraint> {
     if !matches!(field.as_str(), "event.cpu" | "emitter.class") {
         return None;
     }
-    let value = match literal_value(field, value) {
+    let value = match literal_value(Namespace::Events, field, value) {
         Value::Signed(value) => value,
         Value::Unsigned(value) => i64::try_from(value).ok()?,
         _ => return None,
@@ -1813,10 +1818,14 @@ fn referenced_fields(query: &Query) -> Vec<String> {
     fields
 }
 
-fn evaluate(expression: &Expr, record: &Record) -> bool {
+fn evaluate(namespace: Namespace, expression: &Expr, record: &Record) -> bool {
     match expression {
-        Expr::And(left, right) => evaluate(left, record) && evaluate(right, record),
-        Expr::Or(left, right) => evaluate(left, record) || evaluate(right, record),
+        Expr::And(left, right) => {
+            evaluate(namespace, left, record) && evaluate(namespace, right, record)
+        }
+        Expr::Or(left, right) => {
+            evaluate(namespace, left, record) || evaluate(namespace, right, record)
+        }
         Expr::Null { field, negated } => {
             let is_null = record
                 .get(field)
@@ -1836,7 +1845,7 @@ fn evaluate(expression: &Expr, record: &Record) -> bool {
             };
             let found = values
                 .iter()
-                .any(|value| actual.language_equal(&literal_value(field, value)));
+                .any(|value| actual.language_equal(&literal_value(namespace, field, value)));
             found != *negated
         }
         Expr::Compare {
@@ -1850,7 +1859,7 @@ fn evaluate(expression: &Expr, record: &Record) -> bool {
             else {
                 return false;
             };
-            let expected = literal_value(field, value);
+            let expected = literal_value(namespace, field, value);
             match operator {
                 Operator::Equal => actual.language_equal(&expected),
                 Operator::NotEqual => !actual.language_equal(&expected),
@@ -1877,12 +1886,12 @@ fn evaluate(expression: &Expr, record: &Record) -> bool {
     }
 }
 
-fn literal_value(field: &str, literal: &Literal) -> Value {
+fn literal_value(namespace: Namespace, field: &str, literal: &Literal) -> Value {
     match literal {
         Literal::Signed(value) => Value::Signed(*value),
         Literal::Unsigned(value) => Value::Unsigned(*value),
         Literal::Float(value) => Value::Float(*value),
-        Literal::String(value) if field == "emitter.class" => {
+        Literal::String(value) if namespace == Namespace::Events && field == "emitter.class" => {
             match value.to_ascii_lowercase().as_str() {
                 "userspace" => Value::Unsigned(0),
                 "kmes" => Value::Unsigned(1),
@@ -1893,13 +1902,15 @@ fn literal_value(field: &str, literal: &Literal) -> Value {
         }
         Literal::String(value)
             if matches!(
-                field,
-                "emitter.token.guid"
-                    | "emitter.true-token.guid"
-                    | "emitter.process.guid"
-                    | "event.boot.guid"
-                    | "boot_id"
-                    | "job_id"
+                (namespace, field),
+                (
+                    Namespace::Events,
+                    "emitter.token.guid"
+                        | "emitter.true-token.guid"
+                        | "emitter.process.guid"
+                        | "event.boot.guid"
+                ) | (Namespace::Logs, "boot_id" | "job_id")
+                    | (Namespace::Metrics, "boot_id")
             ) =>
         {
             canonical_guid_literal(value)
@@ -2494,7 +2505,11 @@ fn execute_metric(
             "type".into(),
             Value::String(metric_type_name(metric_type)?.into()),
         );
-        if labels.is_some_and(|items| !items.iter().all(|item| evaluate(item, &selector_record))) {
+        if labels.is_some_and(|items| {
+            !items
+                .iter()
+                .all(|item| evaluate(Namespace::Metrics, item, &selector_record))
+        }) {
             continue;
         }
         held.add(SERIES_OVERHEAD + heap(name.len()) + record_size(&label_map))?;
@@ -2564,7 +2579,7 @@ fn execute_metric(
                     )? && query
                         .predicates
                         .iter()
-                        .all(|item| evaluate(item, &row.record)))
+                        .all(|item| evaluate(Namespace::Metrics, item, &row.record)))
                 },
                 &mut |input| {
                     transformer
@@ -5340,6 +5355,7 @@ mod tests {
 
         let has = |sid: &[u8]| {
             evaluate(
+                Namespace::Events,
                 &Expr::Compare {
                     field: "subject.token.groups".into(),
                     operator: Operator::Has,
@@ -5356,6 +5372,7 @@ mod tests {
         // rather than an error — as every other type mismatch is.
         for field in ["event.type", "subject.token.nothing"] {
             assert!(!evaluate(
+                Namespace::Events,
                 &Expr::Compare {
                     field: field.into(),
                     operator: Operator::Has,
@@ -5382,6 +5399,7 @@ mod tests {
         );
         let equals = |value: Literal| {
             evaluate(
+                Namespace::Events,
                 &Expr::Compare {
                     field: "groups".into(),
                     operator: Operator::Equal,
@@ -5400,6 +5418,105 @@ mod tests {
                     Value::Binary(second.to_vec()),
                 ]))
         );
+    }
+
+    #[test]
+    fn metric_label_literals_are_not_event_header_aliases() {
+        let guid = "550E8400-E29B-41D4-A716-446655440000";
+        for (field, value) in [
+            ("emitter.class", "kacs"),
+            ("emitter.token.guid", guid),
+            ("event.boot.guid", guid),
+            ("job_id", guid),
+        ] {
+            let record = BTreeMap::from([(field.into(), Value::String(value.into()))]);
+            for predicate in [
+                format!("{field} == \"{value}\""),
+                format!("{field} IN (\"absent\", \"{value}\")"),
+                format!("{field} NOT_IN (\"absent\") AND {field} == \"{value}\""),
+                format!("{field} == \"absent\" OR {field} == \"{value}\""),
+            ] {
+                let query =
+                    crate::query_language::parse(&format!("METRIC cpu.usage WHERE {predicate}"))
+                        .unwrap();
+                assert!(
+                    evaluate(Namespace::Metrics, &query.predicates[0], &record),
+                    "{predicate}"
+                );
+            }
+            let query =
+                crate::query_language::parse(&format!("METRIC cpu.usage[{field}=\"{value}\"]"))
+                    .unwrap();
+            let Source::Metric {
+                labels: Some(labels),
+                ..
+            } = query.source
+            else {
+                panic!("metric selector expected");
+            };
+            assert!(
+                evaluate(Namespace::Metrics, &labels[0], &record),
+                "selector for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn guid_payload_fields_do_not_borrow_another_namespaces_header_type() {
+        let guid = "550E8400-E29B-41D4-A716-446655440000";
+        for field in ["boot_id", "job_id"] {
+            let record = BTreeMap::from([(field.into(), Value::String(guid.into()))]);
+            let query =
+                crate::query_language::parse(&format!("EVENTS WHERE {field} == \"{guid}\""))
+                    .unwrap();
+            assert!(
+                evaluate(Namespace::Events, &query.predicates[0], &record),
+                "payload {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_literals_keep_their_namespace_specific_conversions() {
+        let unbraced = "550E8400-E29B-41D4-A716-446655440000";
+        let braced = "{550e8400-e29b-41d4-a716-446655440000}";
+        for (namespace, field) in [
+            (Namespace::Events, "emitter.token.guid"),
+            (Namespace::Events, "emitter.true-token.guid"),
+            (Namespace::Events, "emitter.process.guid"),
+            (Namespace::Events, "event.boot.guid"),
+            (Namespace::Logs, "boot_id"),
+            (Namespace::Logs, "job_id"),
+            (Namespace::Metrics, "boot_id"),
+        ] {
+            let record = BTreeMap::from([(field.into(), Value::String(braced.into()))]);
+            for expression in [
+                Expr::Compare {
+                    field: field.into(),
+                    operator: Operator::Equal,
+                    value: Literal::String(unbraced.into()),
+                },
+                Expr::In {
+                    field: field.into(),
+                    negated: false,
+                    values: vec![Literal::String(unbraced.into())],
+                },
+            ] {
+                assert!(
+                    evaluate(namespace, &expression, &record),
+                    "{namespace:?} {field}"
+                );
+            }
+        }
+        for (name, number) in [("userspace", 0), ("KMES", 1), ("kacs", 2), ("lcs", 3)] {
+            let record = BTreeMap::from([("emitter.class".into(), Value::Unsigned(number))]);
+            let expression = Expr::In {
+                field: "emitter.class".into(),
+                negated: false,
+                values: vec![Literal::String(name.into())],
+            };
+            assert!(evaluate(Namespace::Events, &expression, &record));
+        }
     }
 
     #[test]
@@ -5861,7 +5978,7 @@ mod tests {
             let record = BTreeMap::from([("is_error".into(), Value::Bool(is_error))]);
             log_predicates(&query.predicates)
                 .iter()
-                .all(|predicate| evaluate(predicate, &record))
+                .all(|predicate| evaluate(Namespace::Logs, predicate, &record))
         };
         for (text, error, normal) in [
             ("is_error == 1", true, false),
@@ -5882,7 +5999,7 @@ mod tests {
         // do not coerce there (§3.20).
         let query = crate::query_language::parse("EVENTS WHERE is_error == 1").unwrap();
         let record = BTreeMap::from([("is_error".into(), Value::Bool(true))]);
-        assert!(!evaluate(&query.predicates[0], &record));
+        assert!(!evaluate(Namespace::Events, &query.predicates[0], &record));
     }
 
     #[test]
@@ -5928,10 +6045,13 @@ mod tests {
             "x < 5", "x <= 5", "x > 5", "x >= 5", "x == 0", "x > -1.5", "x < 1.5",
         ] {
             let query = crate::query_language::parse(&format!("EVENTS WHERE {text}")).unwrap();
-            assert!(!evaluate(&query.predicates[0], &record), "{text}");
+            assert!(
+                !evaluate(Namespace::Events, &query.predicates[0], &record),
+                "{text}"
+            );
         }
         let query = crate::query_language::parse("EVENTS WHERE x != 5").unwrap();
-        assert!(evaluate(&query.predicates[0], &record));
+        assert!(evaluate(Namespace::Events, &query.predicates[0], &record));
     }
 
     #[test]
