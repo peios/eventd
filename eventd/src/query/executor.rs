@@ -155,7 +155,7 @@ pub fn stream_next(
     watch_query.sort.clear();
     watch_query.take = None;
     watch_query.skip = 0;
-    // One commit's worth of records at a time, which is small.
+    // The records committed between the two captured cursors.
     let mut records = Vec::new();
     execute_at(
         &watch_query,
@@ -287,8 +287,8 @@ fn execute_at(
     // What the other queries hold: an aggregation folds its groups as rows
     // pass, and a sorted one keeps its rows, or with TAKE only its best
     // SKIP + TAKE. A watch batch is gathered whole, because its cross-type
-    // conditions are judged on the batch (PSPU §3.27); it is one commit's
-    // worth.
+    // conditions are judged on the batch (PSPU §3.27); several commits
+    // may have become visible since the previous cursor.
     let mut held = Held::new(budget);
     let mut gathered = match &query.aggregate {
         Some(aggregate) if !watch => Gathered::Groups(Groups::new(aggregate)),
@@ -391,6 +391,20 @@ fn execute_at(
         )?;
     }
 
+    if watch {
+        order_result_rows(&mut rows, query, true);
+        return rows.into_iter().try_for_each(|row| {
+            let record = if let Some(RecordAggregate::Distinct(field)) = &query.aggregate {
+                // The stream handler owns the cross-batch seen set. Give it
+                // values in record order, retaining the first representation.
+                let value = row.record.get(field).cloned().unwrap_or(Value::Null);
+                BTreeMap::from([(field.clone(), value)])
+            } else {
+                project(row.record, &query.select)
+            };
+            emit(record)
+        });
+    }
     if let Some(aggregate) = &query.aggregate {
         let mut groups = Groups::new(aggregate);
         for row in &rows {
@@ -398,10 +412,20 @@ fn execute_at(
         }
         return emit_aggregate(groups.finish()?, query, emit);
     }
-    sort_rows(&mut rows, query);
-    apply_pagination(&mut rows, query);
+    order_result_rows(&mut rows, query, false);
     rows.into_iter()
         .try_for_each(|row| emit(project(row.record, &query.select)))
+}
+
+fn order_result_rows(rows: &mut Vec<Row>, query: &Query, watch: bool) {
+    if watch {
+        // Shards commit independently. Preserve insertion order within each
+        // shard, with a deterministic shard order inside an observed batch.
+        rows.sort_unstable_by_key(|row| row.tie);
+    } else {
+        sort_rows(rows, query);
+        apply_pagination(rows, query);
+    }
 }
 
 fn emit_aggregate(
@@ -4417,6 +4441,48 @@ mod tests {
     fn glob_is_ascii_folded_and_star_only() {
         assert!(glob_matches("KACS.*.denied", "kacs.token.denied"));
         assert!(!glob_matches("kacs.?", "kacs.x"));
+    }
+
+    #[test]
+    fn watch_batches_follow_store_ids_not_timestamps_or_initial_pagination() {
+        let query =
+            crate::query_language::parse("EVENTS SORT n DESC SKIP 1 TAKE 1 STREAM").unwrap();
+        let ties = [
+            Tie::Event { shard: 1, id: 1 },
+            Tie::Event { shard: 0, id: 3 },
+            Tie::Event { shard: 0, id: 1 },
+            Tie::Event { shard: 0, id: 2 },
+        ];
+        let mut rows: Vec<_> = ties
+            .into_iter()
+            .enumerate()
+            .map(|(i, tie)| Row {
+                record: BTreeMap::from([("n".into(), Value::Signed(i64::try_from(i).unwrap()))]),
+                identifier: "t".into(),
+                at: i64::try_from(i).unwrap(),
+                tie,
+            })
+            .collect();
+        let mut initial = rows.clone();
+        order_result_rows(&mut initial, &query, false);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].tie, ties[2]);
+
+        order_result_rows(&mut rows, &query, true);
+        assert_eq!(
+            rows.iter().map(|r| r.tie).collect::<Vec<_>>(),
+            vec![ties[2], ties[3], ties[1], ties[0]]
+        );
+
+        let query = crate::query_language::parse("LOGS STREAM").unwrap();
+        for (row, id) in rows.iter_mut().zip([4, 1, 3, 2]) {
+            row.tie = Tie::Single(id);
+        }
+        order_result_rows(&mut rows, &query, true);
+        assert_eq!(
+            rows.iter().map(|r| r.tie).collect::<Vec<_>>(),
+            (1..=4).map(Tie::Single).collect::<Vec<_>>()
+        );
     }
 
     #[test]
