@@ -425,7 +425,7 @@ fn process_rollups(
     match result {
         Ok(()) => Ok(true),
         Err(error) if error.is_capacity() => {
-            request_retention(retention_requested, &error);
+            request_retention(retention_requested, "rollup maintenance failed", &error);
             Ok(false)
         }
         Err(error) if error.is_corruption() => {
@@ -468,7 +468,7 @@ fn process_maintenance(
         Err(error) => {
             let _ = response.send(Err(error.to_string()));
             if error.is_capacity() {
-                request_retention(retention_requested, &error);
+                request_retention(retention_requested, "maintenance failed", &error);
                 Ok(())
             } else if error.is_corruption() {
                 recover_corruption(store, boot_id, error_events, &error)
@@ -498,7 +498,7 @@ fn commit_batch(
             Ok(())
         }
         Err(error) if error.is_capacity() => {
-            request_retention(retention_requested, &error);
+            request_retention(retention_requested, "batch discarded", &error);
             Ok(())
         }
         Err(error) if error.is_corruption() => {
@@ -511,10 +511,10 @@ fn commit_batch(
     }
 }
 
-fn request_retention(requested: &AtomicBool, error: &MetricStoreError) {
+fn request_retention(requested: &AtomicBool, outcome: &str, error: &MetricStoreError) {
     crate::diagnostics::metric_error(error);
     requested.store(true, Ordering::Release);
-    eprintln!("eventd: metric store is full; batch discarded and retention requested: {error}");
+    eprintln!("eventd: metric store is full; {outcome}; retention requested: {error}");
 }
 
 fn recover_corruption(
