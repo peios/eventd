@@ -14,7 +14,6 @@ use crate::writer::WriterMessage;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyConfig {
-    pub interval: Duration,
     pub create_threshold: u64,
     pub drop_threshold: u64,
 }
@@ -175,10 +174,13 @@ pub fn run(
         queues,
     );
     loop {
+        let interval = Config::read(runtime, |live| live.adaptive_index_policy_interval);
+        let message = receiver.recv_timeout(interval);
+        // A configuration change can be what woke us. Judge this run,
+        // including the final Stop flush, by the values now in force.
         let (config, checkpoint_pages) = Config::read(runtime, |live| {
             (
                 PolicyConfig {
-                    interval: live.adaptive_index_policy_interval,
                     create_threshold: live.adaptive_index_create_threshold,
                     drop_threshold: live.adaptive_index_drop_threshold,
                 },
@@ -186,7 +188,7 @@ pub fn run(
             )
         });
         store.set_checkpoint_pages(checkpoint_pages);
-        match receiver.recv_timeout(config.interval) {
+        match message {
             Ok(PolicyMessage::Recompute) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(error) = recompute(&mut store, tracker, desired, queues, config) {
                     crate::diagnostics::metadata_error(&error);
