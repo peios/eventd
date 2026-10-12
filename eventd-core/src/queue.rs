@@ -187,13 +187,22 @@ impl<T> Inner<T> {
                         )
                         .is_ok()
                     {
-                        return Ok(Permit {
+                        let permit = Permit {
                             inner: self,
                             slot,
                             position,
                             bytes,
                             published: false,
-                        });
+                        };
+                        // Closing can race the capacity checks and slot
+                        // claim. Do not hand out a new permit after that
+                        // race: the consumer may already have drained and
+                        // exited. Dropping this permit cancels its slot.
+                        return if self.closed.load(Ordering::Acquire) {
+                            Err(ReserveError::Closed)
+                        } else {
+                            Ok(permit)
+                        };
                     }
                 }
                 core::cmp::Ordering::Less => {
@@ -481,5 +490,43 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn closing_with_active_producers_drains_every_admitted_item() {
+        for _ in 0..100 {
+            let queue = BoundedQueue::new(8, 64).unwrap();
+            let published = AtomicUsize::new(0);
+            let drained = thread::scope(|scope| {
+                for _ in 0..4 {
+                    let queue = &queue;
+                    let published = &published;
+                    scope.spawn(move || {
+                        loop {
+                            match queue.reserve(1) {
+                                Ok(permit) => {
+                                    permit.publish(());
+                                    published.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ReserveError::Closed) => break,
+                                Err(error) => panic!("unexpected reservation failure: {error}"),
+                            }
+                        }
+                    });
+                }
+                while published.load(Ordering::Relaxed) < 4 {
+                    thread::yield_now();
+                }
+                queue.close();
+                let mut drained = 0;
+                while queue.pop_wait() == Pop::Item(()) {
+                    drained += 1;
+                }
+                // Joining the producers is outside this consumer's loop:
+                // none may publish an item behind its final Closed result.
+                drained
+            });
+            assert_eq!(drained, published.load(Ordering::Relaxed));
+        }
     }
 }
