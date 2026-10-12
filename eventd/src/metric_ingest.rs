@@ -176,20 +176,24 @@ pub fn run(
         next_health = next_health.min(now + health_interval);
         if !health_interval.is_zero() && now >= next_health {
             next_health = now + health_interval;
-            batch.extend(crate::health::sample(
-                boot_id,
-                realtime_nanoseconds()?,
-                store.cache_len(),
-            ));
-            commit_batch(
-                &mut store,
-                &batch,
-                retention_requested,
-                boot_id,
-                error_events,
-                &mut type_mismatch_reporter,
+            let samples =
+                crate::health::sample(boot_id, realtime_nanoseconds()?, store.cache_len());
+            commit_health_samples(
+                &mut batch,
+                samples,
+                open.map_or(max_batch_size, |(_, size_cap, _)| size_cap),
+                max_batch_size,
+                |records| {
+                    commit_batch(
+                        &mut store,
+                        records,
+                        retention_requested,
+                        boot_id,
+                        error_events,
+                        &mut type_mismatch_reporter,
+                    )
+                },
             )?;
-            batch.clear();
             open = None;
         }
         store.configure(checkpoint_pages, cache_size);
@@ -478,6 +482,31 @@ fn process_maintenance(
             }
         }
     }
+}
+
+/// Fill the pending transaction at its original cap, then use the current
+/// cap for any further health transactions. Health sampling always flushes
+/// its last partial batch, so no open-transaction state survives this call.
+fn commit_health_samples(
+    batch: &mut Vec<MetricRecord>,
+    samples: impl IntoIterator<Item = MetricRecord>,
+    mut size_cap: usize,
+    current_size_cap: usize,
+    mut commit: impl FnMut(&[MetricRecord]) -> Result<(), MetricIngestError>,
+) -> Result<(), MetricIngestError> {
+    for sample in samples {
+        batch.push(sample);
+        if batch.len() >= size_cap {
+            commit(batch)?;
+            batch.clear();
+            size_cap = current_size_cap;
+        }
+    }
+    if !batch.is_empty() {
+        commit(batch)?;
+        batch.clear();
+    }
+    Ok(())
 }
 
 fn commit_batch(
@@ -1054,6 +1083,78 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    fn health_record(timestamp: i64) -> MetricRecord {
+        MetricRecord {
+            boot_id: [1; 16],
+            timestamp,
+            name: "eventd.test.health".into(),
+            labels: "".into(),
+            metric_type: MetricType::Gauge,
+            value: MetricValue::Number(7.0),
+        }
+    }
+
+    #[test]
+    fn health_samples_respect_transaction_caps_without_losing_or_reordering_records() {
+        // Include no pending producer batch, a nearly full one, and both
+        // directions of a live limit change. Each callback is a real SQLite
+        // transaction, and the persisted IDs expose loss or reordering.
+        for (pending, original_cap, current_cap, expected_sizes) in [
+            (0, 100, 100, vec![100, 100, 37]),
+            (99, 100, 100, vec![100, 100, 100, 36]),
+            (99, 100, 200, vec![100, 200, 36]),
+            (199, 200, 100, vec![200, 100, 100, 36]),
+        ] {
+            let metric = MetricThread::new();
+            let path = metric.directory.join("metrics.db");
+            let mut store = MetricStore::open(&path, 1_000, 1_000).unwrap();
+            let mut batch: Vec<_> = (0..pending).map(health_record).collect();
+            let mut sizes = Vec::new();
+            commit_health_samples(
+                &mut batch,
+                (pending..pending + 237).map(health_record),
+                original_cap,
+                current_cap,
+                |records| {
+                    sizes.push(records.len());
+                    let stats = store.commit(records)?;
+                    assert_eq!(stats.accepted, records.len());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(sizes, expected_sizes);
+            assert!(batch.is_empty());
+            let reader = rusqlite::Connection::open(&path).unwrap();
+            let timestamps = reader
+                .prepare("SELECT timestamp FROM samples ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(timestamps, (0..pending + 237).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn health_samples_stop_at_a_failed_commit() {
+        let mut batch = vec![health_record(0)];
+        let mut sizes = Vec::new();
+        let result =
+            commit_health_samples(&mut batch, (1..8).map(health_record), 2, 3, |records| {
+                sizes.push(records.len());
+                if sizes.len() == 2 {
+                    Err(MetricIngestError::Clock)
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(matches!(result, Err(MetricIngestError::Clock)));
+        assert_eq!(sizes, [2, 3]);
+        assert_eq!(batch, (2..5).map(health_record).collect::<Vec<_>>());
     }
 
     fn checkpoint(maintenance: &MetricMaintenanceSender) {
