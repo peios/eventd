@@ -16,6 +16,10 @@
     "system event sink silently destroys its audit history. RestartPolicy retries",
     "ordinary crashes before peinit applies the Critical failure policy.",
     "",
+    "LimitNOFILE supplies descriptor headroom for the default query concurrency",
+    "and up to 256 total active and historical event shards (eventd TRM 2.3).",
+    "Operators must size and override it for larger configurations.",
+    "",
     "SeAuditPrivilege must stay in RequiredPrivileges: KACS writes no audit record",
     "from the AccessCheck syscall path unless the caller holds it enabled, so",
     "without it the failure-audit SACLs on eventd's query descriptors record",
@@ -80,6 +84,11 @@
           "name": "ErrorControl",
           "type": "dword",
           "data": 1
+        },
+        {
+          "name": "LimitNOFILE",
+          "type": "dword",
+          "data": 262144
         },
         {
           "name": "DisplayName",
