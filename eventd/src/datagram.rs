@@ -482,11 +482,8 @@ mod tests {
     #[test]
     fn log_broker_descriptor_denies_services_before_allowing_system() {
         let descriptor = sddl::parse(LOG_BROKER_SDDL).expect("valid log broker descriptor");
-        let text = sddl::format(descriptor.as_bytes()).expect("format descriptor");
-        // libpeios 0.5.10 explicitly renders the absent SACL. The broker's
-        // DACL and ACE order are the contract tested here.
         assert_eq!(
-            text.strip_suffix("S:NO_ACCESS_CONTROL").unwrap_or(&text),
+            sddl::format(descriptor.as_bytes()).expect("format descriptor"),
             LOG_BROKER_SDDL
         );
     }
