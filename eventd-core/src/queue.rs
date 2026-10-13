@@ -3,10 +3,21 @@
 //! The fast path is lock-free. A mutex and condition variable are touched only
 //! after the queue applies backpressure or when an idle consumer sleeps.
 
+#[cfg(not(loom))]
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
+#[cfg(not(loom))]
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, fence},
+};
+#[cfg(not(loom))]
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,6 +57,7 @@ impl<T> BoundedQueue<T> {
                 byte_capacity: bytes,
                 closed: AtomicBool::new(false),
                 epoch: AtomicU64::new(0),
+                waiters: AtomicUsize::new(0),
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
             }),
@@ -154,6 +166,7 @@ struct Inner<T> {
     byte_capacity: usize,
     closed: AtomicBool,
     epoch: AtomicU64,
+    waiters: AtomicUsize,
     wait_lock: Mutex<()>,
     wake: Condvar,
 }
@@ -198,6 +211,9 @@ impl<T> Inner<T> {
                         // claim. Do not hand out a new permit after that
                         // race: the consumer may already have drained and
                         // exited. Dropping this permit cancels its slot.
+                        // Pair with is_drained's fence after it observes
+                        // closed: the claim and close cannot both be missed.
+                        fence(Ordering::SeqCst);
                         return if self.closed.load(Ordering::Acquire) {
                             Err(ReserveError::Closed)
                         } else {
@@ -209,7 +225,7 @@ impl<T> Inner<T> {
                     self.bytes_used.fetch_sub(bytes, Ordering::Release);
                     return Err(ReserveError::Full);
                 }
-                core::cmp::Ordering::Greater => core::hint::spin_loop(),
+                core::cmp::Ordering::Greater => queue_spin_loop(),
             }
         }
     }
@@ -232,7 +248,9 @@ impl<T> Inner<T> {
                 } else {
                     // SAFETY: the producer wrote exactly one T before publishing
                     // this sequence with Release; this is the single consumer.
-                    Some(unsafe { (*slot.value.get()).assume_init_read() })
+                    Some(with_slot_value(&slot.value, |value| unsafe {
+                        (*value).assume_init_read()
+                    }))
                 };
                 slot.sequence
                     .store(position.wrapping_add(self.capacity), Ordering::Release);
@@ -252,17 +270,33 @@ impl<T> Inner<T> {
                     Pop::Empty
                 };
             }
-            core::hint::spin_loop();
+            queue_spin_loop();
         }
     }
 
     fn is_drained(&self) -> bool {
+        // Called only after observing closed. Pair with the fence between a
+        // producer's claim and its closed re-check: either we see its claim,
+        // or it sees closed and cancels, so no accepted item is left behind.
+        fence(Ordering::SeqCst);
         self.dequeue.load(Ordering::Acquire) == self.enqueue.load(Ordering::Acquire)
     }
 
     fn notify_change(&self) {
         self.epoch.fetch_add(1, Ordering::Release);
-        self.wake.notify_all();
+        // Pair with the fence between waiter registration and its epoch
+        // check: either we see a waiter, or it sees the change and never parks.
+        fence(Ordering::SeqCst);
+        // Keep the fast path free of mutex acquisition when nobody is waiting.
+        if self.waiters.load(Ordering::Acquire) != 0 {
+            let _guard = self
+                .wait_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The waiter releases this mutex atomically with going to sleep,
+            // so notification cannot fall between its check and its wait.
+            self.wake.notify_all();
+        }
     }
 
     fn park_until_change(&self, observed: u64) {
@@ -270,13 +304,17 @@ impl<T> Inner<T> {
             .wait_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.epoch.load(Ordering::Acquire) == observed {
-            drop(
-                self.wake
-                    .wait(guard)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
+        self.waiters.fetch_add(1, Ordering::Release);
+        fence(Ordering::SeqCst);
+        let guard = if self.epoch.load(Ordering::Acquire) == observed {
+            self.wake
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            guard
+        };
+        self.waiters.fetch_sub(1, Ordering::Release);
+        drop(guard);
     }
 
     fn park_until_change_or(&self, observed: u64, timeout: Duration) {
@@ -284,13 +322,18 @@ impl<T> Inner<T> {
             .wait_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.epoch.load(Ordering::Acquire) == observed {
-            drop(
-                self.wake
-                    .wait_timeout(guard, timeout)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
+        self.waiters.fetch_add(1, Ordering::Release);
+        fence(Ordering::SeqCst);
+        let guard = if self.epoch.load(Ordering::Acquire) == observed {
+            self.wake
+                .wait_timeout(guard, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0
+        } else {
+            guard
+        };
+        self.waiters.fetch_sub(1, Ordering::Release);
+        drop(guard);
     }
 }
 
@@ -305,7 +348,9 @@ impl<T> Drop for Inner<T> {
             {
                 // SAFETY: final Arc ownership proves no concurrent access, and a
                 // published, non-cancelled slot contains one initialized T.
-                unsafe { (*slot.value.get()).assume_init_drop() };
+                with_slot_value(&slot.value, |value| unsafe {
+                    (*value).assume_init_drop();
+                });
             }
             position = position.wrapping_add(1);
         }
@@ -320,7 +365,9 @@ struct Slot<T> {
 }
 
 impl<T> Slot<T> {
-    const fn new(sequence: usize) -> Self {
+    // Loom atomics must be constructed at runtime inside a model.
+    #[allow(clippy::missing_const_for_fn)]
+    fn new(sequence: usize) -> Self {
         Self {
             sequence: AtomicUsize::new(sequence),
             bytes: AtomicUsize::new(0),
@@ -348,7 +395,9 @@ impl<T> Permit<'_, T> {
     pub fn publish(mut self, value: T) {
         // SAFETY: this permit uniquely owns the reserved slot until the Release
         // publication below.
-        unsafe { (*self.slot.value.get()).write(value) };
+        with_slot_value(&self.slot.value, |slot| unsafe {
+            (*slot).write(value);
+        });
         self.slot.bytes.store(self.bytes, Ordering::Relaxed);
         self.slot.cancelled.store(false, Ordering::Relaxed);
         self.slot
@@ -422,11 +471,33 @@ impl fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn no_waiter_fast_path_does_not_take_the_wait_mutex() {
+        let queue = BoundedQueue::new(2, 2).unwrap();
+        let guard = queue.inner.wait_lock.lock().unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let worker = queue.clone();
+            let handle = scope.spawn(move || {
+                worker.try_reserve(1).unwrap().publish(7);
+                assert_eq!(worker.pop(), Pop::Item(7));
+                worker.close();
+                assert_eq!(worker.pop(), Pop::Closed);
+                done.send(()).unwrap();
+            });
+            let finished = result.recv_timeout(Duration::from_secs(10));
+            // Release on failure too, so an unwanted lock cannot hang the test.
+            drop(guard);
+            handle.join().unwrap();
+            finished.unwrap();
+        });
+    }
 
     #[test]
     fn enforces_slot_and_byte_bounds_before_publish() {
@@ -528,5 +599,85 @@ mod tests {
             });
             assert_eq!(drained, published.load(Ordering::Relaxed));
         }
+    }
+}
+
+// Loom needs an explicit scheduling point in retry loops.
+fn queue_spin_loop() {
+    #[cfg(loom)]
+    loom::thread::yield_now();
+    #[cfg(not(loom))]
+    core::hint::spin_loop();
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    #[test]
+    fn publish_wakes_an_idle_consumer() {
+        loom::model(|| {
+            let queue = BoundedQueue::new(2, 2).unwrap();
+            let producer = queue.clone();
+            let sender = thread::spawn(move || producer.reserve(1).unwrap().publish(7));
+            assert_eq!(queue.pop_wait(), Pop::Item(7));
+            sender.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn freed_capacity_wakes_a_blocked_producer() {
+        loom::model(|| {
+            let queue = BoundedQueue::new(2, 1).unwrap();
+            queue.reserve(1).unwrap().publish(1);
+            let producer = queue.clone();
+            let sender = thread::spawn(move || producer.reserve(1).unwrap().publish(2));
+            assert_eq!(queue.pop_wait(), Pop::Item(1));
+            assert_eq!(queue.pop_wait(), Pop::Item(2));
+            sender.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn close_cannot_leave_an_admitted_item_behind() {
+        loom::model(|| {
+            let queue = BoundedQueue::new(2, 2).unwrap();
+            let producer = queue.clone();
+            let sender = thread::spawn(move || match producer.try_reserve(1) {
+                Ok(permit) => {
+                    permit.publish(7);
+                    true
+                }
+                Err(ReserveError::Closed) => false,
+                Err(error) => panic!("unexpected reservation failure: {error}"),
+            });
+            queue.close();
+            let mut received = 0;
+            loop {
+                match queue.pop_wait() {
+                    Pop::Item(7) => received += 1,
+                    Pop::Closed => break,
+                    other => panic!("unexpected queue result: {other:?}"),
+                }
+            }
+            assert_eq!(received, usize::from(sender.join().unwrap()));
+        });
+    }
+}
+
+// Keep payload accesses inside Loom's tracking guard while using the same
+// release/acquire ownership protocol and payload operations in both builds.
+fn with_slot_value<T, R>(
+    value: &UnsafeCell<MaybeUninit<T>>,
+    access: impl FnOnce(*mut MaybeUninit<T>) -> R,
+) -> R {
+    #[cfg(loom)]
+    {
+        value.with_mut(access)
+    }
+    #[cfg(not(loom))]
+    {
+        access(value.get())
     }
 }

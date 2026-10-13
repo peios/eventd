@@ -40,3 +40,20 @@ hardware before changing queue, batch or SQLite parameters. `pekit build`
 produces the release tree and `pekit package --version <version>` produces the
 Peios package, including `evctl`, the inert registry seeds and the standard
 `/var/state/eventd/{events,logs,metrics}` directory skeleton.
+
+The check also runs the queue's Loom models in a separate target directory.
+They explore publication to an idle consumer, capacity release to a blocked
+producer, and reservation racing with close, using the actual queue code and
+instrumented atomics, payload cells, mutexes and condition variables. To run
+only these models:
+
+```sh
+CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \
+  cargo test --locked -p eventd-core --lib queue::loom_tests -- --test-threads=1
+```
+
+The production handshake uses explicit sequentially consistent fences.
+Loom 0.7.2 models these fences; its documented treatment of `SeqCst` accesses
+as weaker orderings cannot validate an accesses-only implementation. These
+bounded models supplement the host stress and timeout tests; they are not
+hardware qualification or an exhaustive proof of the entire daemon.

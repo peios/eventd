@@ -22,6 +22,7 @@ peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "f8c84930f2b7
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 

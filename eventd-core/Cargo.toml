@@ -18,3 +18,6 @@ workspace = true
 [[bench]]
 name = "hot_path"
 harness = false
+
+[dev-dependencies]
+loom = "0.7.2"
