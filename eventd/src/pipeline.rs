@@ -109,7 +109,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         restart |= Shard::historical_contains_boot(path, &boot_id).unwrap_or(false);
         historical_paths.push(path.clone());
     }
-    eprintln!(
+    println!(
         "eventd: {} with {cpu_count} KMES buffer(s), {shard_count} active shard(s); sockets {}, {}, {}",
         if restart { "restarting" } else { "starting" },
         config.query_socket_path.display(),
