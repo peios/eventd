@@ -2794,6 +2794,14 @@ impl Fold {
     }
 
     fn push(&mut self, point: &MetricPoint) {
+        // A result may combine identifiers with different field grants.
+        // Keep a header only if every contributing source exposed it.
+        for field in ["timestamp", "name", "type"] {
+            if !point.row.record.contains_key(field) {
+                self.template.record.remove(field);
+            }
+        }
+
         if matches!(point.row.record.get("overflow"), Some(Value::Bool(true))) {
             self.overflow = true;
         }
@@ -3985,12 +3993,15 @@ fn metric_aggregate_row(
         Record::new()
     };
     record.remove("boot_id");
-    record.insert("timestamp".into(), Value::Signed(output_timestamp));
-    record.insert("name".into(), Value::String(output_name.to_owned()));
-    record.insert(
-        "type".into(),
-        Value::String(metric_type_name(metric_type)?.into()),
-    );
+    for (field, value) in [
+        ("timestamp", Value::Signed(output_timestamp)),
+        ("name", Value::String(output_name.to_owned())),
+        ("type", Value::String(metric_type_name(metric_type)?.into())),
+    ] {
+        if template.record.contains_key(field) {
+            record.insert(field.into(), value);
+        }
+    }
     let overflow = matches!(value, Value::Null);
     set_metric_result(&mut record, value, overflow);
     Ok(Row {
@@ -5632,6 +5643,92 @@ mod tests {
             [5_000],
             "a window takes it by its time"
         );
+    }
+
+    // The rows reaching aggregation have already passed field authorization.
+    // Derived metadata must not reconstruct a source header removed there.
+    #[test]
+    fn metric_aggregates_keep_each_denied_source_header_absent() {
+        for denied in ["timestamp", "name", "type"] {
+            for retain_labels in [false, true] {
+                let mut template = metric_template("test", 1, &Record::new()).unwrap();
+                template.record.remove(denied);
+                let row = metric_aggregate_row(
+                    &template,
+                    Value::Float(12.0),
+                    5_000,
+                    retain_labels,
+                    "test",
+                    1,
+                    7,
+                )
+                .unwrap();
+                assert!(!row.record.contains_key(denied), "{denied} was denied");
+                for visible in ["timestamp", "name", "type"] {
+                    if visible != denied {
+                        assert!(row.record.contains_key(visible), "{visible} is authorized");
+                    }
+                }
+                assert_eq!(row.record.get("value"), Some(&Value::Float(12.0)));
+                assert_eq!(timestamp(&row), 5_000, "internal ordering time is retained");
+            }
+        }
+    }
+
+    #[test]
+    fn metric_windows_only_expose_headers_visible_in_every_contributing_source() {
+        for hidden_first in [false, true] {
+            let budget = budget(usize::MAX);
+            let mut held = Held::new(&budget);
+            let mut windows = Windows::new(1_000);
+            for (index, hidden) in [hidden_first, !hidden_first].into_iter().enumerate() {
+                let mut row =
+                    metric_template(if hidden { "hidden" } else { "visible" }, 1, &Record::new())
+                        .unwrap();
+                row.at = 5_100 + i64::try_from(index).unwrap();
+                row.record.insert("timestamp".into(), Value::Signed(row.at));
+                row.record.insert("value".into(), Value::Signed(6));
+                if hidden {
+                    for field in ["timestamp", "name", "type"] {
+                        row.record.remove(field);
+                    }
+                }
+                windows
+                    .push(
+                        &MetricPoint {
+                            row,
+                            adjusted_delta: None,
+                            elapsed_ns: None,
+                        },
+                        &mut held,
+                    )
+                    .unwrap();
+            }
+            let rows = windows
+                .rows(
+                    AggregateFunction::Sum,
+                    None,
+                    false,
+                    Some("*"),
+                    1,
+                    None,
+                    &mut held,
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].record.get("value"), Some(&Value::Signed(12)));
+            assert_eq!(
+                timestamp(&rows[0]),
+                5_000,
+                "window placement uses the private timestamp"
+            );
+            for field in ["timestamp", "name", "type"] {
+                assert!(
+                    !rows[0].record.contains_key(field),
+                    "{field} cannot be restored from the first contributor"
+                );
+            }
+        }
     }
 
     // PEI-1295, TRM §6.2: metric rows tie-break on timestamp, name,
