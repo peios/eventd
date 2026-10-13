@@ -436,10 +436,10 @@ fn describe_lost(pending: &[(u16, Gap)]) -> String {
         .join(", ")
 }
 
-fn request_retention(requested: &AtomicBool, store: &str, error: &ShardError) {
+fn request_retention(requested: &AtomicBool, outcome: &str, error: &ShardError) {
     crate::diagnostics::event_error(error);
     requested.store(true, Ordering::Release);
-    eprintln!("eventd: {store} store is full; batch discarded and retention requested: {error}");
+    eprintln!("eventd: event store is full; {outcome}; retention requested: {error}");
 }
 
 fn recover_corruption(
@@ -464,7 +464,11 @@ fn recover_corruption(
     match shard.commit_synthetic(&event) {
         Ok(()) => commits.committed(),
         Err(write_error) if write_error.is_capacity() => {
-            request_retention(retention_requested, "event", &write_error);
+            request_retention(
+                retention_requested,
+                "quarantine report write failed",
+                &write_error,
+            );
         }
         Err(write_error) => return Err(write_error),
     }
@@ -581,7 +585,11 @@ fn handle_synthetic(
         Err(error) if error.is_capacity() => {
             // Not stored: say so, and the sender tries the next shard
             // (TRM §2.6). The writer itself carries on.
-            request_retention(context.retention_requested, "event", &error);
+            request_retention(
+                context.retention_requested,
+                "synthetic event write failed",
+                &error,
+            );
             let _ = sender.send(Err(error.to_string()));
             Ok(())
         }
@@ -601,7 +609,11 @@ fn handle_synthetic(
                     Ok(())
                 }
                 Err(retry) if retry.is_capacity() => {
-                    request_retention(context.retention_requested, "event", &retry);
+                    request_retention(
+                        context.retention_requested,
+                        "synthetic event write failed",
+                        &retry,
+                    );
                     let _ = sender.send(Err(retry.to_string()));
                     Ok(())
                 }
@@ -645,7 +657,7 @@ fn handle_maintenance(
         }
         Err(error) if error.is_capacity() => {
             let _ = sender.send(Err(error.to_string()));
-            request_retention(context.retention_requested, "event", &error);
+            request_retention(context.retention_requested, "maintenance failed", &error);
             Ok(())
         }
         Err(error) if error.is_corruption() => {
