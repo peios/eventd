@@ -576,7 +576,10 @@ const FIELD_SLOT: usize = (size_of::<String>() + size_of::<Value>()) * 2;
 /// the dev VM, a sort gathering event rows until the budget refused it
 /// grew eventd by 1.07 to 1.12 times the budget.
 fn row_size(row: &Row) -> usize {
-    size_of::<Row>() + heap(row.identifier.len()) + record_size(&row.record)
+    size_of::<Row>()
+        + heap(row.identifier.len())
+        + heap(row.metric_labels.len())
+        + record_size(&row.record)
 }
 
 fn record_size(record: &Record) -> usize {
@@ -1268,6 +1271,10 @@ struct Row {
     /// sample's `timestamp`): an internal key with no
     /// access-control identity, like `tie` (TRM §6.2).
     at: i64,
+    /// Canonical metric labels before field filtering. This private key
+    /// preserves the TRM §6.2 tiebreak even when label fields are denied.
+    /// Empty for event/log rows and aggregates that do not retain labels.
+    metric_labels: Box<[u8]>,
     tie: Tie,
 }
 
@@ -1465,6 +1472,7 @@ fn next_event(
             record,
             identifier,
             at: timestamp,
+            metric_labels: Box::default(),
             tie: Tie::Event { shard, id },
         }));
     }
@@ -1663,6 +1671,7 @@ fn scan_logs(
             record,
             identifier,
             at: timestamp,
+            metric_labels: Box::default(),
             tie: Tie::Single(id),
         };
         if visit(row)? == Flow::Enough {
@@ -2216,6 +2225,7 @@ impl<'q> Groups<'q> {
                 identifier: String::new(),
                 // A group is no record and has no time of its own.
                 at: 0,
+                metric_labels: Box::default(),
                 tie: Tie::Single(i64::try_from(index).unwrap_or(i64::MAX)),
             })
             .collect())
@@ -3509,6 +3519,7 @@ fn metric_template(name: &str, metric_type: i64, labels: &Record) -> Result<Row,
         record,
         identifier: name.to_owned(),
         at: 0,
+        metric_labels: canonical_labels(labels).collect(),
         tie: Tie::Single(0),
     })
 }
@@ -3587,6 +3598,7 @@ fn read_metric_input(
             record,
             identifier: name.to_owned(),
             at: timestamp,
+            metric_labels: canonical_labels(labels).collect(),
             tie: Tie::Single(id),
         },
         number,
@@ -3686,6 +3698,7 @@ fn transform_metric_inputs(
                     record: later.row.record.clone(),
                     identifier: later.row.identifier.clone(),
                     at: later.row.at,
+                    metric_labels: later.row.metric_labels.clone(),
                     tie: later.row.tie,
                 };
                 row.record.insert("value".into(), finite_value(value)?);
@@ -3984,6 +3997,11 @@ fn metric_aggregate_row(
         record,
         identifier: output_name.to_owned(),
         at: output_timestamp,
+        metric_labels: if retain_labels {
+            template.metric_labels.clone()
+        } else {
+            Box::default()
+        },
         tie: Tie::Single(tie),
     })
 }
@@ -4105,7 +4123,7 @@ fn sort_metric_rows(rows: &mut [Row], query: &Query) {
         sort_key_order(left, right, query)
             .then_with(|| timestamp(left).cmp(&timestamp(right)))
             .then_with(|| left.identifier.cmp(&right.identifier))
-            .then_with(|| canonical_labels(left).cmp(canonical_labels(right)))
+            .then_with(|| left.metric_labels.cmp(&right.metric_labels))
             .then_with(|| left.tie.cmp(&right.tie))
     });
 }
@@ -4113,11 +4131,11 @@ fn sort_metric_rows(rows: &mut [Row], query: &Query) {
 /// The fields of a metric record that are not labels (PSPU §3.22).
 const METRIC_FIELDS: [&str; 6] = ["timestamp", "boot_id", "name", "type", "value", "overflow"];
 
-/// The bytes of a metric row's canonical label string: its labels sorted
-/// by key, each `key=value`, joined with commas (PSPU §3.13). A record's
-/// map is already in key byte order.
-fn canonical_labels(row: &Row) -> impl Iterator<Item = u8> + '_ {
-    row.record
+/// Capture canonical labels before access filtering: sorted by key,
+/// each `key=value`, joined with commas (PSPU §3.13). The record's map
+/// is already in key byte order.
+fn canonical_labels(record: &Record) -> impl Iterator<Item = u8> + '_ {
+    record
         .iter()
         .filter(|(key, _)| !METRIC_FIELDS.contains(&key.as_str()))
         .enumerate()
@@ -4475,6 +4493,7 @@ mod tests {
                 record: BTreeMap::from([("n".into(), Value::Signed(i64::try_from(i).unwrap()))]),
                 identifier: "t".into(),
                 at: i64::try_from(i).unwrap(),
+                metric_labels: Box::default(),
                 tie,
             })
             .collect();
@@ -4673,6 +4692,7 @@ mod tests {
             ]),
             identifier: "t".into(),
             at: timestamp,
+            metric_labels: Box::default(),
             tie: Tie::Event { shard, id },
         };
         // The older event in the lower shard, the newer in the higher, and
@@ -4705,6 +4725,7 @@ mod tests {
             ]),
             identifier: "o".into(),
             at: timestamp,
+            metric_labels: Box::default(),
             tie: Tie::Single(id),
         };
         // The newer line inserted first: row id and time disagree.
@@ -4955,6 +4976,7 @@ mod tests {
                         };
                         MetricInput {
                             row: Row {
+                                metric_labels: canonical_labels(&record).collect(),
                                 record,
                                 identifier: name.into(),
                                 at,
@@ -5556,6 +5578,7 @@ mod tests {
             ]),
             identifier: "test".into(),
             at: timestamp,
+            metric_labels: Box::default(),
             tie: Tie::Single(timestamp),
         }
     }
@@ -5623,6 +5646,7 @@ mod tests {
                 row.record
                     .insert((*key).into(), Value::String((*value).into()));
             }
+            row.metric_labels = canonical_labels(&row.record).collect();
             row.tie = Tie::Single(id);
             row
         };
@@ -5658,6 +5682,48 @@ mod tests {
             sample("m", &[("k", "b")], 5, 0),
         ];
         assert_eq!(order("METRIC m[] SORT value", rows), [3, 0, 2, 1]);
+    }
+
+    #[test]
+    fn hidden_labels_preserve_metric_tiebreaks_through_per_series_aggregation() {
+        let sample = |label: &str, id| {
+            let labels = BTreeMap::from([("k".into(), Value::String(label.into()))]);
+            let mut row = metric_template("m", 1, &labels).unwrap();
+            row.tie = Tie::Single(id);
+            // What authorize_row leaves after denying k.
+            row.record.remove("k");
+            row
+        };
+        let raw = vec![sample("b", 1), sample("a", 2)];
+        let aggregate = |retain_labels| {
+            raw.iter()
+                .map(|row| {
+                    metric_aggregate_row(
+                        row,
+                        Value::Float(1.0),
+                        0,
+                        retain_labels,
+                        "m",
+                        1,
+                        row_id(row),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        for mut rows in [raw.clone(), aggregate(true)] {
+            sort_metric_rows(
+                &mut rows,
+                &crate::query_language::parse("METRIC m[]").unwrap(),
+            );
+            assert_eq!(rows.iter().map(row_id).collect::<Vec<_>>(), [2, 1]);
+            assert!(rows.iter().all(|row| !row.record.contains_key("k")));
+        }
+        assert!(
+            aggregate(false)
+                .iter()
+                .all(|row| row.metric_labels.is_empty())
+        );
     }
 
     fn test_histogram(total_count: u64, final_count: u64) -> Vec<u8> {
@@ -5734,6 +5800,7 @@ mod tests {
                     record,
                     identifier: "t".into(),
                     at: 0,
+                    metric_labels: Box::default(),
                     tie: Tie::Single(index),
                 }
             })
@@ -5920,6 +5987,7 @@ mod tests {
                 record,
                 identifier: String::new(),
                 at: 0,
+                metric_labels: Box::default(),
                 tie: Tie::Single(i64::try_from(index).unwrap()),
             })
             .collect();
@@ -6084,6 +6152,7 @@ mod tests {
                 record: BTreeMap::from([("n".into(), Value::Signed((index * 7_919) % 5_003))]),
                 identifier: "t".into(),
                 at: 0,
+                metric_labels: Box::default(),
                 tie: Tie::Single(index),
             })
             .collect();
@@ -6145,6 +6214,7 @@ mod tests {
                     ]),
                     identifier: "t".into(),
                     at: 0,
+                    metric_labels: Box::default(),
                     tie: Tie::Single(i64::try_from(index).unwrap()),
                 };
                 groups.add(&row, &mut held).unwrap();
@@ -6202,6 +6272,7 @@ mod tests {
                 record: BTreeMap::from([("k".into(), Value::String(format!("value {index}")))]),
                 identifier: "t".into(),
                 at: 0,
+                metric_labels: Box::default(),
                 tie: Tie::Single(index),
             };
             groups.add(&row, &mut held).err()
