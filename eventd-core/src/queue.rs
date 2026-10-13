@@ -664,6 +664,41 @@ mod loom_tests {
             assert_eq!(received, usize::from(sender.join().unwrap()));
         });
     }
+
+    // Shutdown closes the queue from the pipeline thread while the writer
+    // drains it. With the closer on the consumer thread, notify_change's
+    // fence already orders its closed store before the drained check; only a
+    // separate closer depends on is_drained's own fence. Three threads need a
+    // preemption bound to keep the model fast.
+    #[test]
+    fn close_from_another_thread_cannot_leave_an_admitted_item_behind() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let queue = BoundedQueue::new(2, 2).unwrap();
+            let producer = queue.clone();
+            let closer = queue.clone();
+            let sender = thread::spawn(move || match producer.try_reserve(1) {
+                Ok(permit) => {
+                    permit.publish(7);
+                    true
+                }
+                Err(ReserveError::Closed) => false,
+                Err(error) => panic!("unexpected reservation failure: {error}"),
+            });
+            let closing = thread::spawn(move || closer.close());
+            let mut received = 0;
+            loop {
+                match queue.pop_wait() {
+                    Pop::Item(7) => received += 1,
+                    Pop::Closed => break,
+                    other => panic!("unexpected queue result: {other:?}"),
+                }
+            }
+            closing.join().unwrap();
+            assert_eq!(received, usize::from(sender.join().unwrap()));
+        });
+    }
 }
 
 // Keep payload accesses inside Loom's tracking guard while using the same

@@ -43,9 +43,9 @@ Peios package, including `evctl`, the inert registry seeds and the standard
 
 The check also runs the queue's Loom models in a separate target directory.
 They explore publication to an idle consumer, capacity release to a blocked
-producer, and reservation racing with close, using the actual queue code and
-instrumented atomics, payload cells, mutexes and condition variables. To run
-only these models:
+producer, and reservation racing with a close made by the consumer or by
+another thread, using the actual queue code and instrumented atomics, payload
+cells, mutexes and condition variables. To run only these models:
 
 ```sh
 CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \
