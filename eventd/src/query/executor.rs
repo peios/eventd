@@ -2158,8 +2158,7 @@ impl<'q> Groups<'q> {
     }
 
     /// The result rows: `COUNT BY`, `TOP N BY` and `GROUP … COUNT` by
-    /// count descending, `DISTINCT` by value, any other `GROUP` in the
-    /// order its groups appeared.
+    /// count descending, `DISTINCT` by value, numeric `GROUP` by keys.
     fn finish(mut self) -> Result<Vec<Row>, QueryError> {
         let records = match self.aggregate {
             RecordAggregate::CountBy(field) => counted(field, self.seen, None),
@@ -2177,22 +2176,25 @@ impl<'q> Groups<'q> {
                     .collect()
             }
             RecordAggregate::Group { fields, function } => {
-                // Counted groups come by count descending, then TAKE (TRM
-                // §6.4); ties go by the group keys in GROUP order under the
-                // value ordering, as COUNT BY's do (PSPU §3.21). Distinct
-                // groups differ in some key, so the order is total.
-                if matches!(function, GroupFunction::Count) {
-                    self.seen.sort_by(|left, right| {
-                        right.count.cmp(&left.count).then_with(|| {
-                            left.keys
-                                .iter()
-                                .zip(&right.keys)
-                                .map(|(left, right)| language_cmp(left, right))
-                                .find(|ordering| ordering.is_ne())
-                                .unwrap_or(Ordering::Equal)
-                        })
-                    });
-                }
+                // COUNT sorts by count descending; numeric groups sort by
+                // their keys. Both use keys in GROUP order to break ties
+                // before pagination (PSPU §3.21). Distinct groups differ in
+                // some key, so the order is total.
+                self.seen.sort_by(|left, right| {
+                    let count_order = if matches!(function, GroupFunction::Count) {
+                        right.count.cmp(&left.count)
+                    } else {
+                        Ordering::Equal
+                    };
+                    count_order.then_with(|| {
+                        left.keys
+                            .iter()
+                            .zip(&right.keys)
+                            .map(|(left, right)| language_cmp(left, right))
+                            .find(|ordering| ordering.is_ne())
+                            .unwrap_or(Ordering::Equal)
+                    })
+                });
                 let mut records = Vec::with_capacity(self.seen.len());
                 for group in self.seen {
                     let (name, value) = match function {
@@ -5915,7 +5917,8 @@ mod tests {
     }
 
     // What eventd did before it folded: every group compared in turn, and
-    // a GROUP's rows kept until the end. The fold must agree exactly.
+    // a GROUP's rows kept until the end. Normalise its output to the current
+    // default order; the fold must still agree on every group and value.
     #[allow(
         clippy::too_many_lines,
         clippy::cast_precision_loss,
@@ -5954,21 +5957,20 @@ mod tests {
                 groups.push((keys, vec![row]));
             }
         }
-        if let RecordAggregate::Group {
-            function: GroupFunction::Count,
-            ..
-        } = aggregate
-        {
+        if let RecordAggregate::Group { function, .. } = aggregate {
             groups.sort_by(|left, right| {
-                right.1.len().cmp(&left.1.len()).then_with(|| {
-                    left.0
-                        .iter()
-                        .zip(&right.0)
-                        .map(|(left, right)| language_cmp(left, right))
-                        .find(|ordering| ordering.is_ne())
-                        .unwrap_or(Ordering::Equal)
-                })
+                for (left, right) in left.0.iter().zip(&right.0) {
+                    let order = language_cmp(left, right);
+                    if order.is_ne() {
+                        return order;
+                    }
+                }
+                Ordering::Equal
             });
+            if matches!(function, GroupFunction::Count) {
+                // Stable sorting retains key order for equal counts.
+                groups.sort_by_key(|group| std::cmp::Reverse(group.1.len()));
+            }
         }
         let records: Vec<Record> = match aggregate {
             RecordAggregate::CountBy(field) | RecordAggregate::TopBy { field, .. } => {
@@ -6356,6 +6358,119 @@ mod tests {
             grouped("EVENTS GROUP v, w COUNT", &read),
             ["a1", "a2", "b1", "b2"]
         );
+    }
+
+    #[test]
+    fn numeric_groups_sort_by_keys_before_pagination_regardless_of_input_order() {
+        let values = [("z", 2), ("a", 2), ("z", 1), ("a", 1)];
+        for function in ["SUM", "AVG", "MIN", "MAX"] {
+            for offset in 0..values.len() {
+                for (suffix, expected) in [
+                    ("", vec![("a", 1), ("a", 2), ("z", 1), ("z", 2)]),
+                    (" SKIP 1 TAKE 2", vec![("a", 2), ("z", 1)]),
+                    (" SORT {aggregate} SKIP 1 TAKE 2", vec![("a", 2), ("z", 1)]),
+                    (
+                        " SORT v DESC, w",
+                        vec![("z", 1), ("z", 2), ("a", 1), ("a", 2)],
+                    ),
+                ] {
+                    let suffix = suffix.replace("{aggregate}", &function.to_ascii_lowercase());
+                    let query = crate::query_language::parse(&format!(
+                        "EVENTS GROUP v, w {function} n{suffix}"
+                    ))
+                    .unwrap();
+                    let budget = budget(usize::MAX);
+                    let mut held = Held::new(&budget);
+                    let mut groups = Groups::new(query.aggregate.as_ref().unwrap());
+                    for index in 0..values.len() {
+                        let (v, w) = values[(index + offset) % values.len()];
+                        groups
+                            .add(
+                                &Row {
+                                    record: BTreeMap::from([
+                                        ("v".into(), Value::String(v.into())),
+                                        ("w".into(), Value::Signed(w)),
+                                        ("n".into(), Value::Signed(10)),
+                                    ]),
+                                    identifier: "t".into(),
+                                    at: 0,
+                                    metric_labels: Box::default(),
+                                    tie: Tie::Single(0),
+                                },
+                                &mut held,
+                            )
+                            .unwrap();
+                    }
+                    let mut rows = groups.finish().unwrap();
+                    apply_record_sort(&mut rows, &query);
+                    apply_pagination(&mut rows, &query);
+                    let got: Vec<_> = rows
+                        .iter()
+                        .map(|row| (row.record["v"].clone(), row.record["w"].clone()))
+                        .collect();
+                    let expected: Vec<_> = expected
+                        .into_iter()
+                        .map(|(v, w)| (Value::String(v.into()), Value::Signed(w)))
+                        .collect();
+                    assert_eq!(got, expected, "{function}{suffix}, rotation {offset}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_groups_use_language_order_and_declared_key_priority() {
+        // Type order, mathematical numeric order, and ASCII-folded text
+        // order all differ from sorting encoded values or arrival order.
+        let values = [
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Signed(-2),
+            Value::Float(0.5),
+            Value::Unsigned(3),
+            Value::String("a".into()),
+            Value::String("Z".into()),
+            Value::Binary(vec![0]),
+        ];
+        for function in ["SUM", "AVG", "MIN", "MAX"] {
+            for fields in ["z, a", "a, z"] {
+                let query =
+                    crate::query_language::parse(&format!("EVENTS GROUP {fields} {function} n"))
+                        .unwrap();
+                let budget = budget(usize::MAX);
+                let mut held = Held::new(&budget);
+                let mut groups = Groups::new(query.aggregate.as_ref().unwrap());
+                for (index, value) in values.iter().enumerate().rev() {
+                    groups
+                        .add(
+                            &Row {
+                                record: BTreeMap::from([
+                                    ("z".into(), value.clone()),
+                                    (
+                                        "a".into(),
+                                        Value::Unsigned(100 - u64::try_from(index).unwrap()),
+                                    ),
+                                    ("n".into(), Value::Signed(10)),
+                                ]),
+                                identifier: "t".into(),
+                                at: 0,
+                                metric_labels: Box::default(),
+                                tie: Tie::Single(0),
+                            },
+                            &mut held,
+                        )
+                        .unwrap();
+                }
+                let rows = groups.finish().unwrap();
+                let got: Vec<_> = rows.iter().map(|row| row.record["z"].clone()).collect();
+                let mut expected = values.to_vec();
+                if fields == "a, z" {
+                    expected.reverse();
+                }
+                assert_eq!(got, expected, "{fields} {function}");
+            }
+        }
     }
 
     #[test]
