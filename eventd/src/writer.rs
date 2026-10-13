@@ -29,6 +29,21 @@ pub enum WriterMessage {
     IndexPolicy(Arc<[DesiredIndex]>),
 }
 
+/// The writer is the queue's sole consumer, including during teardown.
+/// Closing alone wakes producers but leaves queued reply senders alive.
+/// Drain them on every exit so callers observe failure, not an endless wait.
+struct WriterExit<'a>(&'a BoundedQueue<WriterMessage>);
+
+impl Drop for WriterExit<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+        // A producer may already hold a permit. Wait for its publication or
+        // cancellation before declaring the queue drained; merely popping
+        // the currently visible prefix can strand a later control reply.
+        while let Pop::Item(_) = self.0.pop_wait() {}
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EventMaintenance {
     DeleteBefore { cutoff: i64, limit: usize },
@@ -59,6 +74,7 @@ pub fn run(
     ring_pressure: &Arc<[AtomicU8]>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), ShardError> {
+    let _exit = WriterExit(queue);
     let mut batch = Vec::with_capacity(Config::read(runtime, |config| config.max_batch_size));
     let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
@@ -785,6 +801,105 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn a_failed_writer_releases_all_pending_control_replies() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let directory = temporary_directory();
+        let path = directory.join("shard-0000.db");
+        let shard = Shard::open(&path, 1_000).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_event BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(FAIL, 'injected writer failure'); END;",
+            )
+            .unwrap();
+        let queue = handoff();
+        let (barrier, barrier_result) = sync_channel(1);
+        let (synthetic, synthetic_result) = sync_channel(1);
+        let (maintenance, maintenance_result) = sync_channel(1);
+        publish(&queue, real_event(1));
+        publish(&queue, WriterMessage::Barrier(barrier));
+        publish(
+            &queue,
+            WriterMessage::Synthetic(
+                crate::synthetic::shutdown([1; 16], Some(&[(0, 1)]), 1),
+                synthetic,
+            ),
+        );
+        delete_before(&queue, 1_000, 100, maintenance);
+        let harness = Harness::new();
+        let error = harness.run(shard, &queue, &batched_by_size(1)).unwrap_err();
+        assert!(error.to_string().contains("injected writer failure"));
+        assert!(harness.stopping.load(Ordering::Acquire));
+        for result in [barrier_result, synthetic_result] {
+            assert_eq!(
+                result.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Disconnected),
+                "a dead writer must not keep a control caller waiting",
+            );
+        }
+        assert_eq!(
+            maintenance_result.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Disconnected),
+        );
+        assert!(matches!(
+            queue.try_reserve(1),
+            Err(eventd_core::ReserveError::Closed)
+        ));
+        assert!(queue.is_empty());
+        assert_eq!(stored_events(&path), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn writer_exit_wakes_blocked_producers_and_releases_late_control_replies() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        for publish_late in [false, true] {
+            let queue = BoundedQueue::new(2, 1_024).unwrap();
+            let held = queue.reserve(1).unwrap();
+            let (reply, result) = sync_channel(1);
+            publish(&queue, WriterMessage::Barrier(reply));
+            let (started, starting) = sync_channel(0);
+            let (reserved, reservation) = sync_channel(1);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started.send(()).unwrap();
+                    reserved.send(queue.reserve(1).err()).unwrap();
+                });
+                starting.recv().unwrap();
+                assert_eq!(
+                    reservation.recv_timeout(Duration::from_millis(20)),
+                    Err(RecvTimeoutError::Timeout),
+                    "a full healthy queue still applies backpressure",
+                );
+                let exiting = scope.spawn(|| drop(WriterExit(&queue)));
+                assert_eq!(
+                    reservation.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Some(eventd_core::ReserveError::Closed),
+                );
+                let (late_reply, late_result) = sync_channel(1);
+                if publish_late {
+                    held.publish(WriterMessage::Barrier(late_reply));
+                } else {
+                    drop(held);
+                    drop(late_reply);
+                }
+                for result in [result, late_result] {
+                    assert_eq!(
+                        result.recv_timeout(Duration::from_secs(5)),
+                        Err(RecvTimeoutError::Disconnected),
+                    );
+                }
+                exiting.join().unwrap();
+            });
+            assert!(queue.is_empty());
+            assert_eq!(queue.bytes_used(), 0);
+        }
     }
 
     #[test]
