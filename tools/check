@@ -21,3 +21,9 @@ cd "$repo"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+
+# Model the actual queue with instrumented atomics, payload cells and waits.
+# Keep cfg(loom) artifacts separate from ordinary workspace builds.
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}/loom" \
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg loom" \
+cargo test --locked -p eventd-core --lib queue::loom_tests -- --test-threads=1
