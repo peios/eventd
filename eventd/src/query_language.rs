@@ -342,14 +342,56 @@ fn parse_hex(bytes: &[u8]) -> Result<u32, ParseError> {
     Ok(value)
 }
 
+// Bound both parser recursion through parentheses and the constructed boolean tree.
+// Flat AND/OR chains are parsed iteratively but later traversal, clone and Drop recurse.
+const MAX_EXPRESSION_DEPTH: usize = 128;
+
+/// A partially parsed expression whose tree depth has already been checked.
+struct ParsedExpr {
+    value: Expr,
+    depth: usize,
+}
+
+impl ParsedExpr {
+    const fn leaf(value: Expr) -> Self {
+        Self { value, depth: 1 }
+    }
+
+    fn join(
+        self,
+        right: Self,
+        combine: fn(Box<Expr>, Box<Expr>) -> Expr,
+    ) -> Result<Self, ParseError> {
+        let depth = self.depth.max(right.depth) + 1;
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(expression_depth_error());
+        }
+        Ok(Self {
+            value: combine(Box::new(self.value), Box::new(right.value)),
+            depth,
+        })
+    }
+}
+
+fn expression_depth_error() -> ParseError {
+    ParseError::new(format!(
+        "expression depth exceeds {MAX_EXPRESSION_DEPTH} levels"
+    ))
+}
+
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
+    parenthesis_depth: usize,
 }
 
 impl Parser {
     const fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, cursor: 0 }
+        Self {
+            tokens,
+            cursor: 0,
+            parenthesis_depth: 0,
+        }
     }
 
     #[allow(
@@ -594,32 +636,38 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
-        self.or_expression()
+        self.or_expression().map(|expression| expression.value)
     }
 
-    fn or_expression(&mut self) -> Result<Expr, ParseError> {
+    fn or_expression(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expression = self.and_expression()?;
         while self.consume_keyword("OR") {
-            expression = Expr::Or(Box::new(expression), Box::new(self.and_expression()?));
+            expression = expression.join(self.and_expression()?, Expr::Or)?;
         }
         Ok(expression)
     }
 
-    fn and_expression(&mut self) -> Result<Expr, ParseError> {
+    fn and_expression(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expression = self.predicate_atom()?;
         while self.consume_keyword("AND") {
-            expression = Expr::And(Box::new(expression), Box::new(self.predicate_atom()?));
+            expression = expression.join(self.predicate_atom()?, Expr::And)?;
         }
         Ok(expression)
     }
 
-    fn predicate_atom(&mut self) -> Result<Expr, ParseError> {
+    fn predicate_atom(&mut self) -> Result<ParsedExpr, ParseError> {
         if self.consume_symbol(Symbol::LeftParen) {
-            let expression = self.expression()?;
+            if self.parenthesis_depth == MAX_EXPRESSION_DEPTH {
+                return Err(expression_depth_error());
+            }
+            self.parenthesis_depth += 1;
+            let expression = self.or_expression();
+            self.parenthesis_depth -= 1;
+            let expression = expression?;
             self.expect_symbol(Symbol::RightParen)?;
             return Ok(expression);
         }
-        self.simple_predicate(false)
+        self.simple_predicate(false).map(ParsedExpr::leaf)
     }
 
     fn simple_predicate(&mut self, label: bool) -> Result<Expr, ParseError> {
@@ -1203,6 +1251,118 @@ impl std::error::Error for ParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repeated_predicate(operator: &str, count: usize) -> String {
+        std::iter::repeat_n("message == \"ready\"", count)
+            .collect::<Vec<_>>()
+            .join(&format!(" {operator} "))
+    }
+
+    fn assert_depth_error(query: &str) {
+        let error = parse(query).expect_err("the expression must exceed the depth limit");
+        assert_eq!(error.to_string(), "expression depth exceeds 128 levels");
+    }
+
+    #[test]
+    fn parenthesized_expression_limit_allows_128_groups() {
+        let query = format!(
+            "EVENTS WHERE {}x == 1{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH),
+            ")".repeat(MAX_EXPRESSION_DEPTH),
+        );
+        assert!(parse(&query).is_ok());
+        assert_depth_error(&format!(
+            "EVENTS WHERE {}x == 1{}",
+            "(".repeat(MAX_EXPRESSION_DEPTH + 1),
+            ")".repeat(MAX_EXPRESSION_DEPTH + 1),
+        ));
+    }
+
+    #[test]
+    fn boolean_tree_limit_counts_leaves_and_combination_nodes() {
+        for operator in ["AND", "OR"] {
+            let accepted = repeated_predicate(operator, MAX_EXPRESSION_DEPTH);
+            // LOGS also walks every predicate while validating field names.
+            let query = parse(&format!("LOGS WHERE {accepted}")).unwrap();
+            let copy = query.clone();
+            let mut fields = Vec::new();
+            copy.predicates[0].fields(&mut fields);
+            assert_eq!(fields, ["message"]);
+            assert_depth_error(&format!(
+                "LOGS WHERE {}",
+                repeated_predicate(operator, MAX_EXPRESSION_DEPTH + 1),
+            ));
+        }
+    }
+
+    #[test]
+    fn mixed_boolean_operators_share_the_same_tree_depth_budget() {
+        let conjunction = repeated_predicate("AND", MAX_EXPRESSION_DEPTH - 1);
+        assert!(parse(&format!("LOGS WHERE message == 1 OR {conjunction}")).is_ok());
+        let conjunction = repeated_predicate("AND", MAX_EXPRESSION_DEPTH);
+        assert_depth_error(&format!("LOGS WHERE message == 1 OR {conjunction}"));
+        let disjunction = repeated_predicate("OR", MAX_EXPRESSION_DEPTH);
+        assert_depth_error(&format!("LOGS WHERE ({disjunction}) AND message == 1"));
+    }
+
+    #[test]
+    fn depth_rejection_and_cleanup_fit_a_query_workers_stack() {
+        const CHILD_FLAG: &str = "EVENTD_TEST_EXPRESSION_DEPTH_CHILD";
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    let chain = repeated_predicate("AND", MAX_EXPRESSION_DEPTH);
+                    let grouped = format!(
+                        "LOGS WHERE {}{chain}{}",
+                        "(".repeat(MAX_EXPRESSION_DEPTH),
+                        ")".repeat(MAX_EXPRESSION_DEPTH),
+                    );
+                    let parsed = parse(&grouped).unwrap();
+                    let cloned = parsed.clone();
+                    assert_eq!(parsed, cloned);
+                    drop((parsed, cloned));
+                    // Missing closing delimiters must also destroy only bounded trees.
+                    assert!(parse(grouped.trim_end_matches(')')).is_err());
+                    assert_depth_error(&format!(
+                        "EVENTS WHERE {}x == 1{}",
+                        "(".repeat(1_000),
+                        ")".repeat(1_000),
+                    ));
+                    for operator in ["AND", "OR"] {
+                        assert_depth_error(&format!(
+                            "LOGS WHERE {}",
+                            repeated_predicate(operator, 10_000),
+                        ));
+                    }
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            println!("bounded expression stack checks completed");
+            return;
+        }
+        // An old implementation aborts on stack overflow; isolate it so a regression
+        // reports a failed child rather than terminating the entire test runner.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "query_language::tests::depth_rejection_and_cleanup_fit_a_query_workers_stack",
+                "--nocapture",
+            ])
+            .env(CHILD_FLAG, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .contains("bounded expression stack checks completed"),
+            "query-stack child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     // What a client writes with eventd-client's `text` must read back as
     // exactly the value it meant, wherever it goes: a quoting bug there

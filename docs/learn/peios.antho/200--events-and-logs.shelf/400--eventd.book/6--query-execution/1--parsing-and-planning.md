@@ -29,6 +29,29 @@ or authorized.
 [*plan.parse-errors-return-before-anything-is-opened-read-or-authorized]
 A malformed query costs a decode and a parse.
 
+## Expression depth
+
+The parser enforces two independent limits before query execution:
+
+- Grouping parentheses can nest at most 128 pairs deep.
+- Each boolean expression tree can contain at most 128 nodes on a path
+  from its root to a leaf.
+
+A comparison, membership predicate (`IN` or `NOT_IN`), or null predicate
+(`IS NULL` or `IS NOT NULL`) is a leaf with depth 1. An `AND` or `OR` node
+has depth 1 plus its deeper child's depth. Both operators share the same
+tree limit. Grouping parentheses do not add nodes to the stored tree.
+
+A flat chain of 128 predicates fits the tree limit; a chain of 129 does
+not. Parentheses around an `IN` list are list delimiters, not recursive
+expression grouping. Each `WHERE` clause is checked separately.
+
+Exceeding either limit returns the parse error
+`expression depth exceeds 128 levels`. The caller can simplify the
+expression or remove redundant grouping and retry. These limits are
+independent of the query request's byte limit and prevent deeply nested
+parser and expression-tree traversal from exhausting the worker stack.
+
 ## What can only fail later
 
 Some failures need data. The parser cannot know whether a metric name
@@ -109,7 +132,7 @@ maps from thousands of events means decoding thousands of payloads and
 applying the flattening rules of PSPU §3.22 to each. Partial extraction
 is the lever: with a `SELECT` present, only the named paths need
 decoding, and without one a streaming decoder that emits flattened pairs
-avoids materialising the payload at all (§C).
+avoids materializing the payload at all (§C).
 
 ## Read connections
 

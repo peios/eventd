@@ -28,6 +28,18 @@ For exact flags, output formats, and exit statuses, read `evctl(1)`.
 The default socket is `/run/eventd/query.sock`; `--socket` selects the
 configured path when the deployment uses another location.
 
+## Simplify an expression that exceeds the limit
+
+eventd rejects expressions deeper than 128 levels with the query error
+`expression depth exceeds 128 levels`. The limit applies separately to
+nested grouping parentheses and to the structure built from `AND` and
+`OR` predicates. A long flat chain can exceed the limit even without
+parentheses.
+
+Remove redundant grouping and simplify the predicates before retrying.
+The rejection is a query error, not an empty successful result. Check
+standard error and the exit status as you would for another query error.
+
 ## Check completion
 
 For a finite query, `evctl` holds the initial records in a temporary spool
