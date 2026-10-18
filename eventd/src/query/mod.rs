@@ -134,15 +134,11 @@ impl QueryServer {
             None => {}
         }
         let listener = UnixListener::bind(path).map_err(QuerySocketError::Io)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(QuerySocketError::Io)?;
         let metadata = occupant(path)
             .map_err(QuerySocketError::Io)?
             .ok_or_else(|| QuerySocketError::Io(std::io::ErrorKind::NotFound.into()))?;
 
-        establish(path)?;
-        Ok(Self {
+        let bound = Self {
             listener,
             path: path.to_owned(),
             identity: (metadata.dev(), metadata.ino()),
@@ -150,7 +146,13 @@ impl QueryServer {
             streaming: Arc::new(AtomicUsize::new(0)),
             per_user: PerUser::default(),
             held: Arc::new(AtomicUsize::new(0)),
-        })
+        };
+        bound
+            .listener
+            .set_nonblocking(true)
+            .map_err(QuerySocketError::Io)?;
+        establish(path)?;
+        Ok(bound)
     }
 
     /// The running and streaming query counts, for eventd's health.
@@ -387,6 +389,8 @@ fn handle_as(
             }
         }
         config.index_tracker.prioritize(field);
+        // An already queued request sees the updated tracker; a disconnected policy
+        // worker is handled by the supervisor, so neither case blocks this query.
         let _ = config.index_policy.try_send(PolicyMessage::Recompute);
         send_status(&mut stream, "end", Some(deadline))?;
         return Ok(());
@@ -769,6 +773,8 @@ fn send_status(
     )
 }
 
+/// Deliver a terminal error. Callers already abandoning the connection can ignore
+/// delivery failure because there is no further response or recovery for that peer.
 fn send_error(mut stream: impl Write, error: &str) -> Result<(), QuerySocketError> {
     let mut writer = Writer::new();
     writer
@@ -965,6 +971,18 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn failed_query_socket_protection_removes_the_bound_path() {
+        let directory = socket_directory("failed-protection");
+        let path = directory.join("query.sock");
+        let result = QueryServer::bind_with(&path, |path| {
+            Err(QuerySocketError::Protection(path.to_owned()))
+        });
+        assert!(matches!(result, Err(QuerySocketError::Protection(_))));
+        assert!(!path.exists(), "failed setup must remove its bound socket");
+        std::fs::remove_dir(directory).unwrap();
     }
 
     // PEI-1297: like the metric socket's, a stale query socket whose

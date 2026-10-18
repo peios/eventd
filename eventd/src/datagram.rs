@@ -165,20 +165,24 @@ impl IngestionSocket {
             Some(_) => return Err(SocketError::Occupied(path.to_owned())),
             None => {}
         }
+        let waker = Waker::new().map_err(SocketError::Io)?;
         let socket = UnixDatagram::bind(path).map_err(SocketError::Io)?;
         let metadata = occupant(path)
             .map_err(SocketError::Io)?
             .ok_or_else(|| SocketError::Io(std::io::ErrorKind::NotFound.into()))?;
-        socket.set_nonblocking(true).map_err(SocketError::Io)?;
-        set_receive_buffer(&socket, datagram_ceiling)?;
-
-        establish(path, protection)?;
-        Ok(Self {
+        let bound = Self {
             socket,
             path: path.to_owned(),
             identity: (metadata.dev(), metadata.ino()),
-            waker: Waker::new().map_err(SocketError::Io)?,
-        })
+            waker,
+        };
+        bound
+            .socket
+            .set_nonblocking(true)
+            .map_err(SocketError::Io)?;
+        set_receive_buffer(&bound.socket, datagram_ceiling)?;
+        establish(path, protection)?;
+        Ok(bound)
     }
 
     /// The waker that ends this socket's [`wait_readable`](Self::wait_readable).
@@ -530,7 +534,7 @@ mod tests {
             // No socket was handed out, and nothing is receiving at the path.
             let client = UnixDatagram::unbound().unwrap();
             assert!(client.send_to(b"probe", &path).is_err());
-            let _ = std::fs::remove_file(&path);
+            assert!(!path.exists(), "failed setup must remove its bound socket");
         }
     }
 
