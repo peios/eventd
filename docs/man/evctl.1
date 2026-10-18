@@ -1,6 +1,6 @@
-.TH EVCTL 1 "" "Peios" "User Commands"
+.TH EVCTL 1 "2026-10-18" "Peios eventd 0.1.11" "User Commands"
 .SH NAME
-evctl \- query the Peios event, log and metric store
+evctl \- query the Peios event, log, and metric store
 .SH SYNOPSIS
 .B evctl
 [\fIOPTIONS\fR]
@@ -51,7 +51,7 @@ or from standard input when the argument is
 .BR \- .
 .PP
 eventd identifies the caller from the socket peer token and performs every
-access check; records and fields the caller may not see are omitted.
+access check; records and fields the caller cannot read are omitted.
 .B evctl
 never opens an eventd database itself.
 .SH OPTIONS

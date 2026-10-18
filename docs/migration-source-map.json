@@ -1,0 +1,492 @@
+{
+  "source_root": "../learn-staging",
+  "source_files": [
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/1--introduction/1--overview.md",
+      "sha256": "7a0e1d51e6074f956a43492777bf3d87c9ff7e856933e9a0d9ea2d433600c5e8",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/1--introduction/1--overview.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/1--introduction/2--what-this-manual-is.md",
+      "sha256": "95c6e8a9d10747abcb96b65ce429b4b500dfd39480f4a8af534562c21dfd1f23",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/1--introduction/2--what-this-manual-is.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/1--introduction/3--terminology.md",
+      "sha256": "490bdae160823c51ac88410dd1f348c93ebfa87ea00f47032158998a5d875e46",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/1--introduction/3--terminology.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/1--introduction/4--prior-art.md",
+      "sha256": "6ac85f5a476d83e940cdd43c9a82c45ac759b13bc018728a1a62f1069a3b44fa",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/1--introduction/4--prior-art.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/10--evctl/1--using-evctl.md",
+      "sha256": "a6554715c67616ecf5eb92768a5ecae67bb7b8bb260370621f36a0d21a9ba278",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/10--evctl/1--using-evctl.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/10--evctl/2--eventd-client.md",
+      "sha256": "e45694e43c12ca71813811528a575d31b504219f6de6963a989746f80d0f803e",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/10--evctl/2--eventd-client.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/10--evctl/trail.toml",
+      "sha256": "ed7a64e80f19c62b7866908db9ae5f025f46655883d0e42517f19c5e6ef4335f",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/10--evctl/trail.toml",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/1--the-pipeline.md",
+      "sha256": "a0313c29effe7bf9eb0c16d5285a06918e3a681f99ff2e6ed6583dac7ab931fd",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/1--the-pipeline.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/2--kmes-consumption.md",
+      "sha256": "5f3f061645637e436c45aa5818662f388fae6b97d59341714b91fad25de28d17",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/2--kmes-consumption.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/3--sharding.md",
+      "sha256": "3b71d1b9540ba00c92850f1d56f4b6bd593666caab935c60833935ff596df358",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/3--sharding.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/4--the-batch-writer.md",
+      "sha256": "cf12d736a4c6c2bc226bbb8d4390aaf9ac696e59288057ba68bdf1775d0ff75d",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/4--the-batch-writer.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/5--gap-detection.md",
+      "sha256": "928d0749907930fd4ddc6abd397a8d442436fc347c7b46f7867c5f2d74f5188f",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/5--gap-detection.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/2--event-ingestion/6--synthetic-events.md",
+      "sha256": "042d94a26e5b5f877796c801cc3af1064979c72f4e4d13047c93d362ed6ace30",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/2--event-ingestion/6--synthetic-events.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/1--the-events-table.md",
+      "sha256": "bc961fd8a9fbfccb6cc9e354482d48d5dfbd04a845fefab90587b2dbbe473805",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/1--the-events-table.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/2--synthetic-event-payloads.md",
+      "sha256": "67ddb7376e0cc9abfd6a6bbf0504d4018dce408bb1d9136bb4f2118a1bba795e",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/2--synthetic-event-payloads.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/3--database-lifecycle.md",
+      "sha256": "c9c680be61a1590a3a389180aece6d4592113a59b01f6986ecf6b0767388ab01",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/3--database-lifecycle.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/4--adaptive-indexing.md",
+      "sha256": "657a2abda2b6510b2ec252ba1d18eafa923d2059b7c1ce40f6fdb4a3a6cae96c",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/4--adaptive-indexing.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/5--the-metadata-database.md",
+      "sha256": "42b0299a05a6d21020bf7f6dc7dceb54bb3065fe0c9e5d2b22355a427b46fe2b",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/5--the-metadata-database.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/6--retention.md",
+      "sha256": "e74fa3d1ffb0711c2202218b3e5f537e79cafce7a061fdf240b40e2df618ac7b",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/6--retention.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/3--event-storage/7--boot-partitioning.md",
+      "sha256": "d0942dee04297b7a2559847cbd4fa25ea28e97d0b50caecee7609ce3bfc09c73",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/3--event-storage/7--boot-partitioning.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/4--log-storage/1--the-log-writer.md",
+      "sha256": "31dd002c3ca18a3cb7c7526f8eefb351f6326c3876e8008b8f075e6b6b65c529",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/4--log-storage/1--the-log-writer.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/4--log-storage/2--the-logs-table.md",
+      "sha256": "2634381db120ea29e9140a7982a26ad72685cb1fcb057bedd02f157cf378b1bf",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/4--log-storage/2--the-logs-table.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/4--log-storage/3--database-lifecycle.md",
+      "sha256": "98ac6e27f66c5bb9f4be3b946cc631c7c68ae5a601e39c688cc2841b74c89f32",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/4--log-storage/3--database-lifecycle.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/4--log-storage/4--retention.md",
+      "sha256": "18b47c1db8d0679ab8fa92dece51dd83b0d1312e6e0c114212b83a43b1e006f1",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/4--log-storage/4--retention.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/1--the-metric-writer.md",
+      "sha256": "2db072955ca46a6a119cbc81ffdc2b1a3003b01ebc6160b55c9832cfaf779e7e",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/1--the-metric-writer.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/2--series-and-samples.md",
+      "sha256": "de7710a53848aa6998ef41ae052c6828676dc114edb7fef51bc2879c394f8683",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/2--series-and-samples.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/3--series-resolution.md",
+      "sha256": "e6851cb267f10fc4536cba496eb2380dbfe61b2b5ec247eae5032ae2d3deb961",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/3--series-resolution.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/4--database-lifecycle.md",
+      "sha256": "78c2d48655c4ffcfa8bfb02e54c9d1aabdc1bf89cd9d2225eae87ca2e5542521",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/4--database-lifecycle.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/5--retention.md",
+      "sha256": "deed09bb8ba9f0a53219368370e00f939e4fab297292641c63174443df4c568a",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/5--retention.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/6--adaptive-rollups.md",
+      "sha256": "524ecfdb582edabff2b3d9e8a97b3318b03f652f410caa1cb2fea90bfac5aac5",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/6--adaptive-rollups.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/5--metric-storage/7--health-metrics.md",
+      "sha256": "ea2c0b797b6deb8bda8a786a4b477e0fa049cab6641be6b48316f5b86de44330",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/5--metric-storage/7--health-metrics.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/1--parsing-and-planning.md",
+      "sha256": "28604c6ddf03d8c6aaeee427727f75aa348bb056550fa356b547d38b2879f9f6",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/1--parsing-and-planning.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/2--ordering-and-tiebreakers.md",
+      "sha256": "ddf901631ffe032264295ec92aa5e8453d2225795edb2d0333367cfe21e54ed4",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/2--ordering-and-tiebreakers.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/3--sql-translation.md",
+      "sha256": "cb8e4b62ca6517001fa8b40dfe70416b0e9d9eb94ce3ef6a3b0bd69a3474b70f",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/3--sql-translation.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/4--cross-shard-fan-out.md",
+      "sha256": "d4dc48dd303fb6a9bd62e516fa2b7b92e34a17f9ab94fe7e4a00609c583254de",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/4--cross-shard-fan-out.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/5--accounting-and-limits.md",
+      "sha256": "4fbab2e80e85b21d8b56239a2166ed3cb4cc65a7157f91abfccff8c224442223",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/5--accounting-and-limits.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/6--query-execution/6--the-streaming-machinery.md",
+      "sha256": "d985fc7e853dc22c4ebd72084ef0ba723d3435100692ddc387eaa7b8f2626cb7",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/6--query-execution/6--the-streaming-machinery.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/1--the-model.md",
+      "sha256": "c0075d9fc063851d4225c06395aece66b986393da358831b90d9d3c935fb538a",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/1--the-model.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/2--patterns-and-descriptors.md",
+      "sha256": "7b663f02a09d4efaf8b3d226b7788651e045391ebfad05581a1234474b1c03d7",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/2--patterns-and-descriptors.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/3--per-field-control.md",
+      "sha256": "04ef37ed44967ed5e7fe53c7df84dc4127b9b6044af8ac3f06824de4d41ccb95",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/3--per-field-control.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/4--enforcement.md",
+      "sha256": "eee478c64cd5f2416d0e583db720c3597da593fa354c16fe24809c63d46b892e",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/4--enforcement.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/5--caching.md",
+      "sha256": "74bdce1225bd672a4dae47a48a6097a60495a1b2efc9589fcbd7a40cbaca8556",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/5--caching.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/7--access-control/6--the-write-path.md",
+      "sha256": "3f1702659cb02d13c33d93ab0f8635df475a3c915a9e96d89408225f0d9151d8",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/7--access-control/6--the-write-path.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/8--startup-and-shutdown/1--dependencies.md",
+      "sha256": "e0cb3e0d8a514789398d5a17c7f8bdc0938256e5b393b6bd55f78807da11eaa1",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/8--startup-and-shutdown/1--dependencies.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/8--startup-and-shutdown/2--the-bootstrap-sequence.md",
+      "sha256": "11cf8c6b685fb1324adba44bee9d1c94cb2782d0a6332d8816e8db81cba2783a",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/8--startup-and-shutdown/2--the-bootstrap-sequence.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/8--startup-and-shutdown/3--configuration-at-runtime.md",
+      "sha256": "ee536e7be9a0bf9d45139f258d3fdc69cf2f761d95914fe0865045e41e714619",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/8--startup-and-shutdown/3--configuration-at-runtime.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/8--startup-and-shutdown/4--shutdown.md",
+      "sha256": "475acb5cde6c1627e55b3b0cf392e7178789839efd7fd7cdc7e87fd40ee266be",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/8--startup-and-shutdown/4--shutdown.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/8--startup-and-shutdown/5--crash-recovery-and-signals.md",
+      "sha256": "7704423163299f288b262c05bff3861a2d7b97e4b97db5541cc241d3424c9762",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/8--startup-and-shutdown/5--crash-recovery-and-signals.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/9--failure-modes/1--losing-events.md",
+      "sha256": "94dd5bd4ef88a070a5dca6af5cd55f9a4699ded6f906a41b603ebfe1ddabd2e2",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/9--failure-modes/1--losing-events.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/9--failure-modes/2--storage-failure.md",
+      "sha256": "f47319b563c6a9924d071b7a881ba63876efb8718e2c2d2ec6048718bb9060fc",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/9--failure-modes/2--storage-failure.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/9--failure-modes/3--losing-dependencies.md",
+      "sha256": "161b6c76f067e3dd9d4061cb8328fef862add334b5e11a2cb83a5761d9d7ebcf",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/9--failure-modes/3--losing-dependencies.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/9--failure-modes/4--resource-exhaustion.md",
+      "sha256": "64b48621d01baefeba02edf4b7449be9584ddb719b024f52ee435bd27305634a",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/9--failure-modes/4--resource-exhaustion.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/9--failure-modes/5--power-loss.md",
+      "sha256": "b4d7923c1c4cc109c8c95b9b32d6a4961833114fb5c1115431d1f20eb5f40afc",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/9--failure-modes/5--power-loss.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/a1--configuration-keys.md",
+      "sha256": "0b0a1ce43852afd18e2de6fea03fe317d12ba1b52610ae79f2452e248ec00107",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/a1--configuration-keys.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/a2--constants.md",
+      "sha256": "e33afb924a376d2c49728e36ced7e8f1b8fc4213c96613dfdeb8f19800669581",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/a2--constants.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/a3--recommended-optimisations.md",
+      "sha256": "467897bb29e2cd9897d1ce4aa43652ce68b3a2729f07fe495accb5c8af0f94ae",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/a3--recommended-optimisations.md",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/3--advanced-peios.antho/300--trms.shelf/400--eventd.book/trail.toml",
+      "sha256": "92936d6bf65f329a50bb3331a3bc46303d57d5f4a41128b7abb3b356b2f27e3d",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/400--eventd.book/trail.toml",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/1--eventd-config-changed.md",
+      "sha256": "39b4de7184e940a813a1dc4e351c3dadce2050e75389da0260a0698f81873a34",
+      "destination": "docs/eventd.evman",
+      "disposition": "Owned event reference consolidated into the canonical eventd event catalog.",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/2--eventd-daemon-started.md",
+      "sha256": "42e3453adff87ad7293bbb0a3eba8f97ffdac904a847f84503043ce41afe929d",
+      "destination": "docs/eventd.evman",
+      "disposition": "Owned event reference consolidated into the canonical eventd event catalog.",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/3--eventd-daemon-stopped.md",
+      "sha256": "a990917e8acfc57f7b434c4d5554b9261435efa3d6302de4ae6ea0bb3907987f",
+      "destination": "docs/eventd.evman",
+      "disposition": "Owned event reference consolidated into the canonical eventd event catalog.",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/4--eventd-events-lost.md",
+      "sha256": "d7a85eb6ef383a50cd5e13d454b5a26ecbd50be0c06f96c093fce41c63bbf882",
+      "destination": "docs/eventd.evman",
+      "disposition": "Owned event reference consolidated into the canonical eventd event catalog.",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/5--eventd-store-quarantined.md",
+      "sha256": "e82824b8c43f312709301800e49092203bca22eb7f785f79b481b31226353f58",
+      "destination": "docs/eventd.evman",
+      "disposition": "Owned event reference consolidated into the canonical eventd event catalog.",
+      "staging_status": "removed after archive verification"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/100--fundamentals.shelf/800--logs-and-events.topic/175--save-incident-evidence.md",
+      "sha256": "ba3fec712e1b383bec22150c77f4af0e9369165b5000218bd59d29f439e2586f",
+      "destination": "docs/learn/peios.antho/200--events-and-logs.shelf/100--reading-records.topic/400--saving-evidence.md",
+      "disposition": "Rewritten as a component-owned finite-query capture procedure; no unqualified native command example.",
+      "staging_status": "retained"
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/600--reference.shelf/100--events.book/10--eventd/trail.toml",
+      "sha256": "b843ce21723e0d6346f9814718efb7baec5f53d41733a7702423c6d15a7e9f75",
+      "destination": "docs/eventd.evman",
+      "disposition": "Event-reference chapter metadata retired with its five records; canonical event catalog owns the reference.",
+      "staging_status": "removed after archive verification"
+    }
+  ],
+  "retained_shared_material": [
+    "Event Viewer and service-manager procedures",
+    "PSPU observability protocol specification",
+    "KMES and KACS kernel reference material"
+  ],
+  "originals_retained": false,
+  "reviewed_mixed_material": [
+    {
+      "source": "peios.product/0--using-peios.antho/100--fundamentals.shelf/800--logs-and-events.topic/100--overview.md",
+      "disposition": "Retained in staging because it combines eventd, Event Viewer, peinit, and kernel concepts. Eventd-only explanation is written in Stored Records."
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/100--fundamentals.shelf/800--logs-and-events.topic/150--find-missing-records.md",
+      "disposition": "Retained in staging because it includes Event Viewer and service-manager procedures. Eventd-only checks are written in Finding Missing Records."
+    },
+    {
+      "source": "peios.product/0--using-peios.antho/100--fundamentals.shelf/800--logs-and-events.topic/200--event-viewer.md",
+      "disposition": "Retained in staging; owned by the graphical Event Viewer component."
+    }
+  ],
+  "implementation_review": {
+    "introduction": [
+      "Cargo.toml",
+      "README.md",
+      "eventd/src/pipeline.rs",
+      "registry.d/eventd-service.reg"
+    ],
+    "event-ingestion": [
+      "eventd/src/kmes.rs",
+      "eventd/src/pipeline.rs",
+      "eventd/src/writer.rs",
+      "eventd-core/src/queue.rs",
+      "eventd-core/src/routing.rs",
+      "eventd-core/src/reconcile.rs",
+      "eventd-core/src/receipt.rs"
+    ],
+    "event-storage": [
+      "eventd-core/src/shard.rs",
+      "eventd-core/src/meta_store.rs",
+      "eventd-core/src/payload_index.rs",
+      "eventd/src/indexing.rs",
+      "eventd/src/retention.rs",
+      "eventd/src/synthetic.rs"
+    ],
+    "logs": [
+      "eventd-core/src/log_store.rs",
+      "eventd/src/log_ingest.rs",
+      "eventd/src/write_security.rs"
+    ],
+    "metrics": [
+      "eventd-core/src/metric_store.rs",
+      "eventd/src/metric_ingest.rs",
+      "eventd/src/health.rs"
+    ],
+    "query-and-access": [
+      "eventd/src/query_language.rs",
+      "eventd/src/query/executor.rs",
+      "eventd/src/query/security.rs",
+      "eventd/src/query/mod.rs",
+      "eventd/src/commit_signal.rs",
+      "eventd-client/src/access.rs"
+    ],
+    "lifecycle": [
+      "eventd/src/main.rs",
+      "eventd/src/pipeline.rs",
+      "eventd/src/directory.rs",
+      "eventd/src/config.rs",
+      "eventd/src/diagnostics.rs"
+    ],
+    "client": [
+      "evctl/src/cli.rs",
+      "evctl/src/main.rs",
+      "evctl/src/output.rs",
+      "eventd-client/src/lib.rs",
+      "eventd-client/src/wire.rs",
+      "eventd-client/src/text.rs"
+    ]
+  },
+  "validation_limits": [
+    "Host source review and documentation validation do not qualify native KACS/KMES integration, deployment provisioning, power-loss guarantees, or performance.",
+    "Native command examples retained in the technical reference manual require Peios runtime qualification before publication.",
+    "Mixed-component staging guides remain in place. Component-owned originals are archived with verified hashes; publication redirects still require deployment integration."
+  ],
+  "url_mapping": {
+    "old_book": "peios/advanced-peios/eventd",
+    "new_book": "peios/eventd",
+    "citation_short_name": "eventd",
+    "chapter_and_statement_identifiers_preserved": true,
+    "redirect_status": "Component-owned staging originals are archived and retired. Publication redirects for old book routes remain required before retiring the old published site."
+  },
+  "archive": {
+    "path": "/home/jack/projects/peios/.artifacts/PEI-1522-eventd/learn-staging-before.tar.gz",
+    "sha256": "e49eb61f7cdacb8938af5dd97379add93da4c2400c8743b2519ed6820b58b770",
+    "files": 64,
+    "verified_against_source_map": true
+  }
+}

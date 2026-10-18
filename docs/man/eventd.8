@@ -1,8 +1,9 @@
-.TH EVENTD 8 "" "Peios" "System Administration"
+.TH EVENTD 8 "2026-10-18" "Peios eventd 0.1.11" "System Administration"
 .SH NAME
 eventd \- Peios event, log and metric service
 .SH SYNOPSIS
 .B eventd
+[\fB\-\-prepare-security\fR]
 .SH DESCRIPTION
 .B eventd
 is the single persistent store for everything a Peios system records about
@@ -20,7 +21,7 @@ standard output and standard error. They arrive on a datagram socket.
 .PP
 .B Metrics
 are numeric samples pushed by their producers to a second datagram socket.
-eventd collects nothing itself.
+eventd accepts producer measurements and records its own health metrics.
 .PP
 Queries use the PSPU observability query language over a stream socket; see
 .BR evctl (1).
@@ -44,20 +45,22 @@ log database and the metric database.
 .B QuerySocketPath\fR, \fBLogSocketPath\fR, \fBMetricSocketPath
 The query stream socket and the log and metric datagram sockets.
 .PP
-Paths apply at the next start. Every tuning value (batching, retention,
-query limits, indexing and shedding) has a compiled default and applies
-live; an invalid live change is ignored and the last valid value stays in
+Paths and StorageShards apply at the next start. Other tuning values
+(batching, retention, query limits, indexing, and shedding) have compiled
+defaults and apply live; an invalid live change is ignored and the last valid value stays in
 effect. The standard deployment is offered by
 .IR eventd-config.reg ;
 installing the package does not apply it. See
 .I /usr/share/regman/eventd.regman
 for every value, its type, default and when it applies.
 .SH SECURITY
-Access is enforced on the read path only. Each query is authorized with KACS
+Each query is authorized with KACS
 AccessCheck against the caller's token, taken from the query socket's peer;
-records and fields the caller may not see are filtered out. eventd makes no
-access decision of its own. Ingestion continues even when queries cannot be
-authorized.
+records and fields the caller cannot read are filtered out. eventd makes no
+access decision of its own. The log socket admits the trusted output broker and denies the Service
+logon group. Each metric datagram carries its sender's effective token;
+eventd checks EVENTD_PUBLISH for the metric name. Malformed or unauthorized
+ingestion is dropped. A read authorization failure does not stop ingestion.
 .SH SIGNALS
 .TP
 .BR SIGTERM ", " SIGINT
@@ -70,8 +73,9 @@ Write a diagnostic dump to standard error, then begin graceful shutdown.
 Re-read configuration from the registry.
 .SH EXIT STATUS
 .B eventd
-exits 0 after a graceful shutdown and 1 on a fatal error, which it reports
-on standard error.
+exits 0 after a graceful shutdown or successful security preparation,
+1 on a fatal error, and 2 for invalid command-line arguments.
+It reports errors on standard error.
 .SH FILES
 .TP
 .I /var/state/eventd/events/
