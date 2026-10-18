@@ -25,7 +25,14 @@ impl CommitSignal {
     }
 
     pub fn committed(&self) {
+        // Pair the predicate update with the waiter's mutex: otherwise a notification can
+        // land after its last predicate check but before it actually sleeps.
+        let guard = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.generation.fetch_add(1, Ordering::Release);
+        drop(guard);
         self.changed.notify_all();
     }
 
@@ -57,7 +64,11 @@ impl Default for CommitSignal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    use super::{AtomicU64, CommitSignal};
 
     #[test]
     fn commit_advances_generation() {
@@ -65,6 +76,30 @@ mod tests {
         let before = signal.generation();
         signal.committed();
         assert_ne!(signal.generation(), before);
+    }
+
+    #[test]
+    fn commit_cannot_notify_between_the_waiters_check_and_sleep() {
+        let signal = Arc::new(CommitSignal::new());
+        // Hold the same critical section as the waiter's predicate check. A committer
+        // must not publish and notify until that check can transition into waiting.
+        let guard = signal.wait_lock.lock().unwrap();
+        let (started, entering) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let committer = {
+            let signal = Arc::clone(&signal);
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                signal.committed();
+                finished.send(()).unwrap();
+            })
+        };
+        entering.recv().unwrap();
+        let while_locked = completed.recv_timeout(Duration::from_millis(50));
+        drop(guard);
+        committer.join().unwrap();
+        assert_eq!(while_locked, Err(RecvTimeoutError::Timeout));
+        assert_eq!(signal.generation(), 1);
     }
 
     #[test]

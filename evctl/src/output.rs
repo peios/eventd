@@ -3,7 +3,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::FromRawFd;
 use std::path::Path;
 
 use peios::msgpack::Writer;
@@ -28,6 +28,9 @@ impl Format {
     }
 }
 
+/// Spool initial results anonymously until eventd confirms a complete result.
+/// After commit, streaming records go directly to the destination. Dropping an
+/// uncommitted output discards the spool, so a query error cannot publish partial results.
 pub struct TransactionalOutput<W> {
     destination: W,
     // Buffered: the text formats write a record a few bytes at a time, and
@@ -90,7 +93,7 @@ fn anonymous_spool(directory: &Path) -> io::Result<File> {
         Err(io::Error::last_os_error())
     } else {
         // SAFETY: open returned a fresh owned descriptor.
-        Ok(unsafe { File::from_raw_fd(descriptor as RawFd) })
+        Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 }
 
@@ -280,7 +283,9 @@ fn write_message_pack(output: &mut impl Write, record: &Record) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use eventd_client::{Record, Value};
+
+    use super::{Format, TransactionalOutput, write_record};
 
     fn record() -> Record {
         [

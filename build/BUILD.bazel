@@ -1,0 +1,43 @@
+load(":packaging.bzl", "package_mode")
+
+exports_files([
+    "BUILD.bazel",
+    "peios-sys.patch",
+    "rules-rust-system-libraries.patch",
+])
+
+filegroup(
+    name = "starlark",
+    srcs = glob(["*.bzl"]),
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "native",
+    values = {"define": "peios_native=true"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "packaged",
+    flag_values = {":package-mode": "true"},
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "sources",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "**/__pycache__/**",
+            "**/*.pyc",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)
+
+package_mode(
+    name = "package-mode",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)

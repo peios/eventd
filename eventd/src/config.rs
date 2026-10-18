@@ -1025,6 +1025,8 @@ fn apply_reload(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     retention_requested.store(true, Ordering::Release);
+    // A queued recomputation sees the latest shared configuration. Disconnection
+    // means the policy worker has stopped and the supervisor will end this run.
     let _ = index_policy.try_send(PolicyMessage::Recompute);
     for change in changes {
         let event = crate::synthetic::config_change(boot_id, &change, realtime_nanoseconds());

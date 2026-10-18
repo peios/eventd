@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eventd_core::{
-    BoundedQueue, Coverage, LogStore, MetaStore, MetricStore, Shard, StripeRouter, assigned_shards,
+    BoundedQueue, Coverage, LogStore, MetaStore, MetricStore, QueueReceiver, Shard, StripeRouter,
+    assigned_shards,
 };
 
 use crate::commit_signal::CommitSignal;
@@ -24,6 +24,8 @@ use crate::writer::WriterMessage;
 
 type ReceiptRow = ([u8; 16], u16, eventd_core::Interval);
 
+// Signal handlers only set these process-lifetime atomics. The supervisor consumes stop
+// and diagnostic requests; the configuration watcher consumes reload requests.
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 static SIGNAL_QUIT: AtomicBool = AtomicBool::new(false);
 static SIGNAL_RELOAD: AtomicBool = AtomicBool::new(false);
@@ -164,7 +166,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let queues = handoff_queues(shard_count)?;
+    let (queues, receivers) = handoff_queues(shard_count)?;
     let stopping = Arc::new(AtomicBool::new(false));
     // The log and metric threads stop later than the rest: they go on
     // reading their sockets through shutdown step 1 (TRM §8.4).
@@ -191,8 +193,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     install_signal_handlers()?;
 
     let mut event_writers = Vec::with_capacity(shard_count);
-    for (index, shard) in shards.into_iter().enumerate() {
-        let queue = queues[index].clone();
+    for (index, (shard, receiver)) in shards.into_iter().zip(receivers).enumerate() {
         let writer_stopping = Arc::clone(&stopping);
         let writer_commits = Arc::clone(&event_commits);
         let writer_ring_pressure = Arc::clone(&ring_pressure);
@@ -206,7 +207,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         shard,
                         index,
                         boot_id,
-                        &queue,
+                        receiver,
                         &writer_runtime,
                         &writer_stopping,
                         &writer_commits,
@@ -458,13 +459,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// One drain-to-writer handoff per active shard, bounded by the
 /// startup-fixed slot and byte limits rather than by any reloadable setting.
-fn handoff_queues(
-    shard_count: usize,
-) -> Result<Arc<[BoundedQueue<WriterMessage>]>, eventd_core::QueueConfigError> {
-    Ok((0..shard_count)
+type Handoffs = (
+    Arc<[BoundedQueue<WriterMessage>]>,
+    Vec<QueueReceiver<WriterMessage>>,
+);
+
+fn handoff_queues(shard_count: usize) -> Result<Handoffs, eventd_core::QueueConfigError> {
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..shard_count)
         .map(|_| BoundedQueue::new(HANDOFF_SLOTS, HANDOFF_BYTES))
         .collect::<Result<Vec<_>, _>>()?
-        .into())
+        .into_iter()
+        .unzip();
+    Ok((senders.into(), receivers))
 }
 
 /// The shards a drain routes to, chosen by its attachment's dense ordinal,
@@ -936,6 +942,8 @@ impl Drop for SyntheticReporter {
     fn drop(&mut self) {
         if let Some((sender, handle)) = self.worker.take() {
             drop(sender);
+            // The reporter logs write failures itself; joining here only ensures its
+            // queued attempt has stopped before this owner disappears.
             let _ = handle.join();
         }
     }
@@ -958,7 +966,10 @@ mod tests {
     use super::*;
 
     /// The slot and byte bounds a handoff enforces, measured by filling it.
-    fn handoff_limits(queue: &BoundedQueue<WriterMessage>) -> (usize, usize) {
+    fn handoff_limits(
+        queue: &BoundedQueue<WriterMessage>,
+        receiver: &mut QueueReceiver<WriterMessage>,
+    ) -> (usize, usize) {
         let mut held = Vec::new();
         while let Ok(permit) = queue.try_reserve(1) {
             held.push(permit);
@@ -966,7 +977,7 @@ mod tests {
         let slots = held.len();
         drop(held);
         // The consumer reclaims the cancelled slots.
-        assert!(matches!(queue.pop(), eventd_core::Pop::Empty));
+        assert!(matches!(receiver.pop(), eventd_core::Pop::Empty));
         let whole = queue
             .try_reserve(HANDOFF_BYTES)
             .expect("the byte bound admits its size");
@@ -975,7 +986,7 @@ mod tests {
             Err(eventd_core::ReserveError::Full)
         ));
         drop(whole);
-        assert!(matches!(queue.pop(), eventd_core::Pop::Empty));
+        assert!(matches!(receiver.pop(), eventd_core::Pop::Empty));
         assert!(matches!(
             queue.try_reserve(HANDOFF_BYTES + 1),
             Err(eventd_core::ReserveError::TooLarge)
@@ -986,16 +997,19 @@ mod tests {
     #[test]
     fn a_live_max_batch_size_change_leaves_the_handoff_limits_unchanged() {
         let runtime = Config::test_defaults().shared();
-        let queues = handoff_queues(2).unwrap();
-        for queue in queues.iter() {
-            assert_eq!(handoff_limits(queue), (HANDOFF_SLOTS, HANDOFF_BYTES));
+        let (queues, mut receivers) = handoff_queues(2).unwrap();
+        for (queue, receiver) in queues.iter().zip(&mut receivers) {
+            assert_eq!(
+                handoff_limits(queue, receiver),
+                (HANDOFF_SLOTS, HANDOFF_BYTES)
+            );
         }
         for max_batch_size in [100, 100_000] {
             // What the configuration watch does with a reloaded MaxBatchSize.
             runtime.write().unwrap().max_batch_size = max_batch_size;
-            for queue in queues.iter() {
+            for (queue, receiver) in queues.iter().zip(&mut receivers) {
                 assert_eq!(
-                    handoff_limits(queue),
+                    handoff_limits(queue, receiver),
                     (HANDOFF_SLOTS, HANDOFF_BYTES),
                     "MaxBatchSize {max_batch_size}"
                 );

@@ -1,6 +1,10 @@
 //! Startup-fixed shard assignment and contiguous sequence stripes.
 
 /// Compute the shards owned by one dense CPU ordinal.
+///
+/// # Panics
+///
+/// Panics if either count is zero or `ordinal` is outside `0..cpu_count`.
 #[must_use]
 pub fn assigned_shards(ordinal: usize, cpu_count: usize, shard_count: usize) -> Vec<usize> {
     assert!(cpu_count > 0 && ordinal < cpu_count);
@@ -23,6 +27,10 @@ pub struct StripeRouter {
 
 impl StripeRouter {
     /// Construct a router from a non-empty shard list and positive stripe size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shards` is empty or `stripe_length` is zero.
     #[must_use]
     pub fn new(shards: Vec<usize>, stripe_length: usize) -> Self {
         assert!(!shards.is_empty());

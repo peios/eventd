@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::config::DbConfig;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, Statement, TransactionBehavior, params};
 
 use crate::schema::Contents;
 use crate::{
@@ -13,6 +13,9 @@ use crate::{
 };
 
 const SCHEMA_VERSION: &str = "1";
+
+// Poll cancellation often enough to yield index maintenance to ingestion.
+const MAINTENANCE_PROGRESS_STEPS: i32 = 1_000;
 
 const CREATE_SCHEMA: &str = r"
 BEGIN IMMEDIATE;
@@ -231,12 +234,7 @@ impl Shard {
             for ((boot_id, cpu_id), intervals) in &mut receipts {
                 merge_intervals(intervals);
                 for interval in intervals {
-                    insert_receipt.execute(params![
-                        &boot_id[..],
-                        i64::from(*cpu_id),
-                        sqlite_integer(interval.first, "receipt first sequence")?,
-                        sqlite_integer(interval.last, "receipt last sequence")?,
-                    ])?;
+                    insert_receipt_range(&mut insert_receipt, boot_id, *cpu_id, *interval)?;
                 }
             }
         }
@@ -307,12 +305,7 @@ impl Shard {
             for (cpu_id, intervals) in &mut receipts {
                 merge_intervals(intervals);
                 for interval in intervals.iter() {
-                    insert_receipt.execute(params![
-                        &boot_id[..],
-                        i64::from(*cpu_id),
-                        sqlite_integer(interval.first, "receipt first sequence")?,
-                        sqlite_integer(interval.last, "receipt last sequence")?,
-                    ])?;
+                    insert_receipt_range(&mut insert_receipt, boot_id, *cpu_id, *interval)?;
                 }
             }
             receipt_rows = receipts.values().map(Vec::len).sum();
@@ -339,6 +332,8 @@ impl Shard {
         let connection = std::mem::replace(&mut self.connection, placeholder);
         // Closing would otherwise checkpoint the WAL into the corrupt
         // database and delete it, leaving quarantine nothing to move.
+        // Best effort after corruption: even if this setting fails, close the
+        // connection and attempt quarantine rather than continue using it.
         let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(ShardError::Io)?;
@@ -417,7 +412,8 @@ impl Shard {
             return Ok(0);
         }
         let candidates: Vec<Box<str>> = self.orphan_candidates.iter().cloned().collect();
-        self.connection.progress_handler(1_000, Some(cancel));
+        self.connection
+            .progress_handler(MAINTENANCE_PROGRESS_STEPS, Some(cancel));
         let result = delete_orphans(&mut self.connection, &candidates);
         self.connection.progress_handler(0, None::<fn() -> bool>);
         let removed = match result {
@@ -483,7 +479,8 @@ impl Shard {
             if material.contains(&name) {
                 continue;
             }
-            self.connection.progress_handler(1_000, Some(cancel));
+            self.connection
+                .progress_handler(MAINTENANCE_PROGRESS_STEPS, Some(cancel));
             let result = self.connection.execute_batch(&format!(
                 "CREATE INDEX IF NOT EXISTS {name} ON events({expression})"
             ));
@@ -719,6 +716,22 @@ fn delete_orphans(
 
 const ORPHAN_DELETE: &str = "DELETE FROM event_types WHERE event_type = ?1 \
      AND NOT EXISTS (SELECT 1 FROM events WHERE event_type = ?1 COLLATE NOCASE)";
+
+/// Both ingestion paths store receipt endpoints with the same checked SQL conversion.
+fn insert_receipt_range(
+    statement: &mut Statement<'_>,
+    boot_id: &Guid,
+    cpu_id: u16,
+    interval: Interval,
+) -> Result<(), ShardError> {
+    statement.execute(params![
+        &boot_id[..],
+        i64::from(cpu_id),
+        sqlite_integer(interval.first, "receipt first sequence")?,
+        sqlite_integer(interval.last, "receipt last sequence")?,
+    ])?;
+    Ok(())
+}
 
 fn read_receipts(connection: &Connection) -> Result<Vec<(Guid, u16, Interval)>, ShardError> {
     let mut statement = connection
@@ -984,10 +997,11 @@ impl From<rusqlite::Error> for ShardError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Gap, RealEvent};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{Gap, RealEvent};
 
     fn event(sequence: u64, event_type: &str) -> IngestItem {
         IngestItem {

@@ -1,29 +1,21 @@
 #!/bin/sh
+# Bazel owns production builds/tests; Cargo adds diagnostic and rustdoc coverage.
 set -eu
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-gcc_include=$(gcc -print-file-name=include)
-
-if pkg-config --exists peios; then
-    unset PEIOS_LIB_DIR PEIOS_INCLUDE PKM_UAPI
-else
-    peios_root=$(CDPATH= cd -- "$repo/.." && pwd)
-    export PEIOS_LIB_DIR="$peios_root/libpeios/target/debug"
-    export PEIOS_INCLUDE="$peios_root/libpeios/include"
-    export PKM_UAPI="$peios_root/pkm/out/build/headers/usr/include"
-fi
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS:+ $BINDGEN_EXTRA_CLANG_ARGS}"
-if [ -n "${PEIOS_LIB_DIR:-}" ]; then
-    export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-
+repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+: "${PEIOS_SDK:?Set PEIOS_SDK to an explicit SDK from tools/prepare-dev-sdk}"
+python3 tools/style-check.py
+./bazel build //:build-format-check
+./bazel test //...
 
-# Model the actual queue with instrumented atomics, payload cells and waits.
-# Keep cfg(loom) artifacts separate from ordinary workspace builds.
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}/loom" \
-RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg loom" \
-cargo test --locked -p eventd-core --lib queue::loom_tests -- --test-threads=1
+# These supplemental checks use Cargo's lint configuration and compile-fail
+# documentation tests. They do not produce production programs or packages.
+export PEIOS_LIB_DIR="$PEIOS_SDK/lib"
+export PEIOS_INCLUDE="$PEIOS_SDK/include"
+export PKM_UAPI="$PEIOS_SDK/include"
+export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+gcc_include=$(gcc -print-file-name=include)
+export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS:+ $BINDGEN_EXTRA_CLANG_ARGS}"
+cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.98.1 test --workspace --doc --locked

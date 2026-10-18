@@ -208,10 +208,13 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             match commit_recovery_markers(&context) {
                 Ok(()) => {
                     recovery_complete = true;
+                    // The supervisor may already have abandoned startup; its stop
+                    // flag owns cancellation, independently of this acknowledgement.
                     let _ = context.startup.send(Ok(cpu_id));
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    // Preserve the drain failure even if startup no longer listens.
                     let _ = context.startup.send(Err(message));
                     return Err(error);
                 }

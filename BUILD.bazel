@@ -1,0 +1,143 @@
+load("//build:checks.bzl", "host_test")
+load("//packages:package.bzl", "package_store")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "BUILD.bazel",
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+filegroup(
+    name = "rust-sources",
+    srcs = ["//" + name + ":sources" for name in [
+        "eventd-core",
+        "eventd-client",
+        "eventd",
+        "evctl",
+    ]],
+)
+
+filegroup(
+    name = "artifacts",
+    srcs = [
+        "//evctl",
+        "//eventd",
+    ],
+)
+
+alias(
+    name = "bench",
+    actual = "//eventd-core:hot-path",
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "build-files",
+    srcs = [
+        "BUILD.bazel",
+        "MODULE.bazel",
+        "//build:BUILD.bazel",
+        "//build:starlark",
+        "//packages:build-files",
+        "//tools:BUILD.bazel",
+        "//vendor/ppk:BUILD.bazel",
+    ] + ["//" + name + ":BUILD.bazel" for name in [
+        "eventd-core",
+        "eventd-client",
+        "eventd",
+        "evctl",
+    ]],
+)
+
+genrule(
+    name = "build-format-check",
+    srcs = [":build-files"],
+    outs = ["build-format-check.stamp"],
+    cmd = "$(execpath @buildifier//file) -mode=check -lint=warn $(execpaths :build-files) && touch $@",
+    tools = ["@buildifier//file"],
+)
+
+host_test(
+    name = "vendor-test",
+    size = "small",
+    command = "exec python3 tools/test-bazel-vendor.py",
+    data = [
+        "//tools:bazel-vendor.py",
+        "//tools:test-bazel-vendor.py",
+    ],
+    tags = [
+        "external",
+        "no-remote",
+    ],
+)
+
+filegroup(
+    name = "package-data",
+    srcs = [
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "//packages:definitions",
+    ] + glob([
+        "docs/*.regman",
+        "docs/*.evman",
+        "docs/man/*",
+        "registry.d/*.reg",
+        "third-party/*",
+    ]) + ["//" + name + ":Cargo.toml" for name in [
+        "eventd-core",
+        "eventd-client",
+        "eventd",
+        "evctl",
+    ]],
+)
+
+filegroup(
+    name = "package-sources",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "**/.*/**",
+            "**/.*",
+            ".git",
+            ".git/**",
+            "bazel-*",
+            "bazel-*/**",
+            "target/**",
+            "out/**",
+            ".ci-sdk/**",
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "docs/learn/dist/**",
+            "pekit.toml",
+            "packages.pekit/**",
+            "packaging/**",
+        ],
+    ) + glob([
+        ".github/**",
+    ]) + [
+        ".bazelignore",
+        ".bazelrc",
+        ".bazelversion",
+        ".gitattributes",
+        ".gitignore",
+        ":package-data",
+        ":rust-sources",
+        "//build:sources",
+        "//packages:sources",
+        "//tools:sources",
+        "//vendor/ppk:sources",
+    ] + ["//" + name + ":BUILD.bazel" for name in [
+        "eventd-core",
+        "eventd-client",
+        "eventd",
+        "evctl",
+    ]],
+)
+
+package_store(
+    name = "packages",
+    packages = ["//packages:all"],
+)

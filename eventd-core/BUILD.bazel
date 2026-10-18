@@ -1,0 +1,69 @@
+load("@crates//:crates.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//build:version.bzl", "VERSION")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "BUILD.bazel",
+    "Cargo.toml",
+])
+
+filegroup(
+    name = "sources",
+    srcs = glob(
+        [
+            "src/**",
+            "benches/**",
+        ],
+        allow_empty = True,
+    ),
+)
+
+rust_library(
+    name = "eventd-core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "eventd_core",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_flags = ["--check-cfg=cfg(loom,test)"],
+    version = VERSION,
+    deps = [] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "tests",
+    size = "medium",
+    crate = ":eventd-core",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "loom-tests",
+    size = "medium",
+    timeout = "long",
+    srcs = glob(["src/**/*.rs"]),
+    args = [
+        "queue::loom_tests",
+        "--test-threads=1",
+    ],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_flags = [
+        "--cfg=loom",
+        "--check-cfg=cfg(loom,test)",
+    ],
+    version = VERSION,
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "hot-path",
+    srcs = ["benches/hot_path.rs"],
+    edition = "2024",
+    tags = ["manual"],
+    deps = [":eventd-core"],
+)

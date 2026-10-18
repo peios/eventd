@@ -17,7 +17,7 @@ fn main() {
 }
 
 fn benchmark_queue() {
-    let queue = BoundedQueue::new(4_096, 16 * 1024 * 1024).unwrap();
+    let (queue, mut receiver) = BoundedQueue::new(4_096, 16 * 1024 * 1024).unwrap();
     let started = Instant::now();
     std::thread::scope(|scope| {
         let producer = queue.clone();
@@ -27,7 +27,7 @@ fn benchmark_queue() {
             }
         });
         for _ in 0..ITEMS {
-            match queue.pop_wait() {
+            match receiver.pop_wait() {
                 Pop::Item(value) => black_box(value),
                 Pop::Empty | Pop::Closed => unreachable!(),
             };

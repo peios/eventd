@@ -1,0 +1,52 @@
+name: Eventd build and tests
+
+on:
+    pull_request:
+    push:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: eventd-check-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    check:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 40
+        steps:
+            - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  persist-credentials: false
+            - name: Install Linux development tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y build-essential libclang-dev pkg-config python3 python3-venv binutils
+                  rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+            - name: Prepare pinned PSC style tools
+              run: python3 tools/prepare-style-tools.py "$RUNNER_TEMP/eventd-style"
+            - name: Check out the native SDK library
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  repository: peios/libpeios
+                  ref: 3f2ce51c7cfc27644f72a053ca01888736905064
+                  path: .ci-sdk/libpeios
+                  persist-credentials: false
+            - name: Check out the kernel UAPI
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  repository: peios/kernel
+                  ref: 9759ae740f2a194e8f7c63dd7d88cd31604bf044
+                  path: .ci-sdk/kernel
+                  sparse-checkout: include/uapi/pkm
+                  persist-credentials: false
+            - name: Prepare the development SDK
+              run: tools/prepare-dev-sdk .ci-sdk/libpeios .ci-sdk/kernel/include/uapi "$RUNNER_TEMP/peios-sdk"
+            - name: Check style, build, tests and packages
+              env:
+                  PEIOS_SDK: ${{ runner.temp }}/peios-sdk
+                  PEIOS_STYLE_BIN: ${{ runner.temp }}/eventd-style/bin
+                  CARGO_TARGET_DIR: ${{ runner.temp }}/eventd-cargo-checks
+              run: tools/check

@@ -7,8 +7,8 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use eventd_core::{
-    BoundedQueue, DesiredIndex, Gap, Guid, IndexAction, IngestItem, Pop, Shard, ShardError,
-    SyntheticEvent,
+    BoundedQueue, DesiredIndex, Gap, Guid, IndexAction, IngestItem, Pop, QueueReceiver, Shard,
+    ShardError, SyntheticEvent,
 };
 
 use crate::commit_signal::CommitSignal;
@@ -16,6 +16,8 @@ use crate::config::{Config, SharedConfig};
 use crate::health::Shed;
 
 /// Ordered data and control messages consumed by a shard's sole owner.
+/// Reply delivery is best effort once the operation's outcome is known: a caller
+/// may have disconnected, and failed delivery does not undo a committed write.
 pub enum WriterMessage {
     /// One KMES handoff from a drain thread.
     Event(IngestItem),
@@ -32,9 +34,9 @@ pub enum WriterMessage {
 /// The writer is the queue's sole consumer, including during teardown.
 /// Closing alone wakes producers but leaves queued reply senders alive.
 /// Drain them on every exit so callers observe failure, not an endless wait.
-struct WriterExit<'a>(&'a BoundedQueue<WriterMessage>);
+struct WriterExit(QueueReceiver<WriterMessage>);
 
-impl Drop for WriterExit<'_> {
+impl Drop for WriterExit {
     fn drop(&mut self) {
         self.0.close();
         // A producer may already hold a permit. Wait for its publication or
@@ -67,14 +69,15 @@ pub fn run(
     mut shard: Shard,
     shard_index: usize,
     boot_id: Guid,
-    queue: &BoundedQueue<WriterMessage>,
+    receiver: QueueReceiver<WriterMessage>,
     runtime: &SharedConfig,
     stopping: &Arc<AtomicBool>,
     commits: &Arc<CommitSignal>,
     ring_pressure: &Arc<[AtomicU8]>,
     retention_requested: &Arc<AtomicBool>,
 ) -> Result<(), ShardError> {
-    let _exit = WriterExit(queue);
+    let mut receiver = WriterExit(receiver);
+    let queue = receiver.0.sender();
     let mut batch = Vec::with_capacity(Config::read(runtime, |config| config.max_batch_size));
     let mut pending_gaps = Vec::new();
     let mut desired: Arc<[DesiredIndex]> = Arc::from([]);
@@ -84,7 +87,7 @@ pub fn run(
     loop {
         let context = ControlContext {
             commits,
-            queue,
+            queue: &queue,
             retention_requested,
             shard_index,
             boot_id,
@@ -108,12 +111,12 @@ pub fn run(
                 }
                 continue;
             }
-            match queue.pop_wait_timeout(pressure) {
+            match receiver.0.pop_wait_timeout(pressure) {
                 Pop::Empty => continue,
                 popped => popped,
             }
         } else {
-            queue.pop_wait()
+            receiver.0.pop_wait()
         };
         // Read after the wait, so a change made while the writer was idle
         // bounds the batch this message opens, not the one after it.
@@ -149,7 +152,7 @@ pub fn run(
         let started = Instant::now();
         let mut closed = false;
         while batch.len() < max_batch_size && started.elapsed() < max_batch_latency {
-            match queue.pop() {
+            match receiver.0.pop() {
                 Pop::Item(WriterMessage::Event(item)) => batch.push(item),
                 Pop::Item(control) => {
                     if let Err(error) = commit_batch(
@@ -717,14 +720,14 @@ mod tests {
         fn run(
             &self,
             shard: Shard,
-            queue: &BoundedQueue<WriterMessage>,
+            receiver: QueueReceiver<WriterMessage>,
             runtime: &SharedConfig,
         ) -> Result<(), ShardError> {
             run(
                 shard,
                 0,
                 [1; 16],
-                queue,
+                receiver,
                 runtime,
                 &self.stopping,
                 &self.commits,
@@ -782,7 +785,7 @@ mod tests {
         );
     }
 
-    fn handoff() -> BoundedQueue<WriterMessage> {
+    fn handoff() -> (BoundedQueue<WriterMessage>, QueueReceiver<WriterMessage>) {
         BoundedQueue::new(1_024, 16 * 1024 * 1024).unwrap()
     }
 
@@ -829,7 +832,7 @@ mod tests {
                  BEGIN SELECT RAISE(FAIL, 'injected writer failure'); END;",
             )
             .unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let (barrier, barrier_result) = sync_channel(1);
         let (synthetic, synthetic_result) = sync_channel(1);
         let (maintenance, maintenance_result) = sync_channel(1);
@@ -844,7 +847,9 @@ mod tests {
         );
         delete_before(&queue, 1_000, 100, maintenance);
         let harness = Harness::new();
-        let error = harness.run(shard, &queue, &batched_by_size(1)).unwrap_err();
+        let error = harness
+            .run(shard, receiver, &batched_by_size(1))
+            .unwrap_err();
         assert!(error.to_string().contains("injected writer failure"));
         assert!(harness.stopping.load(Ordering::Acquire));
         for result in [barrier_result, synthetic_result] {
@@ -872,7 +877,7 @@ mod tests {
         use std::sync::mpsc::RecvTimeoutError;
 
         for publish_late in [false, true] {
-            let queue = BoundedQueue::new(2, 1_024).unwrap();
+            let (queue, receiver) = BoundedQueue::new(2, 1_024).unwrap();
             let held = queue.reserve(1).unwrap();
             let (reply, result) = sync_channel(1);
             publish(&queue, WriterMessage::Barrier(reply));
@@ -889,7 +894,7 @@ mod tests {
                     Err(RecvTimeoutError::Timeout),
                     "a full healthy queue still applies backpressure",
                 );
-                let exiting = scope.spawn(|| drop(WriterExit(&queue)));
+                let exiting = scope.spawn(|| drop(WriterExit(receiver)));
                 assert_eq!(
                     reservation.recv_timeout(Duration::from_secs(5)).unwrap(),
                     Some(eventd_core::ReserveError::Closed),
@@ -918,7 +923,7 @@ mod tests {
     fn a_max_batch_size_change_between_batches_bounds_the_next_batch() {
         let directory = temporary_directory();
         let shard = Shard::open(directory.join("shard-0000.db"), 1_000).unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let runtime = batched_by_size(100);
         let harness = Harness::new();
         let (settled, settled_signal) = sync_channel(1);
@@ -939,7 +944,7 @@ mod tests {
         publish(&queue, WriterMessage::Barrier(done));
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             let paused = paused;
             settled_signal.recv().unwrap().unwrap();
@@ -968,7 +973,7 @@ mod tests {
     fn a_max_batch_size_change_while_the_writer_is_idle_bounds_the_next_batch() {
         let directory = temporary_directory();
         let shard = Shard::open(directory.join("shard-0000.db"), 1_000).unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let runtime = batched_by_size(100);
         let harness = Harness::new();
         let (idle, idle_signal) = sync_channel(1);
@@ -976,7 +981,7 @@ mod tests {
         publish(&queue, WriterMessage::Barrier(idle));
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             idle_signal.recv().unwrap().unwrap();
             // The writer goes back to waiting on its empty handoff.
@@ -1013,7 +1018,7 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.join("shard-0000.db");
         let shard = Shard::open(&path, 1_000).unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let runtime = batched_by_size(10_000);
         let harness = Harness::new();
         let (first, first_result) = sync_channel(1);
@@ -1029,7 +1034,7 @@ mod tests {
         delete_before(&queue, 1_000, 100, rest);
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             // Had the command run inside or before the open batch, there
             // would have been nothing committed for it to delete.
@@ -1053,7 +1058,7 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.join("shard-0000.db");
         let shard = Shard::open(&path, 1_000).unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let runtime = batched_by_size(10_000);
         let harness = Harness::new();
         // The retention coordinator sends one command and waits for its
@@ -1064,7 +1069,7 @@ mod tests {
         delete_before(&queue, 1_000, 100, first);
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             let first_result = first_result;
             for sequence in 1..=5 {
@@ -1108,7 +1113,7 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.join("shard-0000.db");
         let shard = full_shard(&path);
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let runtime = batched_by_size(100);
         let harness = Harness::new();
         let (sent, result) = sync_channel(1);
@@ -1120,7 +1125,7 @@ mod tests {
         publish(&queue, WriterMessage::Barrier(after));
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             let reply = result.recv().unwrap();
             assert!(
@@ -1152,7 +1157,7 @@ mod tests {
             full_shard(&paths[0]),
             Shard::open(&paths[1], 1_000).unwrap(),
         ];
-        let queues = [handoff(), handoff()];
+        let (queues, receivers): (Vec<_>, Vec<_>) = [handoff(), handoff()].into_iter().unzip();
         let runtime = batched_by_size(100);
         let harnesses = [Harness::new(), Harness::new()];
         let change = crate::config::AppliedChange {
@@ -1171,11 +1176,11 @@ mod tests {
         std::thread::scope(|scope| {
             let writers: Vec<_> = shards
                 .into_iter()
-                .zip(&queues)
+                .zip(receivers)
                 .zip(&harnesses)
-                .map(|((shard, queue), harness)| {
+                .map(|((shard, receiver), harness)| {
                     let runtime = &runtime;
-                    scope.spawn(move || harness.run(shard, queue, runtime))
+                    scope.spawn(move || harness.run(shard, receiver, runtime))
                 })
                 .collect();
             let _closing = (CloseOnDrop(&queues[0]), CloseOnDrop(&queues[1]));
@@ -1212,7 +1217,7 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.join("shard-0000.db");
         let shard = Shard::open(&path, 1_000).unwrap();
-        let queue = handoff();
+        let (queue, receiver) = handoff();
         let mut config = Config::test_defaults();
         config.max_batch_size = 10;
         config.max_batch_latency = Duration::from_mins(1);
@@ -1242,7 +1247,7 @@ mod tests {
         );
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| harness.run(shard, &queue, &runtime));
+            let writer = scope.spawn(|| harness.run(shard, receiver, &runtime));
             let _closing = CloseOnDrop(&queue);
             let deadline = Instant::now() + Duration::from_secs(10);
             while !index_present() {

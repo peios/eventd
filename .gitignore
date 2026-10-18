@@ -1,2 +1,8 @@
-/target
-/out
+/target/
+/out/
+/bazel-*
+/.ci-sdk/
+**/__pycache__/
+**/.ruff_cache/
+/docs/learn/dist/
+/docs/learn/.trail-cache/

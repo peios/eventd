@@ -1,0 +1,3 @@
+title = "eventd"
+short = "eventd"
+description = "The eventd technical reference manual: ingestion, durable storage, authorization, and query execution."

@@ -336,8 +336,8 @@ mod tests {
         let tracker = Arc::new(Tracker::from_persisted(Vec::new(), Arc::clone(&runtime)));
         tracker.prioritize("emitter.process.guid");
         let desired = Arc::new(RwLock::new(Vec::new()));
-        let queues: Arc<[BoundedQueue<WriterMessage>]> =
-            Arc::from(vec![BoundedQueue::new(16, 1 << 20).unwrap()]);
+        let (queue, mut events) = BoundedQueue::new(16, 1 << 20).unwrap();
+        let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from([queue]);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let (reply, replied) = std::sync::mpsc::sync_channel(1);
         sender
@@ -361,11 +361,11 @@ mod tests {
         .unwrap();
         assert_eq!(replied.recv().unwrap(), Ok(()));
         assert!(
-            matches!(queues[0].pop(), Pop::Item(WriterMessage::IndexPolicy(set)) if set.is_empty()),
+            matches!(events.pop(), Pop::Item(WriterMessage::IndexPolicy(set)) if set.is_empty()),
             "the startup broadcast"
         );
         assert!(
-            matches!(queues[0].pop(), Pop::Empty),
+            matches!(events.pop(), Pop::Empty),
             "and none from the final run"
         );
 

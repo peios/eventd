@@ -346,10 +346,13 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
 
-    pub fn frame(payload: &[u8]) -> Vec<u8> {
+    use peios::msgpack::{Reader, Writer};
+
+    use super::{Connection, Error, Response, Value, decode_response};
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::from(u32::try_from(payload.len()).unwrap().to_le_bytes());
         frame.extend_from_slice(payload);
         frame

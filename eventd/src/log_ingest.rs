@@ -186,6 +186,8 @@ pub fn run(
     Ok(())
 }
 
+/// Complete maintenance even if its requester disappears. Reply delivery cannot
+/// undo the store operation, so a disconnected reply channel is deliberately ignored.
 fn process_maintenance(
     store: &mut LogStore,
     receiver: &Receiver<LogMaintenance>,
@@ -530,6 +532,7 @@ mod tests {
         commits: Arc<CommitSignal>,
         retention_requested: Arc<AtomicBool>,
         error_events: Arc<[BoundedQueue<WriterMessage>]>,
+        _error_receiver: eventd_core::QueueReceiver<WriterMessage>,
     }
 
     impl LogThread {
@@ -547,6 +550,7 @@ mod tests {
             let mut config = Config::test_defaults();
             config.log_max_batch_size = max_batch_size;
             config.log_max_batch_latency = Duration::from_mins(1);
+            let (errors, error_receiver) = BoundedQueue::new(16, 1 << 20).unwrap();
             Self {
                 socket_path: directory.join("log.sock"),
                 directory,
@@ -554,7 +558,8 @@ mod tests {
                 stopping: Arc::new(AtomicBool::new(false)),
                 commits: Arc::new(CommitSignal::new()),
                 retention_requested: Arc::new(AtomicBool::new(false)),
-                error_events: Arc::from([BoundedQueue::new(16, 1 << 20).unwrap()]),
+                error_events: Arc::from([errors]),
+                _error_receiver: error_receiver,
             }
         }
 
@@ -746,10 +751,9 @@ mod tests {
             }
         }
 
-        let queues: Arc<[BoundedQueue<WriterMessage>]> = (0..2)
-            .map(|_| BoundedQueue::new(16, 1 << 20).unwrap())
-            .collect::<Vec<_>>()
-            .into();
+        let (first_queue, mut first) = BoundedQueue::new(16, 1 << 20).unwrap();
+        let (second_queue, mut second) = BoundedQueue::new(16, 1 << 20).unwrap();
+        let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from([first_queue, second_queue]);
         let (stored, delivered) = channel();
         std::thread::scope(|scope| {
             // Dropped in reverse: the queues close, shard 0 is let go, and
@@ -757,7 +761,6 @@ mod tests {
             let mut reporter = SyntheticReporter::new(Arc::clone(&queues));
             let (release, held) = sync_channel::<()>(0);
             let _close = CloseOnDrop(&queues);
-            let (first, second) = (&queues[0], &queues[1]);
             // Shard 0 is full: it refuses, but only once the test lets it.
             scope.spawn(move || {
                 if let eventd_core::Pop::Item(WriterMessage::Synthetic(_, response)) =

@@ -257,12 +257,7 @@ pub const MAX_OBJECT_TYPES: usize = 1024;
 /// the deepest name.
 #[must_use]
 pub fn field_tree<S: AsRef<str>>(root: [u8; 16], fields: &[S]) -> FieldTree {
-    /// One node: its path, and its children in the order first named.
-    struct Node<'a> {
-        path: &'a str,
-        children: Vec<usize>,
-    }
-    let mut nodes = vec![Node {
+    let mut nodes = vec![FieldNode {
         path: "",
         children: Vec::new(),
     }];
@@ -279,7 +274,7 @@ pub fn field_tree<S: AsRef<str>>(root: [u8; 16], fields: &[S]) -> FieldTree {
             parent = if let Some(&node) = found.get(path) {
                 node
             } else {
-                nodes.push(Node {
+                nodes.push(FieldNode {
                     path,
                     children: Vec::new(),
                 });
@@ -292,6 +287,23 @@ pub fn field_tree<S: AsRef<str>>(root: [u8; 16], fields: &[S]) -> FieldTree {
         ends.push(parent);
     }
 
+    let (entries, position) = preorder_entries(root, &nodes);
+    FieldTree {
+        fields: ends.into_iter().map(|node| position[node]).collect(),
+        entries,
+    }
+}
+
+/// A field path and its children in the order first named.
+struct FieldNode<'a> {
+    path: &'a str,
+    children: Vec<usize>,
+}
+
+fn preorder_entries(
+    root: [u8; 16],
+    nodes: &[FieldNode<'_>],
+) -> (Vec<peios_sys::kacs_object_type_entry>, Vec<usize>) {
     // Preorder: each node, then its children's subtrees in turn.
     let mut entries = Vec::with_capacity(nodes.len());
     let mut position = vec![0; nodes.len()];
@@ -313,10 +325,7 @@ pub fn field_tree<S: AsRef<str>>(root: [u8; 16], fields: &[S]) -> FieldTree {
             stack.push((child, depth + 1));
         }
     }
-    FieldTree {
-        fields: ends.into_iter().map(|node| position[node]).collect(),
-        entries,
-    }
+    (entries, position)
 }
 
 /// An object type list built by [`field_tree`].
@@ -330,6 +339,8 @@ pub struct FieldTree {
 
 impl FieldTree {
     /// Whether the node at `index` has nodes beneath it.
+    ///
+    /// `index` must identify an entry in this tree.
     #[must_use]
     pub fn has_children(&self, index: usize) -> bool {
         self.entries
@@ -372,6 +383,9 @@ pub struct FieldReads {
 
 /// Whether the record and each of `fields` may be read, by `check`, which
 /// makes the access check over an object type list and answers per node.
+///
+/// On success, `check` must return exactly one verdict for each input entry,
+/// in the same order. This is the contract of KACS's list access check.
 ///
 /// A field is read when the first ACE to decide `EVENTD_READ` for it,
 /// in DACL order, allows it, of those that name its GUID, the GUID of any

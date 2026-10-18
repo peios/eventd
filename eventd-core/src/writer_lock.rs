@@ -1,7 +1,8 @@
 //! How long a store's writer connection waits for `SQLite`'s write lock.
 
-use rusqlite::Connection;
 use std::time::Duration;
+
+use rusqlite::Connection;
 
 /// The longest a writer waits for the write lock before its transaction
 /// fails with `SQLITE_BUSY`.

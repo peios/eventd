@@ -32,7 +32,7 @@ pub use model::{
     STORE_QUARANTINED, STORE_WRITTEN_TYPES, SyntheticEvent, is_store_written,
 };
 pub use payload_index::{PayloadIndexValue, query_key as payload_query_key};
-pub use queue::{BoundedQueue, Pop, QueueConfigError, ReserveError};
+pub use queue::{BoundedQueue, Pop, QueueConfigError, QueueReceiver, ReserveError};
 pub use receipt::{Coverage, Interval};
 pub use reconcile::{Observation, ReconcileError, Reconciler};
 pub use routing::{StripeRouter, assigned_shards};

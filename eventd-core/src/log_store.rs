@@ -182,6 +182,8 @@ impl LogStore {
         let connection = std::mem::replace(&mut self.connection, placeholder);
         // Closing would otherwise checkpoint the WAL into the corrupt
         // database and delete it, leaving quarantine nothing to move.
+        // Best effort after corruption: even if this setting fails, close the
+        // connection and attempt quarantine rather than continue using it.
         let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(LogStoreError::Io)?;

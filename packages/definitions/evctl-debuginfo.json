@@ -1,0 +1,19 @@
+{
+    "package": {
+        "version": "0.1.11-1",
+        "architecture": "x86_64",
+        "license": "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense)",
+        "license_class": "free",
+        "homepage": "https://github.com/peios/eventd",
+        "name": "dev.peios.evctl-debuginfo",
+        "description": "Debugging symbols for the Peios eventd query client"
+    },
+    "dependencies": {
+        "dev.peios.evctl": "= 0.1.11-1"
+    },
+    "files": {
+        "source:LICENSE": "usr/share/licenses/dev.peios.evctl-debuginfo/LICENSE",
+        "stage:licenses/evctl/**": "usr/share/licenses/dev.peios.evctl-debuginfo/third-party",
+        "stage:debug/evctl/usr/lib/debug/**": "usr/lib/debug"
+    }
+}
