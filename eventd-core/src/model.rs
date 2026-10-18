@@ -69,6 +69,9 @@ pub fn is_store_written(event_type: &str) -> bool {
 }
 
 /// A missing inclusive sequence interval revealed by a real event.
+///
+/// Callers must provide `1 <= first_sequence <= last_sequence`. The reconciler
+/// establishes this invariant before constructing gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gap {
     /// First missing sequence.

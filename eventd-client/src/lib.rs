@@ -117,7 +117,8 @@ impl Tail {
 impl Drop for Tail {
     fn drop(&mut self) {
         // The thread may be waiting to hand over a report; it finds the
-        // channel gone once this `Tail` is, and the socket closed.
+        // channel gone once this `Tail` is, and the socket closed. Shutdown
+        // errors need no recovery: dropping the handles still closes the socket.
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -146,6 +147,7 @@ fn follow(mut connection: Connection<UnixStream>, sender: &SyncSender<Tailed>) {
             return;
         }
     };
+    // A disconnected receiver means the caller dropped its Tail; no report is needed.
     let _ = sender.send(Tailed::Ended(ended));
 }
 
@@ -191,11 +193,13 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use peios::msgpack::Writer;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
+
+    use peios::msgpack::Writer;
+
+    use super::{Error, Record, Tail, Tailed, UnixStream, Value, PathBuf, query};
 
     fn status(status: &str) -> Vec<u8> {
         let mut writer = Writer::new();

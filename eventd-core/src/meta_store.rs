@@ -42,8 +42,8 @@ pub struct MetaStore {
     page_size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// One persisted adaptive-index frequency counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCounter {
     /// Query-language field or flattened payload path.
     pub field_path: String,
@@ -53,8 +53,8 @@ pub struct IndexCounter {
     pub window_start: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// One member of the global desired secondary-index set.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredIndex {
     /// Query-language field or flattened payload path.
     pub field_path: String,

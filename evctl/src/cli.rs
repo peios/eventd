@@ -215,8 +215,11 @@ fn quote(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::ffi::OsString;
     use std::path::Path;
+
+    use super::{Action, Arguments, Error, QuerySource};
+    use crate::output::Format;
 
     fn parse(arguments: &[&str]) -> Result<Arguments, Error> {
         Arguments::parse(arguments.iter().map(OsString::from))

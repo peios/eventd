@@ -370,6 +370,8 @@ impl MetricStore {
         let connection = std::mem::replace(&mut self.connection, placeholder);
         // Closing would otherwise checkpoint the WAL into the corrupt
         // database and delete it, leaving quarantine nothing to move.
+        // Best effort after corruption: even if this setting fails, close the
+        // connection and attempt quarantine rather than continue using it.
         let _ = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         drop(connection);
         crate::quarantine::database(&path).map_err(MetricStoreError::Io)?;
@@ -585,11 +587,15 @@ fn boundary_blob(boundaries: &[f64]) -> Box<[u8]> {
     output.into_boxed_slice()
 }
 
+// FNV-1a identifies candidate series; exact labels and boundaries resolve collisions.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 fn hash_for_sql(bytes: &[u8]) -> i64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut hash = FNV_OFFSET_BASIS;
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     i64::try_from(hash & 0x7fff_ffff_ffff_ffff).expect("high bit cleared")
 }

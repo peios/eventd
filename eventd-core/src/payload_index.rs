@@ -7,6 +7,11 @@ use rusqlite::{Connection, Result as SqlResult};
 const FUNCTION: &str = "eventd_payload_key";
 const MAX_DEPTH: usize = 32;
 
+// Persisted index-key tags: keep these stable across writer and query versions.
+const BOOLEAN_KEY: u8 = 1;
+const STRING_KEY: u8 = 2;
+const BINARY_KEY: u8 = 3;
+
 /// A query literal that can safely narrow through the payload index.
 #[derive(Clone, Copy)]
 pub enum PayloadIndexValue<'a> {
@@ -22,16 +27,16 @@ pub enum PayloadIndexValue<'a> {
 #[must_use]
 pub fn query_key(value: PayloadIndexValue<'_>) -> Vec<u8> {
     match value {
-        PayloadIndexValue::Bool(value) => vec![1, u8::from(value)],
+        PayloadIndexValue::Bool(value) => vec![BOOLEAN_KEY, u8::from(value)],
         PayloadIndexValue::String(value) => {
             let mut output = Vec::with_capacity(value.len() + 1);
-            output.push(2);
+            output.push(STRING_KEY);
             output.extend(value.bytes().map(fold_ascii));
             output
         }
         PayloadIndexValue::Binary(value) => {
             let mut output = Vec::with_capacity(value.len() + 1);
-            output.push(3);
+            output.push(BINARY_KEY);
             output.extend_from_slice(value);
             output
         }

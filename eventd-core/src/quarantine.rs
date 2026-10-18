@@ -59,6 +59,9 @@ fn database_at(path: &Path, timestamp: u128) -> Result<PathBuf, std::io::Error> 
     let mut renamed = Vec::with_capacity(present.len());
     for (source, target) in present.iter().zip(&targets) {
         if let Err(error) = std::fs::rename(source, target) {
+            // Rollback is best effort: preserve the original failure if a second
+            // filesystem error prevents restoration. Any unmoved files remain
+            // available under their quarantine names for manual recovery.
             for (original, quarantined) in renamed.iter().rev() {
                 let _ = std::fs::rename(quarantined, original);
             }
@@ -106,6 +109,8 @@ impl Preserved {
                     Ok(_) => Saved::Taken(copy),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Saved::Absent,
                     Err(error) => {
+                        // Discard a possibly partial backup. A cleanup failure
+                        // must not hide the preservation failure reported below.
                         let _ = std::fs::remove_file(&copy);
                         failure = Some(format!(
                             "{} could not be preserved before opening: {error}",
@@ -154,6 +159,8 @@ impl Drop for Preserved {
     fn drop(&mut self) {
         for (_, state) in &self.sidecars {
             if let Saved::Taken(copy) = state {
+                // These are disposable backups; failure only leaves an extra
+                // file and cannot change the live database or recovery result.
                 let _ = std::fs::remove_file(copy);
             }
         }

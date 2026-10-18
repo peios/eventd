@@ -49,6 +49,8 @@ pub enum Failure {
     HeldBytes,
 }
 
+// Workers publish process-lifetime counters independently. Relaxed reads are sufficient
+// for diagnostic totals; STARTED publishes the immutable layout before per-slot updates.
 static LOGS_STORED: AtomicU64 = AtomicU64::new(0);
 static METRICS_STORED: AtomicU64 = AtomicU64::new(0);
 static SHEDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -82,6 +84,7 @@ struct Started {
 static STARTED: OnceLock<Started> = OnceLock::new();
 
 /// Record the daemon's layout. Counts that need it are dropped until then.
+/// Subsequent calls leave the original layout intact: worker slot indexes refer to it.
 pub fn start(layout: Layout) {
     let _ = STARTED.set(Started {
         events_stored: (0..layout.shards).map(|_| AtomicU64::new(0)).collect(),
