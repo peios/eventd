@@ -443,6 +443,8 @@ fn process_rollups(
     }
 }
 
+/// Complete maintenance even if its requester disappears. Reply delivery cannot
+/// undo the store operation, so a disconnected reply channel is deliberately ignored.
 fn process_maintenance(
     store: &mut MetricStore,
     receiver: &Receiver<MetricMaintenance>,
@@ -1023,6 +1025,7 @@ mod tests {
         stopping: Arc<AtomicBool>,
         retention_requested: Arc<AtomicBool>,
         error_events: Arc<[BoundedQueue<WriterMessage>]>,
+        _error_receiver: eventd_core::QueueReceiver<WriterMessage>,
     }
 
     impl MetricThread {
@@ -1039,12 +1042,14 @@ mod tests {
             std::fs::create_dir(&directory).unwrap();
             let mut config = Config::test_defaults();
             config.health_metric_interval = Duration::ZERO;
+            let (errors, error_receiver) = BoundedQueue::new(16, 1 << 20).unwrap();
             Self {
                 directory,
                 runtime: config.shared(),
                 stopping: Arc::new(AtomicBool::new(false)),
                 retention_requested: Arc::new(AtomicBool::new(false)),
-                error_events: Arc::from([BoundedQueue::new(16, 1 << 20).unwrap()]),
+                error_events: Arc::from([errors]),
+                _error_receiver: error_receiver,
             }
         }
 

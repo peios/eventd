@@ -654,8 +654,8 @@ mod tests {
         let ceiling = crate::config::PORTABLE_INGEST_DATAGRAM_BYTES as usize;
         let log_socket = IngestionSocket::unprotected(&socket_path, ceiling).unwrap();
         let metric_socket = IngestionSocket::unprotected(&metric_socket_path, ceiling).unwrap();
-        let queues: Arc<[BoundedQueue<WriterMessage>]> =
-            Arc::from([BoundedQueue::new(1_024, 1 << 24).unwrap()]);
+        let (queue, receiver) = BoundedQueue::new(1_024, 1 << 24).unwrap();
+        let queues: Arc<[BoundedQueue<WriterMessage>]> = Arc::from([queue]);
         let queue = &queues[0];
         let stopping = Arc::new(AtomicBool::new(false));
         let event_commits = Arc::new(CommitSignal::new());
@@ -676,7 +676,7 @@ mod tests {
                     shard,
                     0,
                     [1; 16],
-                    queue,
+                    receiver,
                     &runtime,
                     &stopping,
                     &event_commits,
@@ -882,9 +882,9 @@ mod tests {
             log_path: log_path.to_owned(),
             metric_path: PathBuf::from("/nonexistent/metrics.db"),
         };
-        let queues: Vec<BoundedQueue<WriterMessage>> = (0..2)
+        let (queues, receivers): (Vec<_>, Vec<_>) = (0..2)
             .map(|_| BoundedQueue::new(16, 1 << 20).unwrap())
-            .collect();
+            .unzip();
         let arrivals = Mutex::new(Vec::new());
         let arrived = |what: String| {
             let result = answer(&what);
@@ -892,10 +892,10 @@ mod tests {
             result
         };
         let result = std::thread::scope(|scope| {
-            for (index, queue) in queues.iter().enumerate() {
+            for (index, mut receiver) in receivers.into_iter().enumerate() {
                 let arrived = &arrived;
                 scope.spawn(move || {
-                    while let Pop::Item(message) = queue.pop_wait() {
+                    while let Pop::Item(message) = receiver.pop_wait() {
                         let WriterMessage::Maintenance(command, response) = message else {
                             panic!("retention sent an event writer something else");
                         };
