@@ -4236,7 +4236,7 @@ fn parse_absolute_time(value: &str) -> Result<i64, QueryError> {
     } else {
         (0_i64, 0_i64, 0_i64)
     };
-    if hour > 23 || minute > 59 || second > 59 {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
         return Err(QueryError::InvalidTime);
     }
     let days = days_from_civil(year, month, day);
@@ -4818,6 +4818,17 @@ mod tests {
             referenced_fields(&metric),
             ["boot_id".to_owned(), "core".to_owned(), "value".to_owned()]
         );
+    }
+
+    #[test]
+    fn negative_clock_components_are_rejected() {
+        for value in [
+            "1970-01-01T-1:00:00",
+            "1970-01-01T00:-1:00",
+            "1970-01-01T00:00:-1",
+        ] {
+            assert!(parse_absolute_time(value).is_err(), "{value}");
+        }
     }
 
     #[test]
