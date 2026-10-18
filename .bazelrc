@@ -1,0 +1,16 @@
+build --jobs=6
+build --compilation_mode=opt
+build --incompatible_strict_action_env
+build --action_env=PATH=/usr/bin:/bin
+test --test_output=errors
+
+# Native Peios builds use the installed CET-enabled compiler and standard library.
+build:peios --extra_toolchains=@peios_rust//:toolchain
+build:peios --compilation_mode=opt
+build:peios --strip=never
+build:peios --define=peios_native=true
+# Native builds run inside the caller-provided isolated Peios userspace.
+build:peios --spawn_strategy=local
+build:peios --genrule_strategy=local
+# Package workers can mount the same source tree at different paths.
+build:peios --symlink_prefix=/

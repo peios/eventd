@@ -1,0 +1,53 @@
+load("@ppk_crates//:crates.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+filegroup(
+    name = "sources",
+    srcs = [
+        "BUILD.bazel",
+        "Cargo.lock",
+        "Cargo.toml",
+        "ORIGIN",
+    ] + glob([
+        "src/**/*.rs",
+        "tests/**/*.rs",
+    ]),
+)
+
+rust_library(
+    name = "lib",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_name = "ppk",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "ppk",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":lib"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "commit-test",
+    srcs = ["tests/commit.rs"],
+    aliases = aliases(normal_dev = True),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":lib"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

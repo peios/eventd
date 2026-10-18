@@ -1,0 +1,36 @@
+load("@crates//:crates.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("//build:version.bzl", "VERSION")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "BUILD.bazel",
+    "Cargo.toml",
+])
+
+filegroup(
+    name = "sources",
+    srcs = glob(
+        [
+            "src/**",
+            "benches/**",
+        ],
+        allow_empty = True,
+    ),
+)
+
+rust_binary(
+    name = "evctl",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = VERSION,
+    deps = ["//eventd-client"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "binary-tests",
+    size = "small",
+    crate = ":evctl",
+)
