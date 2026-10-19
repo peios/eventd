@@ -143,6 +143,6 @@ trail lint docs/learn
 trail build docs/learn --strict --out /tmp/eventd-learn
 ```
 
-Panorama merges this component's `peios.antho` contribution into the shared
+Panorama merges this component's `peios.product` contribution into the shared
 Peios documentation. Validate that combined tree when changing shared links
 or citation targets. Keep generated output out of source control.
