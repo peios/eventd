@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+qualifier=${PEIOS_QUALIFY:-peios-qualify}
+exec "$qualifier" run --suite eventd "$@"
