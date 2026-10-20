@@ -17,7 +17,7 @@ can mix unrelated attempts. Preserve available records before changing
 retention or attempting storage recovery.
 
 For Event Viewer controls and visibility notices, follow [Reading Events and
-Logs](~peios/desktop-event-viewer/reading-events-and-logs). The daemon checks
+Logs](~peios/reading-records/reading-events-and-logs). The daemon checks
 below apply regardless of the client.
 
 ## Inspect the result

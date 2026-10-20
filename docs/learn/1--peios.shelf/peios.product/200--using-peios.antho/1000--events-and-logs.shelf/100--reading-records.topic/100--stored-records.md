@@ -41,7 +41,7 @@ and histograms describe distributions. Compare samples within the same label
 set and account for producer restarts before interpreting a counter's rate.
 eventd publishes its own health under `eventd.*`.
 
-Use [Event Viewer](~peios/desktop-event-viewer/event-viewer) for interactive
+Use [Event Viewer](~peios/reading-records/event-viewer) for interactive
 inspection, or [query records](~peios/reading-records/querying-records) with
 `evctl`. Its read policy is the same boundary for either client.
 
