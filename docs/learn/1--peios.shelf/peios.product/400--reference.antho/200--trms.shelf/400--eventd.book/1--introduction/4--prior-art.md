@@ -13,7 +13,7 @@ The responsibilities are divided as follows:
 
 | Concern | Owner |
 |---|---|
-| Event emission and ring-buffer transport | Kernel messaging and event subsystem (KMES) |
+| Event emission and ring-buffer transport | Kernel mediated event subsystem (KMES) |
 | Event type names and payload meanings | The emitting component |
 | Token and access-check primitives | Kernel access control subsystem (KACS) |
 | Registry storage and access | Layered configuration subsystem (LCS) and loregd |

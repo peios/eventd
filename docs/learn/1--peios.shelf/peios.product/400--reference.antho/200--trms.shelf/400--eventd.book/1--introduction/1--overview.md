@@ -89,7 +89,7 @@ External producers measure and push their own samples.
 entirely. [*overview.eventd-implements-no-distributed-tracing]
 
 **It exposes committed history.** A consumer that needs direct event
-transport can attach to kernel messaging and event subsystem (KMES) rings.
+transport can attach to kernel mediated event subsystem (KMES) rings.
 eventd adds storage and query authorization; records become queryable
 after their batch commits. That delay depends on the workload and storage.
 [*overview.eventd-costs-a-batch-commit-interval-of-latency-over-kmes]

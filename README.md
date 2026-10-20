@@ -14,8 +14,8 @@ The workspace contains four crates:
 - `evctl`: the command-line query client.
 
 Read [the contributor guide](docs/building.md) to build, test, and package
-the workspace. Start with [Stored Records](docs/learn/1--peios.shelf/peios.product/200--events-and-logs.shelf/100--reading-records.topic/100--stored-records.md)
-for the reader documentation, or the [eventd technical reference manual](docs/learn/1--peios.shelf/peios.product/200--events-and-logs.shelf/400--eventd.book/1--introduction/1--overview.md)
+the workspace. Start with [Stored Records](docs/learn/1--peios.shelf/peios.product/200--using-peios.antho/1000--events-and-logs.shelf/100--reading-records.topic/100--stored-records.md)
+for the reader documentation, or the [eventd technical reference manual](docs/learn/1--peios.shelf/peios.product/400--reference.antho/200--trms.shelf/400--eventd.book/1--introduction/1--overview.md)
 for implementation details.
 
 Command manuals live in [docs/man](docs/man). Registry and event references
