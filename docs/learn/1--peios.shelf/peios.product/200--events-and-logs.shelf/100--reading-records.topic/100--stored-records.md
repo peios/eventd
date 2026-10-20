@@ -20,6 +20,31 @@ The stores hold these records:
 A metric series combines a name with its labels. Samples from different
 label sets belong to different series even when they share a name.
 
+## Producers and record meaning
+
+Service output reaches eventd through peinit's output broker. A log retains
+its origin, stream, and run context. Hooks and health checks can have their
+own origin suffixes under the service name; jobs have job identifiers. A
+service attached through `TTYPath` writes to its terminal instead of that
+capture path. Standard error identifies a stream, not necessarily an error.
+Read [Service Output and
+Logging](~peios/services-and-jobs/output-and-logging) for capture and
+backpressure behavior.
+
+Structured events identify a type and carry fields defined by its event
+catalog. Use `evman` to interpret those fields rather than inferring identity
+or causation from the event name. A kernel ring is volatile; eventd supplies
+stored history within collection and retention limits.
+
+Counters describe accumulating quantities, gauges describe changing levels,
+and histograms describe distributions. Compare samples within the same label
+set and account for producer restarts before interpreting a counter's rate.
+eventd publishes its own health under `eventd.*`.
+
+Use [Event Viewer](~peios/desktop-event-viewer/event-viewer) for interactive
+inspection, or [query records](~peios/reading-records/querying-records) with
+`evctl`. Its read policy is the same boundary for either client.
+
 ## Visibility
 
 Queries run with the caller's socket identity. eventd checks access to
