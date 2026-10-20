@@ -33,7 +33,7 @@ Supplied signed tools must be signed for the test image's trust policy.
 The runner resolves supplied tools; it does not compile or sign them.
 Missing inputs fail the run, and skipped cases make the result incomplete.
 
-Read [the qualification guide](https://learn.peios.org/peios/test-ownership)
+Read [the qualification guide](https://learn.peios.org/peios/developing-for-peios/qualification/test-ownership)
 for ownership, composition, and result contracts. Imported assertions retain
 their historical specification references; the migration does not certify
 those references or establish runtime qualification.
