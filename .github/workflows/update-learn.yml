@@ -1,0 +1,18 @@
+name: Update Learn
+
+# Asks Learn to redeploy when this repository's documentation changes. The
+# same file goes in every repository that contributes to Learn.
+on:
+    push:
+        paths: ["docs/**"]
+
+permissions: {}
+
+jobs:
+    dispatch:
+        if: github.ref_name == github.event.repository.default_branch
+        runs-on: ubuntu-latest
+        steps:
+            - run: gh api repos/peios/learn/dispatches -f event_type=docs-changed
+              env:
+                  GH_TOKEN: ${{ secrets.LEARN_DISPATCH_TOKEN }}
