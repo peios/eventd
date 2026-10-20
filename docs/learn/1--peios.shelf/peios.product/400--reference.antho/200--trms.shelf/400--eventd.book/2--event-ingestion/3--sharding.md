@@ -191,7 +191,7 @@ The channel is a small scheduling handoff, not storage for a complete
 transaction and not a second backlog buffer. A writer can consume and
 insert one slot while producers refill it, so a transaction can contain
 many more events than the channel can hold simultaneously.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*shard.a-transaction-may-hold-more-events-than-the-channel-can-at-once]
 Changing `MaxBatchSize` changes only the writer's next commit threshold
 and never resizes or replaces a live channel (§8.3).

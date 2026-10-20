@@ -95,7 +95,7 @@ table and does not depend on an adaptive event index being present.
 [*plan.discovery-never-scans-a-records-table-or-needs-an-adaptive-index]
 
 Catalogs can conservatively contain a name whose final retained row was
-<!-- lint-disable-next-line spelling words -->
+<!-- lint-disable-next-line spelling -->
 deleted. [*plan.a-catalogue-may-keep-a-name-whose-rows-were-all-deleted]
 That safe superset can cause an extra access check but cannot
 expose a row or omit a concrete identifier that committed successfully.

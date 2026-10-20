@@ -107,7 +107,7 @@ lagging it.
 Shards converge at their own pace. One under sustained pressure can lag
 the desired set indefinitely, and that is the correct outcome: it is
 prioritizing throughput.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*index.a-shard-under-sustained-pressure-may-lag-the-desired-set-indefinitely]
 
 ## Shedding

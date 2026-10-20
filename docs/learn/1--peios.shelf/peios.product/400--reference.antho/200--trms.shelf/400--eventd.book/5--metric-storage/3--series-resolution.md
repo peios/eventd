@@ -57,7 +57,7 @@ Resolution runs through a bounded in-memory cache mapping
 A hit is a hash table lookup with no SQLite involvement.
 [*resolve.a-cache-hit-does-not-touch-sqlite] A miss costs
 one `SELECT` on `name` and `label_hash`, after which the result is
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 inserted, evicting the least-recently-used entry if the cache is full.
 [*resolve.a-cache-miss-costs-one-select-and-evicts-the-lru-entry-when-full]
 

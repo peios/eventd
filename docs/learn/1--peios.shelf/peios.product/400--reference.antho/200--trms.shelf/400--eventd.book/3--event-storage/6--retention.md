@@ -115,7 +115,7 @@ before another command runs.
 Under urgent size pressure the owner can
 append one bounded deletion to an ingestion transaction it already has
 open, avoiding an additional commit and fsync.
-<!-- lint-disable-next-line line-length words -->
+<!-- lint-disable-next-line line-length spelling -->
 [*eventretain.under-urgent-size-pressure-one-bounded-delete-may-join-an-open-ingestion-transaction]
 
 The passive checkpoint attempted before a size measurement is also a

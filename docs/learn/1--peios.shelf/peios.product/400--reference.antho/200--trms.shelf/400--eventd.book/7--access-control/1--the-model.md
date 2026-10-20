@@ -34,7 +34,7 @@ with it forever.
 Records admitted by ingestion are stored independently of who is
 allowed to read them, and two callers querying the same store see
 different results.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*access.every-record-is-stored-regardless-of-who-may-read-it]
 
 Three reasons make this the only workable arrangement:
@@ -55,7 +55,7 @@ The query socket lets every authenticated caller connect: its
 descriptor is `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FW;;;AU)`,
 set in place of the one it would inherit from eventd's closed runtime
 directory.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*access.every-authenticated-caller-may-connect-to-the-query-socket]
 What a caller can read is decided by eventd, per identifier and per
 field, against the descriptors below, not by the socket. A socket that

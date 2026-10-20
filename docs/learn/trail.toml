@@ -6,7 +6,7 @@ featured = ["peios"]
 
 [lint]
 rules = [
-  "words", "spelling", "em-dash", "double-hyphen", "curly-quotes",
+  "spelling", "em-dash", "double-hyphen", "curly-quotes",
   "invisible-characters", "exclamation", "ampersand", "double-space",
   "title-case", "heading-case", "heading-punctuation", "heading-levels",
   "code-language", "shell-prompt", "line-length", "hex-case", "serial-comma",
@@ -20,114 +20,5 @@ proper_nouns = [
   "WAL", "MessagePack", "GUID", "GUIDs", "Loom", "JSON", "UTF-8",
 ]
 
-[[lint.words]]
-match = ["may"]
-case_sensitive = true
-message = "write \"can\" or \"might\"; MAY is only the specification keyword"
-
-[[lint.words]]
-match = ["simply", "just", "easily", "obviously", "of course"]
-message = "don't condescend; cut it"
-
-[[lint.words]]
-match = ["e.g."]
-use = "for example"
-
-[[lint.words]]
-match = ["i.e."]
-use = "that is"
-
-[[lint.words]]
-match = ["etc."]
-use = "and so on, or end the list"
-
-[[lint.words]]
-match = ["via"]
-use = "through or by using"
-
-[[lint.words]]
-match = ["vs.", "vs"]
-use = "compared with, or \"or\""
-
-[[lint.words]]
-match = ["and/or"]
-use = "A, B, or both"
-
-[[lint.words]]
-match = ["utilize*", "leverage*"]
-use = "use"
-
-[[lint.words]]
-match = ["in order to"]
-use = "to"
-
-[[lint.words]]
-match = ["whitelist*"]
-use = "allowlist"
-
-[[lint.words]]
-match = ["blacklist*"]
-use = "denylist"
-
-[[lint.words]]
-match = ["master", "slave*"]
-message = "use \"primary\" and \"replica\", or \"main\" for a branch"
-
-[[lint.words]]
-match = ["sanity check*"]
-use = "confidence check"
-
-[[lint.words]]
-match = ["dummy"]
-use = "placeholder or sample value"
-
-[[lint.words]]
-match = ["currently", "recently", "no longer", "in a future release"]
-message = "don't write about time; state the version it applies to"
-
-[[lint.words]]
-match = ["click*", "tap", "taps", "tapped", "tapping"]
-use = "select"
-
-[[lint.words]]
-match = ["afterwards", "towards"]
-message = "drop the final \"s\""
-
-[[lint.words]]
-match = [
-  "login*", "log in", "logs in", "logged in", "logging in", "log on",
-  "log off", "log out",
-]
-message = "use \"sign in\" for providing credentials and \"logon\" for what the system creates"
-
-[[lint.words]]
-match = ["we", "our", "ours"]
-message = "the documentation speaks for Peios, not a team"
-
-# Case-sensitive, so that "US" passes.
-[[lint.words]]
-match = ["us"]
-case_sensitive = true
-message = "the documentation speaks for Peios, not a team"
-
-[[lint.words]]
-rule = "spelling"
-match = [
-  "colour*", "behaviour*", "favour*", "honour*", "labour*", "neighbour*",
-  "flavour*", "humour*", "rumour*", "armour*", "harbour*", "endeavour*",
-  "centre", "centres", "centred", "metre", "metres", "fibre", "theatre",
-  "calibre", "catalogue", "catalogues", "catalogued", "licence", "licences",
-  "defence", "offence", "analyse", "analysed", "analysing", "paralyse",
-  "paralysed", "organis*", "recognis*", "realise", "realised", "realises",
-  "realising", "realisation", "initialis*", "finalis*", "customis*",
-  "normalis*", "serialis*", "deserialis*", "optimise", "optimised",
-  "optimises", "optimising", "optimisation", "minimise", "minimised",
-  "minimises", "minimising", "maximise", "maximised", "maximises",
-  "prioritis*", "standardis*", "authoris*", "categoris*", "summaris*",
-  "utilis*", "emphasise", "emphasised", "emphasises", "specialis*",
-  "synchronis*", "virtualis*", "travelled", "travelling", "cancelled",
-  "cancelling", "labelled", "labelling", "modelled", "modelling",
-  "signalled", "signalling", "grey", "programme", "programmes", "whilst",
-  "amongst", "learnt", "enrol", "enrols", "judgement", "acknowledgement",
-]
-message = "use the US spelling"
+[lint.spelling]
+banned-words = ["banned-words.txt"]

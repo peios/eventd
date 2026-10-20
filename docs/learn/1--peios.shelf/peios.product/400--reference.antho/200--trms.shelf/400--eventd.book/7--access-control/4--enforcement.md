@@ -164,7 +164,7 @@ set is known, or read candidates and filter them before aggregating
 (§6.3). The externally visible result is identical to filtering first,
 and `COUNT`, `COUNT BY`, `TOP N BY` and every other aggregate reflect
 only what the caller can see.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*enforce.every-aggregate-reflects-only-what-the-caller-may-see]
 
 ## The audit trail

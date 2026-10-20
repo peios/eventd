@@ -103,7 +103,7 @@ superset avoids write work on the ingestion path.
 Low-priority maintenance can remove an entry after proving through a
 read-only scan that no row refers to it, with the deletion submitted to
 the log writer.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*logs.maintenance-may-remove-an-unreferenced-origin-through-the-log-writer]
 The writer rechecks `NOT EXISTS` in that transaction and removes the
 origin from its in-memory set only after commit, so a log arriving
@@ -168,7 +168,7 @@ The log store holds a `metadata` table with the same two-column
 structure as a shard's (§3.1).
 [*logs.the-log-store-metadata-table-has-a-shards-two-column-structure]
 Schema version 1 comprises `logs`,
-`log_origins` and `metadata`; its version number is in §B.
+`log_origins`, and `metadata`; its version number is in §B.
 [*logs.log-store-schema-version-1-comprises-logs-log-origins-and-metadata]
 
 eventd checks it at startup and applies the lifecycle rules of §4.3,

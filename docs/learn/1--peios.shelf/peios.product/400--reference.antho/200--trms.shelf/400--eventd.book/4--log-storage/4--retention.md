@@ -60,7 +60,7 @@ before the next command.
 [*logretain.each-log-retention-transaction-deletes-at-most-retentiondeletebatchrows-then-ingestion-is-rechecked]
 Under urgent size pressure the writer can
 append one bounded delete to a transaction already open.
-<!-- lint-disable-next-line line-length words -->
+<!-- lint-disable-next-line line-length spelling -->
 [*logretain.under-urgent-size-pressure-one-bounded-delete-may-join-an-open-transaction]
 Retention
 never takes a writer mutex or opens a second read-write connection

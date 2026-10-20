@@ -105,7 +105,7 @@ Under urgent size pressure the writer
 can append one bounded retention delete to a transaction it already has
 open; retention never takes a writer mutex or opens another read-write
 connection (§3.6).
-<!-- lint-disable-next-line line-length words -->
+<!-- lint-disable-next-line line-length spelling -->
 [*metricretain.urgent-size-pressure-may-add-one-bounded-delete-to-an-open-transaction]
 
 `VACUUM` is never run automatically.

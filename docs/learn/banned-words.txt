@@ -1,0 +1,52 @@
+# Words and phrases this documentation doesn't use, read by trail
+# lint's spelling rule. Each line: phrases separated by commas, then
+# "-> replacement" or ": message". See trail-lint(5).
+
+may: write "can" or "might"; MAY is only the specification keyword
+simply, just, easily, obviously, of course: don't condescend; cut it
+e.g. -> for example
+i.e. -> that is
+etc. -> and so on, or end the list
+via -> through or by using
+vs., vs -> compared with, or "or"
+and/or -> A, B, or both
+utilize*, leverage* -> use
+in order to -> to
+whitelist* -> allowlist
+blacklist* -> denylist
+master, slave*: use "primary" and "replica", or "main" for a branch
+sanity check* -> confidence check
+dummy -> placeholder or sample value
+currently, recently: don't write about time; state the version it applies to
+no longer: don't write about time; state the version it applies to
+in a future release: don't write about time; state the version it applies to
+click*, tap, taps, tapped, tapping -> select
+afterwards, towards: drop the final "s"
+login*: use "sign in" for providing credentials and "logon" for what the system creates
+log in: use "sign in" for providing credentials and "logon" for what the system creates
+logs in: use "sign in" for providing credentials and "logon" for what the system creates
+logged in: use "sign in" for providing credentials and "logon" for what the system creates
+logging in: use "sign in" for providing credentials and "logon" for what the system creates
+log on: use "sign in" for providing credentials and "logon" for what the system creates
+log off: use "sign in" for providing credentials and "logon" for what the system creates
+log out: use "sign in" for providing credentials and "logon" for what the system creates
+we, our, ours: the documentation speaks for Peios, not a team
+us: the documentation speaks for Peios, not a team
+colour*, behaviour*, favour*, honour*, labour*: use the US spelling
+neighbour*, flavour*, humour*, rumour*, armour*, harbour*: use the US spelling
+endeavour*, centre, centres, centred, metre, metres: use the US spelling
+fibre, theatre, calibre, catalogue, catalogues: use the US spelling
+catalogued, licence, licences, defence, offence, analyse: use the US spelling
+analysed, analysing, paralyse, paralysed, organis*: use the US spelling
+recognis*, realise, realised, realises, realising: use the US spelling
+realisation, initialis*, finalis*, customis*, normalis*: use the US spelling
+serialis*, deserialis*, optimise, optimised, optimises: use the US spelling
+optimising, optimisation, minimise, minimised, minimises: use the US spelling
+minimising, maximise, maximised, maximises, prioritis*: use the US spelling
+standardis*, authoris*, categoris*, summaris*, utilis*: use the US spelling
+emphasise, emphasised, emphasises, specialis*: use the US spelling
+synchronis*, virtualis*, travelled, travelling, cancelled: use the US spelling
+cancelling, labelled, labelling, modelled, modelling: use the US spelling
+signalled, signalling, grey, programme, programmes: use the US spelling
+whilst, amongst, learnt, enrol, enrols, judgement: use the US spelling
+acknowledgement: use the US spelling

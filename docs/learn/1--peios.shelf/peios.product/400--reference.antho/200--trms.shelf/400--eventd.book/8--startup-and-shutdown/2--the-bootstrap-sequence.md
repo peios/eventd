@@ -150,7 +150,7 @@ Recognizing a leftover socket needs no right on it. If an operator has
 narrowed its descriptor so that eventd cannot delete it, eventd,
 which still owns it, first puts its own descriptor back, so a narrowed
 socket never stops the next start.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*bootstrap.a-stale-socket-eventd-may-no-longer-delete-is-reclaimed-first]
 
 ## Phase 6 — threads

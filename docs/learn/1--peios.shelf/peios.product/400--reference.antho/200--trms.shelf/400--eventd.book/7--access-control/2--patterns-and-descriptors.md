@@ -106,7 +106,7 @@ write that value can therefore replace the SACL as well as the DACL, and
 removing a SACL this way needs no `SeSecurityPrivilege`: the registry
 checks the right to set the value, not the right to change audit
 policy.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*pattern.whoever-may-write-a-descriptor-value-may-also-drop-its-sacl]
 Write access to the `Security` subtree is therefore audit-policy
 authority, and only those trusted to change audit policy should hold it.

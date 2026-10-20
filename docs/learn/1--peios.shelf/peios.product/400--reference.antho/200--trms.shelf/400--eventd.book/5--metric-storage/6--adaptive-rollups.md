@@ -157,7 +157,7 @@ least `AdaptiveRollupMinSamples` raw inputs.
 It enqueues no more than
 `AdaptiveRollupBatchRows` missing windows, and submission uses `try_send` on a
 fixed-capacity channel.
-<!-- lint-disable-next-line line-length words -->
+<!-- lint-disable-next-line line-length spelling -->
 [*rollup.one-submission-carries-at-most-adaptiverollupbatchrows-windows-via-try-send]
 Repeating a wide query gradually fills its cache in
 bounded pieces without starting a background scanner.

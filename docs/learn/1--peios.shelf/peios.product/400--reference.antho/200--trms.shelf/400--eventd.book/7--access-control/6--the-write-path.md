@@ -48,7 +48,7 @@ service cannot write merely because its user SID is SYSTEM; peinit can.
 
 peinit determines `origin` from the output pipe it is draining and can
 batch records from several origins in one datagram.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*writepath.a-log-datagram-may-carry-records-from-several-origins] eventd
 therefore
 does not request or check a KACS token for each log datagram.
@@ -64,7 +64,7 @@ line. It does not prove that the line's message is truthful.
 Every authenticated caller can send to the metric socket: eventd replaces
 the descriptor it would inherit from its closed runtime directory with
 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FW;;;AU)`.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*writepath.every-authenticated-caller-may-send-to-the-metric-socket]
 Who can publish what is decided below, per metric name, against the
 token each datagram carries, so a socket that admitted fewer callers
@@ -161,7 +161,7 @@ in-memory diagnostic counters.
 [*writepath.rejected-metric-input-increments-in-memory-diagnostic-counters]
 Policy errors can produce rate-limited
 standard-error text.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*writepath.policy-errors-may-produce-rate-limited-standard-error-text]
 None produces a durable event or log record of eventd's own: doing
 work proportional to hostile input would create an amplification path

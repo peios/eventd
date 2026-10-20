@@ -128,7 +128,7 @@ boundaries and rechecks ingestion pressure after one bounded action.
 [*batch.low-priority-maintenance-runs-at-transaction-boundaries-one-bounded-action-at-a-time]
 A size-urgent retention delete can be included in an existing ingestion
 transaction so it adds no second commit.
-<!-- lint-disable-next-line words -->
+<!-- lint-disable-next-line spelling -->
 [*batch.a-size-urgent-retention-delete-may-join-an-ingestion-transaction]
 Index creation remains cancellable through SQLite's progress handler
 (§3.4). Under sustained pressure maintenance can lag indefinitely;
