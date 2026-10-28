@@ -1,21 +1,10 @@
 #!/bin/sh
-# Bazel owns production builds/tests; Cargo adds diagnostic and rustdoc coverage.
+# The contributor check: owned source style, then pekit's tests, which build
+# every member, run its tests, its Loom models and its documentation tests,
+# and check it with Clippy.
 set -eu
 
 repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
-: "${PEIOS_SDK:?Set PEIOS_SDK to an explicit SDK from tools/prepare-dev-sdk}"
 python3 tools/style-check.py
-./bazel build //:build-format-check
-./bazel test //...
-
-# These supplemental checks use Cargo's lint configuration and compile-fail
-# documentation tests. They do not produce production programs or packages.
-export PEIOS_LIB_DIR="$PEIOS_SDK/lib"
-export PEIOS_INCLUDE="$PEIOS_SDK/include"
-export PKM_UAPI="$PEIOS_SDK/include"
-export LD_LIBRARY_PATH="$PEIOS_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-gcc_include=$(gcc -print-file-name=include)
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS:+ $BINDGEN_EXTRA_CLANG_ARGS}"
-cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
-cargo +1.98.1 test --workspace --doc --locked
+pekit test

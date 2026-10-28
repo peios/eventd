@@ -1,137 +1,106 @@
 # Building and Checking eventd
 
-Build on x86-64 Linux with Python 3.11 or newer, a C compiler, binutils,
-libclang, pkg-config, gzip, curl, and Rust 1.98.1 with rustfmt and Clippy.
-The `bazel` launcher verifies and caches Bazel 8.4.2. Bazel builds each
-Rust crate directly and resolves dependencies from `Cargo.lock`.
+Use pekit to build the event daemon and its command-line client, and to run
+their tests. Pekit builds each crate on its own, so a change rebuilds only
+the crates it reaches. The supported development host is x86-64 Linux.
 
-## Prepare a development SDK
+## Before you start
 
-Select exact libpeios and kernel revisions, then prepare a new SDK directory:
+You need pekit and Git. Everything else is pinned and fetched by pekit on
+the first build: the Bootlin C toolchain, Rust 1.98.1 with Clippy, Python
+3.14, libclang, and the crates `Cargo.lock` selects. The first build needs
+network access; later builds find what they need in pekit's store, and every
+step runs without network access in a sandbox that holds only its declared
+inputs.
+
+The build files use the gcslib libraries named in `workspace.gcsl` and the
+build files, and the libraries of peios-rs and the Peios SDK. `pekit lock`
+pins their commits in `pekit.lock`.
+
+## Build
 
 ```sh
-tools/prepare-dev-sdk /path/to/libpeios /path/to/kernel/include/uapi /tmp/eventd-sdk
-export PEIOS_SDK=/tmp/eventd-sdk
+pekit build eventd evctl
 ```
 
-The helper builds libpeios with Cargo because that component owns its build
-interface. It copies its headers, the selected kernel UAPI, and
-`libpeios.so.0` into the SDK. It does not install anything on the host.
-CI pins both SDK source revisions in `.github/workflows/check.yml`.
-A development SDK uses the host ABI; it does not qualify native Peios
-security or kernel integration.
+| Target | Output |
+|---|---|
+| `eventd` | Event daemon |
+| `evctl` | Command-line client of eventd's query channel |
 
-## Build and test
+Pekit prints where each output is, under `pekit-out/<target>/`. The
+programs load `libpeios.so.0` by its shared object name (SONAME) and carry
+no runtime search path, so running them needs libpeios installed. Do not run
+the daemon on the development host as part of a build check.
+
+Programs are built with the workspace's release profile: full link-time
+optimization, one code-generation unit, and aborting panics.
+
+## Test
 
 ```sh
-./bazel build //:artifacts
-./bazel test //...
-./bazel run //evctl -- help
+pekit test
 ```
 
-The test set includes the store, daemon, client, and command-line interface
-(CLI) suites, four Loom
-queue models, package assembly and blob verification, and package-family
-policy checks. The portable store and queue tests run on a Linux host.
-Loom explores bounded publication, capacity-release, and closure schedules;
-it supplements stress tests and ownership checks.
+| Test | Check |
+|---|---|
+| `eventd_core`, `eventd_client`, `eventd`, `evctl` | Each member's unit tests |
+| `loom` | Loom's models of the queue's publication, capacity-release, and closure schedules |
+| `doctests` | Each member's documentation tests, including compile-fail checks on queue receiver ownership |
+| `clippy` | Clippy's checks of every target of every member, with every warning denied |
 
-For the full contributor check, install the pinned PSC tools into a directory
-outside the repository, then run the shared entry point:
+The `loom` test compiles eventd-core with `--cfg loom` and runs only the
+queue's models, one at a time. Loom explores bounded schedules; it
+supplements stress tests and ownership checks.
+
+A test whose inputs did not change is found in the store and not run
+again. The portable store and queue tests run on a Linux host.
+
+For the full contributor check, install the pinned PSC tools into a
+directory outside the repository, then run the shared entry point:
 
 ```sh
-python3 tools/prepare-style-tools.py /tmp/eventd-style
-export PEIOS_STYLE_BIN=/tmp/eventd-style/bin
+python3 tools/prepare-style-tools.py "$HOME/.cache/eventd-style"
+export PEIOS_STYLE_BIN="$HOME/.cache/eventd-style/bin"
 tools/check
 ```
 
-`tools/check` checks owned source formatting and lint, Starlark formatting,
-and the Bazel test set. It then uses Cargo for strict Clippy diagnostics and
-rustdoc tests, including compile-fail checks on queue receiver ownership.
-These supplemental Cargo checks do not produce the packaged programs.
-The tool versions and hashes are recorded in `tools/style-tools.lock.json`.
+`tools/check` checks owned source formatting and lint with rustfmt, Ruff,
+ShellCheck, and shfmt, then runs `pekit test`. The style checks use the
+host's Rust 1.98.1 formatter through rustup. The tool versions and hashes
+are recorded in `tools/style-tools.lock.json`. GitHub's workflow runs the
+style checks alone; builds and tests run with pekit.
 
-## Build packages
+## How the build is planned
 
-```sh
-./bazel build //:packages
-```
+`build.gcsl` plans the Cargo workspace with the gcslib rust library's
+`workspace`: Cargo works out each member's build, unit by unit, and pekit
+compiles each unit as a step. Planning reads the manifests, `Cargo.lock`,
+and which files exist, never the sources, so editing a source plans nothing
+again. Each member's crates are compiled with the lints in the workspace's
+`[lints]` table, as Cargo compiles them.
 
-The verified content-addressed store is `bazel-bin/packages.store`. It
-contains canonical manifests, compressed SHA-256 blobs, and an `index.json`
-record describing the six packages:
+Keep Rust dependency versions in the Cargo manifests and `Cargo.lock`, and
+update the lockfile deliberately with Cargo. `peios-sys` generates its
+bindings from the SDK's headers with bindgen and links libpeios, so it, and
+every crate that depends on it, is given what peios-rs's library says it
+needs, `crate_settings()`: libpeios and its headers.
 
-- `dev.peios.eventd`: daemon, registry seeds, event and registry references,
-  manual, and empty state directories.
-- `dev.peios.evctl`: query client and manual.
-- `dev.peios.eventd-debuginfo` and `dev.peios.evctl-debuginfo`: separate
-  symbols matching each runtime package version.
-- `dev.peios.eventd-debugsource`: declared source inputs for debugging.
-- `dev.peios.eventd-source`: source and build machinery.
+libpeios and its headers are built from the Peios SDK's own files, through
+the SDK's GCSL library, which peios-rs's library imports. The commits
+`pekit.lock` pins say which SDK and which peios-rs; the rust library fails a
+build whose `Cargo.lock` takes peios-rs's crates at another commit than
+`pekit.lock` pins its library at, so the crates and the settings they are
+built with always agree. authd takes the same peios-rs commit, so that a
+program linking both eventd-client and authd's crates holds one peios-sys.
 
-Packaged programs retain the workspace release profile: full link-time
-optimization, one code-generation unit, and aborting panics.
+## Not built with pekit yet
 
-Individual outputs are available under `//packages:<name>`, with the
-`dev.peios.` prefix omitted. Staging checks ELF hardening, split debug
-information, versions, licenses, manuals, and registry policy before writing
-packages. Store assembly verifies every manifest and decompresses every
-unique blob to check its content identity.
-
-The canonical manifest schema is unchanged. Dependency constraints,
-security descriptors, manual-cache effects, and the daemon's `tcb.priv`
-signing requirement remain explicit in the accompanying package metadata.
-Those records express installation and signing requirements; building the
-store does not apply them. Outputs remain unsigned and marked
-`release_ready: false`. Publication and native runtime qualification are
-separate release steps.
-
-## Build in native Peios userspace
-
-Native packaging requires an isolated Peios userspace with its CET-enabled
-Rust compiler and standard library, C toolchain, libpeios development SDK
-(at least 0.5.8, ABI 0), kernel headers, Python, and binutils. The caller owns
-that environment and its package lock. Do not run a native build against an
-unrecorded mix of host and Peios libraries.
-
-Acquire an immutable dependency snapshot on a networked development host:
-
-```sh
-tools/offline-build acquire /absolute/path/eventd-inputs
-```
-
-Copy the exact source, including `MODULE.bazel.lock`, into the isolated
-environment. Mount the acquired snapshot read-only and provide a private
-writable work directory. Inside that environment:
-
-```sh
-tools/prepare-native-sdk /tmp/eventd-native-sdk
-export PEIOS_SDK=/tmp/eventd-native-sdk
-export PEIOS_RUSTC=/usr/bin/rustc
-tools/offline-build test /eventd-inputs /eventd-work
-```
-
-The native configuration enables CET, full RELRO, immediate binding, and
-packed relocations. Package checks require the corresponding ELF properties.
-The offline wrapper refuses repository downloads and a mismatched module
-lock. It produces the package family and runs Bazel tests; it does not start
-services, install registry seeds, or sign artifacts.
-
-Native userspace tests still run on the caller's kernel. Full qualification
-requires a compatible Peios kernel and tests of KMES ingestion, KACS access
-checks, service identity, provisioning, restart recovery, and installed-client
-queries. Keep those results separate from host tests and package checks.
-
-## Measure performance
-
-```sh
-tools/bench
-```
-
-Run benchmarks on deployment-class hardware before changing queue, batch,
-index, or SQLite parameters. Record the build profile and workload with
-the result. A host microbenchmark does not measure native access checks or
-the complete ingestion path.
+Packages, the hot-path benchmark, and builds with the native Peios
+toolchain, which hardens programs with control-flow enforcement technology
+(CET), are not yet built with pekit. The package definitions and native
+build settings from the Bazel build are kept outside this repository until
+they are.
 
 ## Check documentation
 
@@ -140,7 +109,7 @@ merges at every tree level:
 
 ```sh
 trail lint docs/learn
-trail build docs/learn --strict --out /tmp/eventd-learn
+trail build docs/learn --strict --out "$HOME/.cache/eventd-learn"
 ```
 
 Panorama merges this component's `peios.product` contribution into the shared

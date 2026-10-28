@@ -132,7 +132,7 @@ pub fn drain(attachment: Attachment, mut context: DrainContext) -> Result<Attach
             // would be indistinguishable from eventd's own record, so it is
             // not stored. It is still handed to the writer, so its sequence
             // is receipted and no restart reports it lost.
-            let reserved = crate::synthetic::is_reserved(event.event_type);
+            let reserved = crate::synthetic::is_reserved(&event.event_type);
             if reserved && observation.store_event {
                 crate::diagnostics::reserved_event_type();
             }

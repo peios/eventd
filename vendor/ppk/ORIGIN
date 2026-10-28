@@ -1,5 +1,0 @@
-Snapshot of Peios ppknew, commit 9d586e59b6560a2e95eb41564fdcc759ea4f0733.
-Cargo.toml, Cargo.lock, src/*.rs and tests/commit.rs are copied unchanged.
-This is the current canonical blob and manifest writer, not a forked format.
-Bazel integration files are local. Update the snapshot deliberately and rerun
-the upstream commit tests and eventd package-store tests together.

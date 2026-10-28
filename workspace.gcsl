@@ -1,0 +1,9 @@
+# The eventd workspace: pekit builds it with the gcc library's Bootlin C
+# toolchain and the rust library's pinned Rust.
+import Toolchain::* from "github.com/gcslib/gcc"
+import Toolchain::* from "github.com/gcslib/rust"
+import Toolchain from toolchain
+
+pekitconf = {
+    toolchains = [Toolchain::C gcc_x86_64, Toolchain::Rust rust_1_98]
+}
