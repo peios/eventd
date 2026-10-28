@@ -4,8 +4,8 @@ This bundle owns 64 conformance test files and its exported fixtures.
 `suite.json` records the imported source commit and maps files into the
 qualification run layout. The original MIT notice is in `LICENSE`.
 
-Run fast unit and contract checks through this repository's existing Bazel
-checks. Run native conformance against explicitly supplied boot artifacts:
+Run fast unit and contract checks with `pekit test`. Run native conformance
+against explicitly supplied boot artifacts:
 
 ```sh
 PEIOS_QUALIFY=/path/to/integration-tests/peios-qualify \
@@ -14,10 +14,6 @@ PEIOS_QUALIFY=/path/to/integration-tests/peios-qualify \
   --composition /path/to/composition.json \
   --output /path/to/fresh-run
 ```
-
-The same entry point is available as
-`bazel run //tests/integration:check -- ...`.
-Use absolute input and output paths with Bazel.
 
 The lock selects committed suite revisions, including helper dependencies.
 To test a different committed suite, pass `--candidate eventd=/path/to/repo`.

@@ -13,12 +13,12 @@ publish = false
 crossbeam-utils = "0.8.21"
 hashlink = "0.10.0"
 libc = "0.2.175"
-# Keep the public Peios bindings release-addressable and immutable. The tag
-# predates the libpeios 0.5 ABI. This is the one libgxwi uses: a program that
-# links eventd-client and libgxwi can hold only one peios-sys, which links
-# libpeios.
-peios = { git = "https://github.com/peios/peios-rs.git", rev = "f8c84930f2b71763bcf0550df0b1420a0f63b21e", package = "peios" }
-peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "f8c84930f2b71763bcf0550df0b1420a0f63b21e", package = "peios-sys" }
+# The Peios bindings at the commit `pekit.lock` pins peios-rs's library at,
+# which the rust library requires. authd takes the same commit: a program
+# that links eventd-client and authd's crates, or libgxwi, can hold only
+# one peios-sys, which links libpeios, so they move together.
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "b2282f654758831e4a2e34c7b35c26e61a6ebe1c", package = "peios" }
+peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "b2282f654758831e4a2e34c7b35c26e61a6ebe1c", package = "peios-sys" }
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]

@@ -1,0 +1,61 @@
+# eventd's tests: each member's unit tests, as `cargo test -p` builds
+# them, eventd-core's Loom models of its queue, each member's documentation
+# tests, as `cargo test --doc` runs them, and Clippy's checks, as `cargo
+# clippy --all-targets -- -Dwarnings` makes them.
+#
+# A test's own code runs in a hermetic step of its own, so what it plans,
+# builds or fetches is in its parameters' defaults. Clippy's checks and the
+# documentation tests are steps of their own, made there.
+import "github.com/gcslib/rust"
+import "github.com/peios/peios-rs" as peios_rs
+
+# The members of the workspace, each a directory of the same name.
+let MEMBERS = ["eventd-core", "eventd-client", "eventd", "evctl"]
+
+# What every test is given: libpeios, by its soname, which a program that
+# links it loads (see peios-rs's `runtime`).
+def loaded() -> List<{at: String, place: Dir | File}> {
+    = peios_rs.runtime()
+}
+
+# Runs each of `tests`, given `given`, with `args`.
+fn ran(tests: List<rust.RustTest>, given: List<{at: String, place: Dir | File}>, args: List<String> = []) -> {} {
+    let each = for test in tests {
+        = rust.run_test(test, given = given, env = peios_rs.runtime_env(), args = args)
+    }
+}
+
+def test eventd_core(tests: List<rust.RustTest> = rust.tests(crates(), "eventd-core"), given: List<{at: String, place: Dir | File}> = loaded()) {
+    = ran(tests, given)
+}
+
+def test eventd_client(tests: List<rust.RustTest> = rust.tests(crates(), "eventd-client"), given: List<{at: String, place: Dir | File}> = loaded()) {
+    = ran(tests, given)
+}
+
+def test eventd(tests: List<rust.RustTest> = rust.tests(crates(), "eventd"), given: List<{at: String, place: Dir | File}> = loaded()) {
+    = ran(tests, given)
+}
+
+def test evctl(tests: List<rust.RustTest> = rust.tests(crates(), "evctl"), given: List<{at: String, place: Dir | File}> = loaded()) {
+    = ran(tests, given)
+}
+
+# The Loom models of eventd-core's queue: its unit tests compiled with
+# `--cfg loom`, of which only the models run, one at a time.
+def test loom(
+    tests: List<rust.RustTest> = rust.tests(crates(rustflags = ["--cfg=loom"]), "eventd-core"),
+    given: List<{at: String, place: Dir | File}> = loaded(),
+) {
+    = ran(tests, given, args = ["queue::loom_tests", "--test-threads=1"])
+}
+
+# Each member's documentation tests.
+def test doctests(
+    ran: List<List<{}>> = for each in MEMBERS {
+        = rust.doctests(crates(), each, given = loaded(), env = peios_rs.runtime_env())
+    },
+) {}
+
+# Clippy's checks of each member, every warning denied.
+def test clippy(checked: List<List<{}>> = for each in MEMBERS { = rust.clippy(crates(), each, flags = ["-Dwarnings"]) }) {}

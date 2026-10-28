@@ -1,0 +1,29 @@
+# eventd's programs, each crate compiled on its own (see the rust library's
+# `workspace`), for glibc.
+import "github.com/gcslib/clang"
+import "github.com/gcslib/rust"
+import "github.com/peios/peios-rs" as peios_rs
+
+# The eventd workspace, planned, with `rustflags` given to every crate.
+# `peios-sys` binds libpeios with bindgen and links it, so it, and every
+# crate that depends on it, is given what peios-rs's library says it needs:
+# libpeios and its headers, built from the Peios SDK's own files.
+def crates(rustflags: List<String> = []) -> rust.RustWorkspace {
+    = rust.workspace(
+        dir("."),
+        rust.vendored(file("Cargo.lock")),
+        rustflags = rustflags,
+        crates = peios_rs.crate_settings(),
+        libclang = [clang.libclang_18()],
+    )
+}
+
+# The event daemon.
+def build eventd() {
+    = rust.bin(crates(), "eventd")
+}
+
+# The command-line client of eventd's query channel.
+def build evctl() {
+    = rust.bin(crates(), "evctl")
+}

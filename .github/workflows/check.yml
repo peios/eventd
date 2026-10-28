@@ -1,0 +1,42 @@
+name: Eventd build and tests
+
+on:
+    pull_request:
+    push:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: eventd-check-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    check:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        env:
+            # pekit at a pinned commit; pekit.lock pins everything it builds with.
+            PEKIT_REV: 593d83f27a7e65199c3a5d76c8f0f10972e797ad
+            PEKIT_CACHE_DIR: ${{ github.workspace }}/../pekit-cache
+        steps:
+            - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  persist-credentials: false
+            - name: Install bubblewrap and the Rust formatter
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y bubblewrap
+                  # Ubuntu 24.04 keeps unprivileged processes from making the
+                  # user namespaces bubblewrap sandboxes each step in.
+                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+                  rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+            - name: Install pekit
+              run: cargo +1.98.1 install --locked --git https://github.com/peios/pekit --rev "$PEKIT_REV" pekit
+            - name: Prepare pinned PSC style tools
+              run: python3 tools/prepare-style-tools.py "$RUNNER_TEMP/eventd-style"
+            - name: Check style, build and tests
+              env:
+                  PEIOS_STYLE_BIN: ${{ runner.temp }}/eventd-style/bin
+              run: tools/check
