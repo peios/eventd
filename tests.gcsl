@@ -51,11 +51,21 @@ def test loom(
 }
 
 # Each member's documentation tests.
-def test doctests(
-    ran: List<List<{}>> = for each in MEMBERS {
-        = rust.doctests(crates(), each, given = loaded(), env = peios_rs.runtime_env())
-    },
-) {}
+def test doctests(ran: List<List<{}>> = documented(crates(), loaded())) {}
+
+# The documentation tests of every member of `ws`, each given `given`. The
+# workspace and `given` are made once, by the caller, and not in each
+# iteration: GCSL's scheduler can split iterations that each wait on the
+# same target's result again and again without end (see PEI-1604).
+fn documented(ws: rust.RustWorkspace, given: List<{at: String, place: Dir | File}>) -> List<List<{}>> {
+    = for each in MEMBERS { = rust.doctests(ws, each, given = given, env = peios_rs.runtime_env()) }
+}
 
 # Clippy's checks of each member, every warning denied.
-def test clippy(checked: List<List<{}>> = for each in MEMBERS { = rust.clippy(crates(), each, flags = ["-Dwarnings"]) }) {}
+def test clippy(checked: List<List<{}>> = checked_by_clippy(crates())) {}
+
+# Clippy's checks of every member of `ws`, made once by the caller, as
+# `documented` has it.
+fn checked_by_clippy(ws: rust.RustWorkspace) -> List<List<{}>> {
+    = for each in MEMBERS { = rust.clippy(ws, each, flags = ["-Dwarnings"]) }
+}
