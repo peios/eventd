@@ -68,7 +68,8 @@ tools/check
 `tools/check` checks owned source formatting and lint with rustfmt, Ruff,
 ShellCheck, and shfmt, then runs `pekit test`. The style checks use the
 host's Rust 1.98.1 formatter through rustup. The tool versions and hashes
-are recorded in `tools/style-tools.lock.json`.
+are recorded in `tools/style-tools.lock.json`. GitHub's workflow runs the
+style checks alone; builds and tests run with pekit.
 
 ## How the build is planned
 
