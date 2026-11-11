@@ -4,9 +4,15 @@
     "eventd intentionally has no compiled fallback that could write audit data",
     "somewhere an operator did not choose.",
     "",
-    "The package supplies the three empty /var/state directories. The required",
-    "ProvisionedPaths entries establish their protected inheritable descriptor",
-    "before phase 2. peinit supplies /run/eventd through RuntimeDirectories.",
+    "The required ProvisionedPaths entries create /var/state/eventd and its",
+    "three store directories with protected inheritable descriptors before",
+    "phase 2. The eventd entry sorts before eventd-events, eventd-logs and",
+    "eventd-metrics: peinit never creates unnamed parents. The image or",
+    "installer supplies /var/state. peinit supplies /run/eventd through",
+    "RuntimeDirectories.",
+    "",
+    "All four directories use this binary self-relative descriptor:",
+    "O:SYG:SYD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;S-1-5-80-1963885778-1835409261-1671587836-2279113866-1994761124)",
     "",
     "This seed is inert until an image names eventd-config.reg in its",
     "[registry] autoapply list. Tuning values are omitted because eventd's",
@@ -22,6 +28,15 @@
     },
     {
       "path": "Machine\\System\\Init\\ProvisionedPaths"
+    },
+    {
+      "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd",
+      "values": [
+        { "name": "Kind", "type": "sz", "data": "directory" },
+        { "name": "Path", "type": "sz", "data": "/var/state/eventd" },
+        { "name": "Security", "type": "binary", "data": "010004901400000020000000000000002c00000001010000000000051200000001010000000000051200000002005c000300000000031400000000100101000000000005120000000003180000000010010200000000000520000000200200000003280000000010010600000000000550000000d2840e756d1f666dfc67a2638a84d887a4a3e576" },
+        { "name": "Required", "type": "dword", "data": 1 }
+      ]
     },
     {
       "path": "Machine\\System\\Init\\ProvisionedPaths\\eventd-events",

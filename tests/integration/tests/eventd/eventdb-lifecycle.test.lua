@@ -145,9 +145,8 @@ test("the standard event store path is /var/state/eventd/events/", {
     t:assert(exists(vm, "/var/state/eventd/events/shard-0000.db"), "and eventd uses it")
 end)
 
-test("the package ships the state directory and three store directories; the three are required provisioned paths", {
-    spec = "eventd *eventdb.the-package-ships-the-state-directory-and-its-three-store-directories"
-        .. " eventd *eventdb.the-three-store-directories-are-required-peinit-provisioned-directories",
+test("the state directory and three store directories are required provisioned paths", {
+    spec = "eventd *eventdb.the-state-directory-and-three-store-directories-are-required-peinit-provisioned-directories",
 }, function(t)
     local base = [[Machine\System\Init\ProvisionedPaths]]
     local required = {}
@@ -160,9 +159,8 @@ test("the package ships the state directory and three store directories; the thr
         if path then required[path:gsub("/$", "")] = (req == "1" and kind == "directory") end
     end
     t:assert(vm:run("test -d /var/state/eventd").exit_code == 0, "/var/state/eventd exists")
-    t:assert(required["/var/state/eventd"] == nil,
-        "/var/state/eventd is not a provisioned directory: " .. json.encode(required))
-    for _, d in ipairs({ "/var/state/eventd/events", "/var/state/eventd/logs", "/var/state/eventd/metrics" }) do
+    for _, d in ipairs({ "/var/state/eventd", "/var/state/eventd/events", "/var/state/eventd/logs",
+                         "/var/state/eventd/metrics" }) do
         t:assert(vm:run("test -d " .. d).exit_code == 0, d .. " exists")
         t:assert(required[d], d .. " is a required provisioned directory: " .. json.encode(required))
     end
