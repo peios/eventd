@@ -33,6 +33,12 @@ The service manager invokes
 once as SYSTEM before launch to initialize registry query authorization
 defaults. The long-running daemon uses its own virtual Service identity,
 with only traversal, KMES-consumer and event-emission privileges.
+.PP
+The eventd-config.reg seed declares /var/state/eventd and its events, logs
+and metrics children as required peinit provisioned directories.
+peinit creates them before phase 2 with protected inheritable descriptors
+granting full control to SYSTEM, Administrators and eventd's service SID.
+The image or installer must supply /var/state.
 .SH CONFIGURATION
 Settings are read from the registry key
 .BR Machine\eSystem\eeventd .

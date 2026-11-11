@@ -18,17 +18,16 @@ databases nowhere else.
 
 The standard path is `/var/state/eventd/events/`.
 <!-- lint-disable-next-line line-length -->
-[*eventdb.the-standard-event-store-path-is-var-state-eventd-events] The eventd package
-ships `/var/state/eventd/` and its `events/`, `logs/`, and `metrics/`
-children.
+[*eventdb.the-standard-event-store-path-is-var-state-eventd-events]
+The eventd package ships `eventd-config.reg`, which declares
+`/var/state/eventd/` and its `events/`, `logs/`, and `metrics/` children
+as required peinit provisioned directories. peinit creates all four and
+establishes their descriptors before eventd starts. The `eventd` entry
+sorts before `eventd-events`, `eventd-logs`, and `eventd-metrics`, so the
+parent exists when each child is provisioned. The image or installer
+supplies `/var/state`; peinit does not create unnamed parents.
 <!-- lint-disable-next-line line-length -->
-[*eventdb.the-package-ships-the-state-directory-and-its-three-store-directories]
-The three store directories are also declared as required peinit
-provisioned directories, so peinit establishes their descriptor before
-eventd starts; `/var/state/eventd/` itself is not a provisioned
-directory.
-<!-- lint-disable-next-line line-length -->
-[*eventdb.the-three-store-directories-are-required-peinit-provisioned-directories]
+[*eventdb.the-state-directory-and-three-store-directories-are-required-peinit-provisioned-directories]
 Each of the four carries an
 explicit protected, inheritable descriptor granting full control only
 to SYSTEM, Administrators, and the service SID of eventd's own virtual
