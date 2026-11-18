@@ -10,7 +10,13 @@ publish.workspace = true
 [dependencies]
 libc = { workspace = true }
 peios = { workspace = true }
-peios-sys = { workspace = true }
+peios-sys = { workspace = true, optional = true }
+
+[features]
+default = ["access"]
+# Query-only consumers need framing and actual server-side authorization, not
+# local policy previews or a direct SDK dependency for access-list construction.
+access = ["dep:peios-sys"]
 
 [lints]
 workspace = true

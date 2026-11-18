@@ -107,6 +107,7 @@ pub enum Response {
 pub struct Connection<S> {
     stream: S,
     frame: Vec<u8>,
+    max_frame_bytes: usize,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -115,6 +116,18 @@ impl<S: Read + Write> Connection<S> {
         Self {
             stream,
             frame: Vec::new(),
+            max_frame_bytes: u32::MAX as usize,
+        }
+    }
+
+    /// A query connection with an explicit response-frame byte bound.
+    /// The length is checked before reserving response storage. A refused frame
+    /// ends this connection; reconnect rather than attempting to skip its body.
+    pub const fn bounded(stream: S, max_frame_bytes: usize) -> Self {
+        Self {
+            stream,
+            frame: Vec::new(),
+            max_frame_bytes,
         }
     }
 
@@ -136,6 +149,9 @@ impl<S: Read + Write> Connection<S> {
         let mut prefix = [0_u8; 4];
         self.stream.read_exact(&mut prefix).map_err(Error::Io)?;
         let length = u32::from_le_bytes(prefix) as usize;
+        if length > self.max_frame_bytes {
+            return Err(Error::Malformed("response frame exceeds client byte bound"));
+        }
         self.frame.clear();
         self.frame
             .try_reserve_exact(length)
@@ -351,6 +367,17 @@ mod tests {
     use peios::msgpack::{Reader, Writer};
 
     use super::{Connection, Error, Response, Value, decode_response};
+
+    #[test]
+    fn a_bounded_connection_refuses_the_declared_length_before_reading_its_body() {
+        let mut connection = Connection::bounded(Cursor::new(u32::MAX.to_le_bytes()), 4096);
+        assert!(matches!(
+            connection.next_response(),
+            Err(Error::Malformed("response frame exceeds client byte bound"))
+        ));
+        assert_eq!(connection.stream().position(), 4);
+        assert!(connection.frame.is_empty());
+    }
 
     fn frame(payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::from(u32::try_from(payload.len()).unwrap().to_le_bytes());

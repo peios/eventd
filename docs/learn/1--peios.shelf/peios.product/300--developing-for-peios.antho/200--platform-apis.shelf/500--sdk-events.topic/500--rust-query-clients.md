@@ -8,6 +8,10 @@ The `eventd-client` Rust crate provides query framing and client lifecycle
 handling. It shares access-right constants with the daemon so that clients
 can describe policy without implementing the authorization decision.
 
+The default `access` feature includes the local access-policy helpers.
+Query-only consumers can turn off default features without changing the
+server's authorization of their queries.
+
 ## Finite queries
 
 `query` returns the complete result after the server's terminal response.
@@ -18,6 +22,12 @@ The result is a vector in client memory. Server resource limits do not
 make that client allocation a fixed-size buffer. Choose bounded queries
 or use the wire interface when an application needs a different storage
 strategy.
+
+`wire::Connection::bounded(stream, max_frame_bytes)` rejects an oversized
+response-frame length before reserving its body. A rejected frame ends the
+connection. Reconnect instead of trying to skip the body. The bound applies
+to encoded frame bytes; decoded values and retained result collections need
+separate memory bounds. `Connection::new` retains its protocol-sized bound.
 
 ## Streaming queries
 
