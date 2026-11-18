@@ -17,8 +17,8 @@ libc = "0.2.175"
 # which the rust library requires. authd takes the same commit: a program
 # that links eventd-client and authd's crates, or libgxwi, can hold only
 # one peios-sys, which links libpeios, so they move together.
-peios = { git = "https://github.com/peios/peios-rs.git", rev = "3950d35950c46cb3538885b7cf05bde059393def", package = "peios" }
-peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "3950d35950c46cb3538885b7cf05bde059393def", package = "peios-sys" }
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e", package = "peios" }
+peios-sys = { git = "https://github.com/peios/peios-rs.git", rev = "7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e", package = "peios-sys" }
 rusqlite = { version = "0.37.0", features = ["bundled", "functions", "hooks"] }
 
 [workspace.lints.rust]
