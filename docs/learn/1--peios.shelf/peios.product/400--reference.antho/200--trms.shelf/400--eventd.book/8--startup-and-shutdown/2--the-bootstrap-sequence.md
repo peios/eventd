@@ -31,6 +31,11 @@ ingestion socket as soon as its store is open, so the log socket
    descriptor that is not equivalent to the protected platform default
    fails startup (§3.3).
    [*bootstrap.a-missing-or-unsafe-store-directory-fails-startup]
+   SQLite retains each validated directory handle in database and journal
+   paths. It does not resolve that handle back to the configured pathname.
+   Replacing the original directory path therefore cannot redirect an open
+   store. The service needs no metadata-read grant on private ancestors that
+   its traversal privilege permits it to pass through.
 3. Read the optional keys and apply compiled-in defaults for those
    absent (§A).
    [*bootstrap.absent-optional-keys-take-their-compiled-in-defaults]

@@ -53,6 +53,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_directory = StoreDirectory::open(&config.event_store_path)?;
     let log_directory = StoreDirectory::open(&config.log_store_path)?;
     let metric_directory = StoreDirectory::open(&config.metric_store_path)?;
+    crate::sqlite_anchor::install()?;
     let attachments = kmes::attach_all()?;
     let cpu_count = attachments.len();
     let shard_count = if config.storage_shards == 0 {

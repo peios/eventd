@@ -16,6 +16,7 @@ mod pipeline;
 mod query;
 mod query_language;
 mod retention;
+mod sqlite_anchor;
 mod synthetic;
 mod write_security;
 mod writer;
