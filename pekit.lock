@@ -4,13 +4,13 @@
       "prefix": "github.com/peios/peios-rs",
       "git": "https://github.com/peios/peios-rs",
       "dir": "",
-      "rev": "3950d35950c46cb3538885b7cf05bde059393def"
+      "rev": "7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e"
     },
     {
       "prefix": "github.com/peios/peios-sdk",
       "git": "https://github.com/peios/peios-sdk",
       "dir": "",
-      "rev": "0edd31223cef7b9a0b920ec40e2ad493e2232024"
+      "rev": "f3d1b4cb420f93200452e09dd1b92d89904f714d"
     },
     {
       "prefix": "github.com/gcslib/rust",
@@ -83,15 +83,15 @@
       "path": "github.com/peios/peios-rs",
       "git": "https://github.com/peios/peios-rs",
       "dir": "",
-      "commit": "3950d35950c46cb3538885b7cf05bde059393def",
-      "tree": "f27d821bc08b493bf74d46736067023ddfbd1aa1a5bec742b60cc5acb4a4eaa2"
+      "commit": "7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e",
+      "tree": "542bf54f3b7d5c9989520822f763dc2dcb03c62722a877f0d9bd4f32130d9c49"
     },
     {
       "path": "github.com/peios/peios-sdk",
       "git": "https://github.com/peios/peios-sdk",
       "dir": "",
-      "commit": "0edd31223cef7b9a0b920ec40e2ad493e2232024",
-      "tree": "9e76422dd0e656539d4ebb7df3c0e3fdee424eaa9e6657749be16ea8a5cfeabf"
+      "commit": "f3d1b4cb420f93200452e09dd1b92d89904f714d",
+      "tree": "5b550ce14f3f9adad261a7f366ec29598c302680eb8b4ea24551553755450b78"
     }
   ]
 }
