@@ -297,8 +297,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "peios"
-version = "0.4.0"
-source = "git+https://github.com/peios/peios-rs.git?rev=7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e#7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e"
+version = "0.5.0"
+source = "git+https://github.com/peios/peios-rs.git?rev=623520bc0405fdd4526bab45f45882e7f19b1ab1#623520bc0405fdd4526bab45f45882e7f19b1ab1"
 dependencies = [
  "bitflags",
  "libc",
@@ -307,8 +307,8 @@ dependencies = [
 
 [[package]]
 name = "peios-sys"
-version = "0.3.0"
-source = "git+https://github.com/peios/peios-rs.git?rev=7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e#7c05d93e82ddeae7c9c16c4bb21cfe5e5416ca7e"
+version = "0.4.0"
+source = "git+https://github.com/peios/peios-rs.git?rev=623520bc0405fdd4526bab45f45882e7f19b1ab1#623520bc0405fdd4526bab45f45882e7f19b1ab1"
 dependencies = [
  "bindgen",
  "pkg-config",
